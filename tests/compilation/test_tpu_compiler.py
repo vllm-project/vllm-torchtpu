@@ -232,6 +232,34 @@ class TestTpuCompilerCache:
         assert first == first_again
         assert first != hosts_swapped
 
+    def test_tpu_hash_ignores_reload_and_tier2_cache_switches(self):
+        """Reloading newly compiled executables or changing the Tier-2 cache
+        name does not alter the serialized executable bytes or disk cache key."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            with patch.dict(
+                os.environ,
+                {
+                    "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE": "0",
+                    "TORCH_TPU_TIER2_COMPILATION_CACHE": "disabled",
+                },
+            ):
+                base = compute_tpu_compilation_hash(self._config())
+            with patch.dict(
+                os.environ,
+                {
+                    "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE": "1",
+                    "TORCH_TPU_TIER2_COMPILATION_CACHE": "tpu_tier2_cache",
+                },
+            ):
+                toggled = compute_tpu_compilation_hash(self._config())
+
+        assert base == toggled
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 

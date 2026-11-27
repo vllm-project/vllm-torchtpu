@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
+    VLLM_TPU_RELOAD_COMPILED_EXECUTABLE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -188,6 +189,7 @@ if TYPE_CHECKING:
     KDA_PACK_HEAD_INV: bool = True
     KDA_PACKED_METADATA: bool = True
     KDA_FWD_MB: int | None = None
+    TORCH_TPU_TIER2_COMPILATION_CACHE: str = ""
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     SPEC_WARMUP: bool = True
@@ -1000,6 +1002,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before the next group is even traced, so the groups run one after
     # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
     "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
+    # Temporary opt-in workaround: reloads each newly compiled PJRT executable
+    # from its serialized artifact to free compile-only host DRAM, until
+    # torch_tpu / libtpu release that metadata natively. Mechanism:
+    # `TpuCompilerAdaptor._reload_compiled` and `compilation/executable_reload.py`.
+    "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE": env_bool(
+        "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", default=False
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
@@ -1289,6 +1298,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TCPStore port for the mp multihost rendezvous; unset means the vLLM
     # coordination port plus one.
     "TORCH_TPU_MP_RENDEZVOUS_PORT": env_optional_int("TORCH_TPU_MP_RENDEZVOUS_PORT"),
+    # Name for the shared-memory Tier-2 TorchTPU compilation cache, or
+    # "disabled" to turn off both Tier-2 and Tier-3; empty defers to torch_tpu's
+    # default ("default" when world_size > 1, disabled when world_size == 1).
+    "TORCH_TPU_TIER2_COMPILATION_CACHE": lambda: os.getenv(
+        "TORCH_TPU_TIER2_COMPILATION_CACHE", ""
+    ),
     # Directory for the on-disk TorchTPU compilation cache; read raw because
     # env_override.py copies it verbatim into the TORCH_TPU_INTERNAL_* vars.
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": lambda: os.getenv(

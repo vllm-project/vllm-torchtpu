@@ -47,6 +47,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP,
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
+    _validate_executable_reload_config,
     _validate_lora_config,
     _validate_peer_replay_config,
     _validate_phased_profiling_config,
@@ -1926,3 +1927,98 @@ def test_check_and_update_config_preserves_programmatic_ep_weight_filter(
     vllm_config = _make_ep_filter_vllm_config(enable_ep_weight_filter=initial_filter)
     TpuPlatform.check_and_update_config(vllm_config)
     assert vllm_config.parallel_config.enable_ep_weight_filter is initial_filter
+
+
+@pytest.mark.parametrize(
+    (
+        "reload_env",
+        "check_recomp",
+        "tier2",
+        "tier3",
+        "world_size",
+        "expect_recomp_warn",
+        "expect_tier_warn",
+    ),
+    [
+        pytest.param("0", "1", "", "", 1, False, False, id="reload-off"),
+        pytest.param("1", "1", "shm", "", 1, True, False, id="check-recompilation-on"),
+        pytest.param(
+            "1", "0", "", "", 1, False, True, id="single-rank-default-no-cache"
+        ),
+        pytest.param(
+            "1", "0", "disabled", "/tmp/t3", 8, False, True, id="tier2-disabled"
+        ),
+        pytest.param("1", "0", "", "", 8, False, False, id="multi-rank-default-tier2"),
+        pytest.param(
+            "1", "0", "", "/tmp/t3", 1, False, False, id="single-rank-tier3-set"
+        ),
+        pytest.param("1", "0", "shm", "", 1, False, False, id="single-rank-tier2-set"),
+    ],
+)
+def test_validate_executable_reload_config(
+    monkeypatch,
+    reload_env,
+    check_recomp,
+    tier2,
+    tier3,
+    world_size,
+    expect_recomp_warn,
+    expect_tier_warn,
+):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu import envs
+
+    for name, val in (
+        ("VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", reload_env),
+        ("VLLM_XLA_CHECK_RECOMPILATION", check_recomp),
+        ("TORCH_TPU_TIER2_COMPILATION_CACHE", tier2),
+        ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", tier3),
+    ):
+        monkeypatch.delitem(vars(envs), name, raising=False)
+        if val:
+            monkeypatch.setenv(name, val)
+        else:
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+
+    fake_cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            world_size_across_dp=world_size,
+            prefill_context_parallel_size=1,
+            nnodes=1,
+        )
+    )
+    with patch.object(tpu_platform.logger, "warning_once") as warn_once:
+        _validate_executable_reload_config(fake_cfg)
+
+    joined = "\n".join(call.args[0] for call in warn_once.call_args_list)
+    assert ("VLLM_XLA_CHECK_RECOMPILATION" in joined) == expect_recomp_warn
+    assert ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT" in joined) == expect_tier_warn
+
+
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_check_and_update_config_warns_for_single_rank_reload_without_caches(
+    mock_prepare_env, mock_apply_patches, monkeypatch
+):
+    from vllm_torchtpu import envs
+
+    for name in (
+        "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE",
+        "VLLM_XLA_CHECK_RECOMPILATION",
+        "TORCH_TPU_TIER2_COMPILATION_CACHE",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+    ):
+        monkeypatch.delitem(vars(envs), name, raising=False)
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", "1")
+
+    with (
+        _device_left_unset(),
+        patch.object(tpu_platform.logger, "warning_once") as warn,
+    ):
+        VllmConfig()
+
+    joined = "\n".join(call.args[0] for call in warn.call_args_list)
+    assert "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT" in joined
