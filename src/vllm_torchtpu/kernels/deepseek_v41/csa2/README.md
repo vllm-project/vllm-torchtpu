@@ -24,7 +24,9 @@ of core VMEM; larger tables are streamed through bounded buffers. Query, packed
 KV and SWA owners are constrained to HBM so the compiler does not copy a complete
 owner into another memory space before entering the kernel.
 
-`cache.py` provides cache publication and SparseCore gathers. `pipeline.py`
+`cache.py` provides cache publication and SparseCore gathers. `swa_metadata.py`
+builds the SWA visibility metadata of every SWA group's block table in one
+scalar-core kernel that reads only the live requests' table rows. `pipeline.py`
 overlaps those gathers with calls to the same `csa2` kernel and retains gathered
 KV for reuse within a model stage. `reference.py` contains independent attention
 math for correctness checks. Benchmark-only mathematical ablations are not part

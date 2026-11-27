@@ -377,12 +377,17 @@ def test_shift_swa_metadata_matches_direct_offsets(seed):
 
 @pytest.mark.parametrize("seed", range(6))
 @pytest.mark.parametrize("non_causal", [False, True])
-def test_metadata_tables_matches_per_table_metadata(seed, non_causal):
-    """One batched program equals one prepare_swa_metadata call per SWA group."""
+# 40: per-table XLA calls; 256 and 640: the metadata kernel, in the Pallas
+# interpreter (640: slices that start past the row's first tile).
+@pytest.mark.parametrize("width", [40, 256, 640])
+def test_metadata_tables_matches_per_table_metadata(seed, non_causal, width):
+    """One batched call equals one prepare_swa_metadata call per SWA group."""
     from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter
+    from vllm_torchtpu.kernels.deepseek_v41.csa2.swa_metadata import (
+        prepare_swa_metadata_tables,
+    )
 
-    page, width, groups = 64, 40, 7
+    page, groups = 64, 7 if width < 256 else 3
     rng = np.random.default_rng(seed)
     requests = int(rng.integers(1, 9))
     stride = page * 8
@@ -397,13 +402,22 @@ def test_metadata_tables_matches_per_table_metadata(seed, non_causal):
     starts = np.concatenate(([0], np.cumsum(queries))).astype(np.int32)
     positions = np.zeros(int(starts[-1]) + int(rng.integers(0, 5)), np.int32)
     for r in range(requests):
-        first = int(rng.integers(0, width * page - 16))
+        # Windows anywhere in the row, the row end included.
+        lowest = 0 if r % 2 else width * page - 400
+        first = int(rng.integers(max(lowest, 0), width * page - 16))
         positions[starts[r] : starts[r + 1]] = first + np.arange(queries[r])
     minimum = rng.integers(0, 64, requests).astype(np.int32)
     args = tuple(jnp.asarray(x) for x in (starts, positions, minimum))
 
-    metadata, bounds, records = csa2_adapter._metadata_tables(
-        tuple(jnp.asarray(t) for t in tables), *args, page, stride, non_causal
+    # The tables arrive flat, as the runner uploads them.
+    metadata, bounds, records = prepare_swa_metadata_tables(
+        tuple(jnp.asarray(t.reshape(-1)) for t in tables),
+        *args,
+        page_size=page,
+        page_stride=stride,
+        row_offset=0,
+        non_causal=non_causal,
+        interpret=True,
     )
     for g in range(groups):
         want = prepare_swa_metadata(
@@ -417,6 +431,34 @@ def test_metadata_tables_matches_per_table_metadata(seed, non_causal):
         np.testing.assert_array_equal(np.asarray(metadata[g]), np.asarray(want[0]))
         np.testing.assert_array_equal(np.asarray(bounds), np.asarray(want[1]))
         np.testing.assert_array_equal(np.asarray(records[g]), np.asarray(want[2]))
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_swa_metadata_flat_table_matches_2d(seed):
+    """A flat [R*W] table looks up exactly what its [R, W] view does,
+    windows that run past the row end included."""
+    from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
+
+    page, width = 64, 6
+    rng = np.random.default_rng(seed)
+    requests = int(rng.integers(1, 9))
+    table = rng.integers(1, 1000, (requests, width)).astype(np.int32)
+    queries = rng.integers(0, 7, requests)
+    queries[0] = max(queries[0], 1)
+    starts = np.concatenate(([0], np.cumsum(queries))).astype(np.int32)
+    positions = np.zeros(int(starts[-1]) + int(rng.integers(0, 5)), np.int32)
+    for r in range(requests):
+        first = int(rng.integers(width * page - 200, width * page - 6))
+        positions[starts[r] : starts[r + 1]] = first + np.arange(queries[r])
+    args = tuple(
+        jnp.asarray(x)
+        for x in (starts, positions, rng.integers(0, 64, requests).astype(np.int32))
+    )
+    kwargs = dict(page_size=page, page_stride=page * 8, row_offset=page)
+    flat = prepare_swa_metadata(jnp.asarray(table.reshape(-1)), *args, **kwargs)
+    want = prepare_swa_metadata(jnp.asarray(table), *args, **kwargs)
+    for got, ref in zip(flat, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
 
 def test_swa_group_tables_dedupes_by_object_and_shape():

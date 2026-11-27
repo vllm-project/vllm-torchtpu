@@ -23,6 +23,9 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
+from vllm_torchtpu.kernels.deepseek_v41.csa2.swa_metadata import (
+    prepare_swa_metadata_tables,
+)
 from vllm_torchtpu.kernels.mla.paged_swa import (
     SwaPublishPlan,
     swa_plan_slots,
@@ -314,26 +317,28 @@ def _metadata_tables(
     page_stride: int,
     non_causal: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """``_metadata`` for G [R,W] block tables at row offset 0, in one program.
+    """``_metadata`` for G flat [R*W] block tables at row offset 0, in one
+    kernel: [G,...] metadata and records, with the shared bounds.
 
-    The tables stay separate inputs: stacking them would copy every full
-    table each stage. Only the page lookups depend on the table; XLA shares
-    the request, window and bound computation across the G calls.
+    The tables stay separate, flat inputs: stacking them would copy every
+    full table each stage, and an [R, W] view would relayout each.
     """
-    results = [
-        _metadata(
-            table, starts, positions, minimum, page_size, page_stride, 0, non_causal
-        )
-        for table in tables
-    ]
-    metadata = jnp.stack([result[0] for result in results])
-    records = jnp.stack([result[2] for result in results])
-    return metadata, results[0][1], records
+    return prepare_swa_metadata_tables(
+        tables,
+        starts,
+        positions,
+        minimum,
+        page_size=page_size,
+        page_stride=page_stride,
+        row_offset=0,
+        non_causal=non_causal,
+        onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
+    )
 
 
 def _fake_metadata_tables(tables, starts, positions, minimum, page_size, *_):
     columns = (positions.shape[0] + 128 + page_size - 1) // page_size + 1
-    requests = tables[0].shape[0]
+    requests = starts.shape[0] - 1
     return (
         tables[0].new_empty((len(tables), requests, 2 + columns)),
         tables[0].new_empty((requests, 2)),
@@ -796,10 +801,11 @@ def prepare_swa_tables(
     cache: "PagedCacheRows",
     non_causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``prepare_swa`` for G [R,W] tables at row offset 0: [G,...] metadata
-    and records, with the table-independent bounds shared."""
+    """``prepare_swa`` for G block tables at row offset 0, each passed flat
+    ([R*W], as uploaded): [G,...] metadata and records, with the
+    table-independent bounds shared."""
     return _ops["metadata_tables"](
-        tuple(table.int() for table in tables),
+        tuple(table.int().reshape(-1) for table in tables),
         starts.int(),
         positions.int(),
         minimum.int(),

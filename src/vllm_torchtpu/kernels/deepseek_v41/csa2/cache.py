@@ -547,6 +547,37 @@ def _requests(starts: jax.Array, tokens: int, *, onehot: bool) -> jax.Array:
     return jnp.minimum(count, requests - 1)
 
 
+def check_swa_metadata_args(
+    block_table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum_visible: jax.Array,
+    page_size: int,
+    page_stride: int,
+    row_offset: int,
+) -> int:
+    """`prepare_swa_metadata`'s shape and page checks; the table's row width."""
+    requests = starts.shape[0] - 1
+    width = block_table.size // max(requests, 1)
+    if (
+        block_table.ndim not in (1, 2)
+        or block_table.ndim == 2
+        and block_table.shape[0] != requests
+        or requests < 1
+        or width < 1
+        or block_table.size != requests * width
+        or starts.shape != (requests + 1,)
+        or minimum_visible.shape != (requests,)
+        or not positions.shape[0]
+        or page_size not in (8, 16, 32, 64)
+        and (page_size < 128 or page_size % 128)
+        or page_stride % page_size
+        or row_offset % page_size
+    ):
+        raise ValueError("CSA2 requires nonempty, whole-page aligned SWA metadata")
+    return width
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -571,27 +602,27 @@ def prepare_swa_metadata(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return request page metadata, explicit bounds, and physical write records.
 
-    Block table entries are allocator block IDs. Stride/offset are in BF16
-    512-feature record units and must preserve whole BF16 pages. Starts and
-    positions obey csa2's contiguous-request contract; noncausal requests have
-    at most 64 queries. Minimum visibility carries replay/window-start state.
-    Bounds are passed to csa2 ONLY for noncausal calls; causal visibility stays
-    query-dependent. Padding records are -1. Empty requests have empty bounds.
+    Block table entries are allocator block IDs, as [R, W] or as the flat
+    [R * W] table the runner uploads. Pass a flat table flat: an [R, W] view
+    of it is relaid out before every call, which at decode sizes costs more
+    than the lookups. Stride/offset are in BF16 512-feature record units and
+    must preserve whole BF16 pages. Starts and positions obey csa2's
+    contiguous-request contract; noncausal requests have at most 64 queries.
+    Minimum visibility carries replay/window-start state. Bounds are passed
+    to csa2 ONLY for noncausal calls; causal visibility stays query-dependent.
+    Padding records are -1. Empty requests have empty bounds.
     """
     tokens = positions.shape[0]
-    requests = block_table.shape[0]
-    if (
-        block_table.ndim != 2
-        or block_table.shape[1] < 1
-        or starts.shape != (requests + 1,)
-        or minimum_visible.shape != (requests,)
-        or not tokens
-        or page_size not in (8, 16, 32, 64)
-        and (page_size < 128 or page_size % 128)
-        or page_stride % page_size
-        or row_offset % page_size
-    ):
-        raise ValueError("CSA2 requires nonempty, whole-page aligned SWA metadata")
+    requests = starts.shape[0] - 1
+    width = check_swa_metadata_args(
+        block_table,
+        starts,
+        positions,
+        minimum_visible,
+        page_size,
+        page_stride,
+        row_offset,
+    )
     first = positions[jnp.minimum(starts[:-1], tokens - 1)]
     count = starts[1:] - starts[:-1]
     left = jnp.maximum(first - (128 if non_causal else 127), 0)
@@ -611,17 +642,20 @@ def prepare_swa_metadata(
     )
     pages = jnp.concatenate(
         (
-            jnp.minimum(logical_pages, block_table.shape[1] - 1).reshape(-1),
-            jnp.minimum(positions // page_size, block_table.shape[1] - 1),
+            jnp.minimum(logical_pages, width - 1).reshape(-1),
+            jnp.minimum(positions // page_size, width - 1),
         )
     )
-    looked_up = block_table[rows, pages]
+    if block_table.ndim == 1:
+        looked_up = block_table[rows * width + pages]
+    else:
+        looked_up = block_table[rows, pages]
     blocks = looked_up[: requests * columns].reshape(requests, columns)
     current_blocks = looked_up[requests * columns :]
     physical = blocks * (page_stride // page_size) + row_offset // page_size
     visible = (
         (count[:, None] > 0)
-        & (logical_pages < block_table.shape[1])
+        & (logical_pages < width)
         & (logical_pages * page_size < right[:, None])
     )
     metadata = jnp.concatenate(
