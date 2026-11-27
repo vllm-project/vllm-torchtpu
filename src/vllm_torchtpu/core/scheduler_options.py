@@ -63,6 +63,17 @@ class SchedulerOptions:
     nothing. The cost is host-side: the memo's prefix-cache change log, at
     most 65536 entries."""
 
+    hybrid_state_retention: bool = False
+    """Keep the GDN state snapshots a later turn of a conversation hits on
+    (``core/hybrid_retention.py``) in ``PrefixAwareScheduler``, on any engine
+    serving a Qwen3.5 MoE model with prefix caching on. Its prefill
+    checkpoint stops need ``--mamba-cache-mode align``, under which vLLM
+    splits prefill chunks at Mamba blocks. It pins up to 360 Mamba blocks of
+    HBM, which an allocation that runs short evicts. Elsewhere (another
+    model, prefix caching off) it logs that retention is off and changes
+    nothing. The pipeline chunk scheduler (PP > 1) does not read it and keeps
+    snapshots on a KV producer only."""
+
 
 def parse(raw: Any) -> SchedulerOptions:
     """The ``tpu_scheduler`` section as options; None gives the defaults.

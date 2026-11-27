@@ -74,8 +74,10 @@ multi-turn think-time within a strictly bounded HBM pin budget:
    refusal is classified first (see ``ALLOC_NONE_REASONS``); only a real
    shortage evicts, and only as many entries as cover it.
 
-Models without a Mamba group, or with prefix caching off, are untouched. A
-scheduler builds this only where :func:`retention_wanted` says so.
+Models without a Mamba group, or with prefix caching off, are untouched. The
+pipeline chunk scheduler builds this where :func:`retention_wanted` says so,
+and PrefixAwareScheduler with the ``tpu_scheduler.hybrid_state_retention``
+option.
 """
 
 from __future__ import annotations

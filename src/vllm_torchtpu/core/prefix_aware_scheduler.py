@@ -42,7 +42,9 @@ queue.
 
 For an aggregated engine, ``prefix_aware_levers`` runs the decode-leg levers
 above on an engine that is not a KV consumer, and resolves divergent hybrid
-hits through the KV connector there.
+hits through the KV connector there. ``hybrid_state_retention`` keeps the GDN
+state snapshots a later turn hits on (core/hybrid_retention.py, through
+core/retention_scheduler.py) on a Qwen3.5 MoE model, on any engine.
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -67,8 +69,12 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log, scheduler_options
+from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
-from vllm_torchtpu.core.retention_scheduler import HybridRetentionScheduler
+from vllm_torchtpu.core.retention_scheduler import (
+    RETENTION_ARCHITECTURES,
+    HybridRetentionScheduler,
+)
 from vllm_torchtpu.core.scheduler_utils import format_counts, is_waiting_status
 
 if TYPE_CHECKING:
@@ -280,6 +286,8 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
             )
         self._kv_prefetch_switch = options.kv_prefetch
         self._decode_throttle_switch = options.decode_inflight_throttle
+        if options.hybrid_state_retention:
+            self._init_retention()
         self._memo_xstep = False
         if self._levers_on():
             self._enable_memo_xstep()
@@ -339,6 +347,38 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
                 "keep vLLM's lookup.",
                 type(connector).__name__,
             )
+
+    def _init_retention(self) -> None:
+        """Builds hybrid-state retention (``tpu_scheduler.hybrid_state_retention``)
+        on a ``RETENTION_ARCHITECTURES`` model with a Mamba group, a
+        full-attention group and prefix caching; otherwise logs why it is off
+        and schedules without it."""
+        archs = self.vllm_config.model_config.architectures or ()
+        if RETENTION_ARCHITECTURES.isdisjoint(archs):
+            logger.info(
+                "PrefixAwareScheduler: hybrid state retention is off: it keeps "
+                "snapshots for %s only, not %s.",
+                sorted(RETENTION_ARCHITECTURES),
+                list(archs),
+            )
+            return
+        try:
+            retention = HybridStateRetention(self.kv_cache_manager)
+        except Exception:
+            logger.exception(
+                "PrefixAwareScheduler: hybrid state retention is off: building "
+                "it failed."
+            )
+            return
+        if not retention.enabled:
+            logger.info(
+                "PrefixAwareScheduler: hybrid state retention is off: it needs "
+                "prefix caching and a Mamba and a full-attention KV cache group "
+                "(or a vLLM with the methods it hooks)."
+            )
+            return
+        self._retention = retention
+        logger.info("PrefixAwareScheduler: hybrid state retention ACTIVE")
 
     # ------------------------------------------------------------------
     # Decode KV prefetch past a full running set (option
@@ -718,6 +758,7 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         return cached
 
     def schedule(self, *args, **kwargs):
+        self._retention_begin_step()
         if not self._levers_on():
             # Without the levers: the warmest-first admission alone, unless
             # tpu_scheduler.promote_warmest=false asks for FCFS admission.
@@ -888,12 +929,26 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        aligned = super()._mamba_block_aligned_split(
-            request,
-            num_new_tokens,
-            num_new_local_computed_tokens,
-            num_external_computed_tokens,
-        )
+        if self._retention is None:
+            aligned = super()._mamba_block_aligned_split(
+                request,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+        else:
+            start = (
+                request.num_computed_tokens
+                + num_new_local_computed_tokens
+                + num_external_computed_tokens
+            )
+            aligned = self._retention_split(
+                request,
+                start,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
         if aligned <= 0:
             self._note_waiting_stop(request, "align0")
         return aligned
@@ -939,6 +994,10 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         except Exception:
             return None
         if isinstance(free_blocks, int) and not isinstance(free_blocks, bool):
+            if self._retention is not None:
+                # Retention evicts the blocks it pins when an allocation
+                # needs them.
+                free_blocks += self._retention.num_pinned_blocks()
             return free_blocks
         return None
 
