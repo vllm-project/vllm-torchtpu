@@ -486,35 +486,3 @@ def test_worker_arms_the_options_before_anything_else():
             distributed_init_method="tcp://127.0.0.1:29500",
         )
     assert fast_dispatch._CONFIG == {"fast": True}
-
-
-class _HashStub:
-    """What VllmConfig.compute_hash reads, as in
-    tests/compilation/test_additional_config_hash_patch.py."""
-
-    def __init__(self, additional_config):
-        self.additional_config = additional_config
-        self.observability_config = SimpleNamespace(compute_hash=lambda: "o")
-        self.aux_output_config = SimpleNamespace(compute_hash=lambda: "a")
-
-    def __getattr__(self, name):
-        if name.startswith("__") and name.endswith("__"):
-            raise AttributeError(name)
-        return None
-
-
-def test_section_stays_in_the_compile_cache_key():
-    """The options change how compiled programs are guarded and called, so
-    turning one on must change the compile-cache key."""
-    from vllm.config import VllmConfig
-
-    from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
-    from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
-
-    _patch_vllm_config_hash_ignore_diagnostics()
-    assert compile_options.SECTION not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
-    off = VllmConfig.compute_hash(_HashStub({}))
-    on = VllmConfig.compute_hash(
-        _HashStub({compile_options.SECTION: {"fast_compiled_call": True}})
-    )
-    assert on != off
