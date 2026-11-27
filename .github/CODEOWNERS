@@ -177,6 +177,10 @@
 /src/vllm_torchtpu/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
 /tests/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
 
+# Models: OLMo 3.5
+/src/vllm_torchtpu/models/olmo35/ @sierraisland @wenxindongwork
+/tests/models/olmo35/ @sierraisland @wenxindongwork
+
 # Models: Qwen3.5 MoE
 /src/vllm_torchtpu/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
 /tests/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
