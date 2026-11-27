@@ -151,6 +151,8 @@ def prepare_multiport_dp_env(vllm_config) -> bool:
         return False
     parallel_config = vllm_config.parallel_config
 
+    # Not at the top: tpu_mp_multihost imports this module at its top (for
+    # SECTION), so a top-level import here would be a cycle.
     from vllm_torchtpu.distributed.tpu_mp_multihost import dp_master_port_list
 
     # Every child picks its own random DP-init ports in ParallelConfig; the

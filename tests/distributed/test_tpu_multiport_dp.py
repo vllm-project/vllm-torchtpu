@@ -29,6 +29,7 @@ from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry
+from vllm_torchtpu.distributed import tpu_mp_multihost
 from vllm_torchtpu.distributed import tpu_multiport_dp as mpdp
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -155,8 +156,6 @@ def test_dp_group_ports_come_from_the_multi_host_dp_helper(monkeypatch):
     """vLLM's DP group ports come from tpu_mp_multihost.dp_master_port_list,
     the helper prepare_mp_multihost_dp_env calls (tested there), so the two
     bootstraps cannot drift apart."""
-    from vllm_torchtpu.distributed import tpu_mp_multihost
-
     calls = []
 
     def ports(rpc_port):
@@ -193,12 +192,12 @@ def test_bootstrap_honours_overrides(monkeypatch):
     assert len(os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
 
 
-def test_internal_lb_server_is_rejected(monkeypatch):
+def test_internal_lb_server_is_rejected():
     with pytest.raises(ValueError, match="not a rank of"):
         mpdp.validate(_vllm_config(_child_config(0, external_lb=False), ON))
 
 
-def test_multi_node_is_rejected(monkeypatch):
+def test_multi_node_is_rejected():
     pc = _child_config(0)
     pc.nnodes = 2
     with pytest.raises(NotImplementedError, match="nnodes"):
@@ -242,7 +241,7 @@ def test_engine_core_gets_its_host_slot(monkeypatch, rank):
     assert kwargs["local_dp_rank"] == 0  # the caller's dict is not mutated
 
 
-def test_engine_core_of_internal_lb_is_left_alone(monkeypatch):
+def test_engine_core_of_internal_lb_is_left_alone():
     pc = _child_config(3, external_lb=False)
     kwargs = {"vllm_config": _vllm_config(pc, ON), "dp_rank": 3, "local_dp_rank": 3}
     assert mpdp.engine_core_kwargs(kwargs) is kwargs

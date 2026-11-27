@@ -70,6 +70,9 @@ import torch.distributed as dist
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
+
+# For its SECTION name. tpu_multiport_dp imports dp_master_port_list from this
+# module inside a function, not at its top, so the two form no import cycle.
 from vllm_torchtpu.distributed import tpu_multiport_dp
 from vllm_torchtpu.logger import init_logger
 
