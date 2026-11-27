@@ -60,6 +60,8 @@ python -m vllm_torchtpu.megakernel.advisor calibrate \
 | `--json [out.json]` | Emit machine-readable JSON output to stdout (when omitted) or `out.json`. |
 | `--html <out.html>` | Write a self-contained static HTML/SVG audit report (with zero JavaScript) to `out.html`. |
 | `--bucket-schedule <out.json>` | Write an advisory `advisor.bucket_schedule.v1` JSON bucket schedule to `out.json` (or `-` for stdout). |
+| `--workbench-html <out.html>` | Write a static-snapshot 3-pane Fusion Workbench HTML file to `out.html`. |
+| `serve --model <m> --port <p>` | Launch the loopback (`127.0.0.1`) Python-backed interactive Fusion Workbench server. |
 
 ## Physics & Drift Gates
 

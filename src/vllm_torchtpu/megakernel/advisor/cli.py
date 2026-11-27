@@ -64,7 +64,22 @@ from .report import (
     write_advisor_html,
     write_bucket_schedule,
 )
-from .specs import DispatchRegime, MoEMode, ObjectiveMode, Phase, WorkloadSpec
+from .serve import (
+    DEFAULT_SERVE_HOST,
+    DEFAULT_SERVE_PORT,
+    MAX_TCP_PORT,
+    WorkbenchServerOptions,
+    run_workbench_server,
+    validate_loopback_host,
+)
+from .specs import (
+    DispatchRegime,
+    MoEMode,
+    ObjectiveMode,
+    Phase,
+    WorkloadSpec,
+    load_measurements,
+)
 from .text_format import (
     format_advisor_summary,
     format_layer_group_search,
@@ -72,6 +87,7 @@ from .text_format import (
 )
 from .verdict import advise, search_layer_groups
 from .vmem import _mesh_divisibility_reasons
+from .workbench import write_workbench_html
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -79,6 +95,7 @@ if TYPE_CHECKING:
 __all__ = [
     "build_calibrate_arg_parser",
     "build_parser",
+    "build_serve_arg_parser",
     "derive_decoding_sequences",
     "format_model_listing",
     "main",
@@ -452,7 +469,13 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
         "--html",
         type=str,
         default=None,
-        help="Write self-contained HTML audit report to disk.",
+        help="Write self-contained zero-JS HTML audit report to disk.",
+    )
+    parser.add_argument(
+        "--workbench-html",
+        type=str,
+        default=None,
+        help="Write a static-snapshot Fusion Workbench HTML file to disk.",
     )
     parser.add_argument("--json", nargs="?", const="-", help="JSON stdout or file.")
     parser.add_argument("--explain", action="store_true", help="Metric provenance.")
@@ -514,6 +537,20 @@ def _validate_batch_exclusivity(args: argparse.Namespace) -> None:
         raise errors.MegakernelConfigError(msg)
 
 
+def _validate_measurements_arg(raw_measurements: str | None) -> str | None:
+    """Validate optional `--measurements` path or alias, failing on empty/dir."""
+    if raw_measurements is None:
+        return None
+    cleaned = raw_measurements.strip()
+    if not cleaned:
+        msg = "--measurements must not be empty"
+        raise errors.MegakernelConfigError(msg)
+    if cleaned not in PUBLIC_MEASUREMENT_ALIASES and Path(cleaned).is_dir():
+        msg = f"--measurements path is a directory: {raw_measurements!r}"
+        raise errors.MegakernelConfigError(msg)
+    return cleaned
+
+
 def _validate_non_empty_cli_values(args: argparse.Namespace) -> None:
     """Reject empty/whitespace name or path strings and directory output paths."""
     if not args.chip.strip():
@@ -527,17 +564,7 @@ def _validate_non_empty_cli_values(args: argparse.Namespace) -> None:
         if raw_val is not None and not raw_val.strip():
             msg = f"{flag} must not be empty"
             raise errors.MegakernelConfigError(msg)
-    if args.measurements is not None:
-        cleaned_meas = args.measurements.strip()
-        if not cleaned_meas:
-            msg = "--measurements must not be empty"
-            raise errors.MegakernelConfigError(msg)
-        if (
-            cleaned_meas not in PUBLIC_MEASUREMENT_ALIASES
-            and Path(cleaned_meas).is_dir()
-        ):
-            msg = f"--measurements path is a directory: {args.measurements!r}"
-            raise errors.MegakernelConfigError(msg)
+    _validate_measurements_arg(args.measurements)
     if args.json is not None:
         _validate_json_dest(args.json)
 
@@ -580,6 +607,7 @@ def _validate_cli_combinations(args: argparse.Namespace) -> None:
         )
         opt_flags = (
             ("--html", "html"),
+            ("--workbench-html", "workbench_html"),
             ("--bucket-schedule", "bucket_schedule"),
             ("--json", "json"),
             ("--measurements", "measurements"),
@@ -651,6 +679,9 @@ def _validate_output_file_arg(
 def _validate_output_exclusivity(args: argparse.Namespace) -> None:
     """Enforce valid CLI output paths and flag combinations before evaluation."""
     args.html = _validate_output_file_arg(args.html, "--html")
+    args.workbench_html = _validate_output_file_arg(
+        args.workbench_html, "--workbench-html"
+    )
     args.bucket_schedule = _validate_output_file_arg(
         args.bucket_schedule, "--bucket-schedule", allow_stdout=True
     )
@@ -660,8 +691,12 @@ def _validate_output_exclusivity(args: argparse.Namespace) -> None:
             "and cannot be combined with --bucket-schedule alone."
         )
         raise errors.MegakernelConfigError(msg)
-    if args.search_layer_groups and args.html is not None:
-        msg = "--search-layer-groups cannot be combined with --html."
+    if args.search_layer_groups and (
+        args.html is not None or args.workbench_html is not None
+    ):
+        msg = (
+            "--search-layer-groups cannot be combined with --html or --workbench-html."
+        )
         raise errors.MegakernelConfigError(msg)
     if args.bucket_schedule != "-":
         return
@@ -745,33 +780,39 @@ def _build_single_workload(
     )
 
 
-def _resolve_cli_model_and_chip(
-    args: argparse.Namespace,
-) -> tuple[ModelProfile, ChipSpec]:
-    """Resolve `ModelProfile` and `ChipSpec` from CLI source arguments."""
-    target: str | Path | None = None
-    if args.config is not None:
-        raw_config = args.config.strip()
+def _resolve_model_target(
+    model: str | None,
+    config: str | None,
+    hf_repo: str | None,
+) -> str | Path:
+    """Validate and extract the model preset, repo alias, or config path."""
+    if config is not None:
+        raw_config = config.strip()
         if not raw_config:
             msg = "--config path must not be empty"
             raise errors.MegakernelConfigError(msg)
         config_path = Path(raw_config)
         cfg_file = config_path / "config.json" if config_path.is_dir() else config_path
         if not cfg_file.is_file():
-            msg = f"Missing config file: {args.config!r}"
+            msg = f"Missing config file: {config!r}"
             raise errors.MegakernelConfigError(msg)
-        target = config_path
-    else:
-        for flag, raw_str in (("--model", args.model), ("--hf-repo", args.hf_repo)):
-            if raw_str is not None:
-                target = raw_str.strip()
-                if not target:
-                    msg = f"{flag} must not be empty"
-                    raise errors.MegakernelConfigError(msg)
-                break
-    if target is None:
-        msg = "One of --model, --config, --hf-repo, or --list-models is required"
-        raise errors.MegakernelConfigError(msg)
+        return config_path
+    for flag, raw_str in (("--model", model), ("--hf-repo", hf_repo)):
+        if raw_str is not None:
+            cleaned = raw_str.strip()
+            if not cleaned:
+                msg = f"{flag} must not be empty"
+                raise errors.MegakernelConfigError(msg)
+            return cleaned
+    msg = "One of --model, --config, --hf-repo, or --list-models is required"
+    raise errors.MegakernelConfigError(msg)
+
+
+def _resolve_cli_model_and_chip(
+    args: argparse.Namespace,
+) -> tuple[ModelProfile, ChipSpec]:
+    """Resolve `ModelProfile` and `ChipSpec` from CLI source arguments."""
+    target = _resolve_model_target(args.model, args.config, args.hf_repo)
     profile = resolve_model_profile(
         target,
         act_dtype=args.act_dtype,
@@ -838,6 +879,19 @@ def _run_sweep_command(
     exit_code = INVALID_CONFIG_EXIT_CODE if invalid else 0
     if args.html is not None:
         write_advisor_html(sweep, args.html)
+    if args.workbench_html is not None:
+        loaded_measurements = (
+            load_measurements(measurements_path, chip_name=chip_spec.name)
+            if measurements_path is not None
+            else None
+        )
+        write_workbench_html(
+            profile,
+            chip_spec,
+            sweep,
+            args.workbench_html,
+            measurements=loaded_measurements,
+        )
     if args.bucket_schedule is not None:
         if args.bucket_schedule == "-":
             _emit_json(build_bucket_schedule(sweep).to_dict(), "-")
@@ -920,7 +974,11 @@ def _dispatch(args: argparse.Namespace) -> int:
         sys.stdout.write(format_model_listing() + "\n")
         return 0
     profile, chip_spec = _resolve_cli_model_and_chip(args)
-    if args.regime_sweep or args.bucket_schedule is not None:
+    if (
+        args.regime_sweep
+        or args.bucket_schedule is not None
+        or args.workbench_html is not None
+    ):
         return _run_sweep_command(args, profile, chip_spec, args.measurements)
     return _run_single_command(args, profile, chip_spec, args.measurements)
 
@@ -1000,6 +1058,81 @@ def _run_calibrate_cli(argv: Sequence[str]) -> int:
     return 0
 
 
+def build_serve_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for `advisor serve`."""
+    parser = argparse.ArgumentParser(
+        prog="python -m vllm_torchtpu.megakernel.advisor serve",
+        description="Run the loopback Python-backed Fusion Workbench server.",
+    )
+    src_group = parser.add_mutually_exclusive_group()
+    src_group.add_argument("--model", type=str, default=None)
+    src_group.add_argument("--config", type=str, default=None)
+    src_group.add_argument("--hf-repo", type=str, default=None)
+    parser.add_argument("--chip", default=DEFAULT_CHIP)
+    parser.add_argument("--host", default=DEFAULT_SERVE_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_SERVE_PORT)
+    parser.add_argument("--measurements", type=str, default=None)
+    parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--export-html",
+        type=str,
+        default=None,
+        help="Write static-snapshot workbench HTML and exit without serving.",
+    )
+    return parser
+
+
+def _run_serve_cli(argv: Sequence[str]) -> int:
+    """Validate arguments and run `advisor serve` or `--export-html`."""
+    args = build_serve_arg_parser().parse_args(list(argv))
+    safe_host = validate_loopback_host(args.host)
+    if args.port < 0 or args.port > MAX_TCP_PORT:
+        msg = f"--port must be in [0, {MAX_TCP_PORT}], got {args.port}"
+        raise errors.MegakernelConfigError(msg)
+    if not args.chip.strip():
+        msg = "--chip must not be empty"
+        raise errors.MegakernelConfigError(msg)
+    cleaned_measurements = _validate_measurements_arg(args.measurements)
+    export_dest = _validate_output_file_arg(args.export_html, "--export-html")
+    model_arg = (
+        "qwen3.5-397b"
+        if args.model is None and args.config is None and args.hf_repo is None
+        else args.model
+    )
+    target = _resolve_model_target(model_arg, args.config, args.hf_repo)
+    profile = resolve_model_profile(target)
+    chip_spec = resolve_chip_spec(args.chip)
+    loaded_measurements = (
+        load_measurements(cleaned_measurements, chip_name=chip_spec.name)
+        if cleaned_measurements is not None
+        else None
+    )
+    if export_dest is not None:
+        sweep = advise_regimes(
+            profile,
+            chip_spec,
+            options=RegimeSweepOptions(measurements=loaded_measurements),
+        )
+        write_workbench_html(
+            profile,
+            chip_spec,
+            sweep,
+            export_dest,
+            measurements=loaded_measurements,
+        )
+        return 0
+    return run_workbench_server(
+        model=profile,
+        chip=chip_spec,
+        options=WorkbenchServerOptions(
+            host=safe_host,
+            port=args.port,
+            measurements=loaded_measurements,
+            open_browser=not args.no_browser,
+        ),
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the fusion-scope advisor command-line interface.
 
@@ -1009,6 +1142,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if argv_list and argv_list[0] == "calibrate":
         return _run_calibrate_cli(argv_list[1:])
+    if argv_list and argv_list[0] == "serve":
+        return _run_serve_cli(argv_list[1:])
     if argv_list and argv_list[0] == "estimate":
         argv_list = argv_list[1:]
     return _dispatch(build_parser().parse_args(argv_list))
