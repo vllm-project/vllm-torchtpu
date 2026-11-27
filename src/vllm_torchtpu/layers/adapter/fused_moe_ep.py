@@ -650,9 +650,19 @@ def register_fused_scale_buffers(layer) -> None:
     The tables are synced here because the loaders' own sync has already run.
     """
     tables = []
+    w13_param = (
+        "w13_weight_scale"
+        if hasattr(layer, "w13_weight_scale")
+        else "w13_weight_scale_inv"
+    )
+    w2_param = (
+        "w2_weight_scale"
+        if hasattr(layer, "w2_weight_scale")
+        else "w2_weight_scale_inv"
+    )
     for param, buf in (
-        ("w13_weight_scale", "_tpu_fused_w13_scale"),
-        ("w2_weight_scale", "_tpu_fused_w2_scale"),
+        (w13_param, "_tpu_fused_w13_scale"),
+        (w2_param, "_tpu_fused_w2_scale"),
     ):
         table = fresh_buffer(getattr(layer, param).squeeze(2))
         layer.register_buffer(buf, table, persistent=False)
@@ -862,8 +872,16 @@ def prebuild_fused_moe_ep(
             weights = (
                 layer.w13_weight,
                 layer.w2_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
+                getattr(
+                    layer,
+                    "w13_weight_scale",
+                    getattr(layer, "w13_weight_scale_inv", None),
+                ),
+                getattr(
+                    layer,
+                    "w2_weight_scale",
+                    getattr(layer, "w2_weight_scale_inv", None),
+                ),
             )
         else:
             weights = (
