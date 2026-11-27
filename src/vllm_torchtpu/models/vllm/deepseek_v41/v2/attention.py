@@ -1861,7 +1861,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         """Select logical indices from the already-published Index-K cache.
 
         ``query_start_loc``: request row boundaries of ``qr``, which spare the
-        FP8 indexer from deriving them from ``requests``.
+        FP8 indexer from deriving them from ``requests``. Candidates are rows
+        [:count] of the shared buffer, as this forward's source layer wrote
+        them; rows past its count are stale, so no reader may read more.
         """
         indexer = self.indexer
         count = qr.shape[0]
@@ -1998,13 +2000,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     indexer.indexer_op.candidate_source_layer,
                 )
                 stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
-            self.candidate_block_buffer.copy_(
-                torch.nn.functional.pad(
-                    published,
-                    (0, 0, 0, self.candidate_block_buffer.shape[0] - count),
-                    value=-1,
-                )
-            )
+            # Readers are later layers of this forward and take rows [:count]
+            # (see `candidates` above), never more rows than this layer has:
+            # the rows past it hold stale values, not -1, and are not read.
+            self.candidate_block_buffer[:count].copy_(published)
         return selected
 
     def forward_mqa(self, q, kv, positions, output):
