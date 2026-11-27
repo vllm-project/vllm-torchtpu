@@ -87,16 +87,34 @@ steps:
 
   # -----------------------------------------------------------------
   # v6e perf baseline calibration (throwaway branch, never merged)
-  # Three runs of qwen3-0.6b-tp1 on one v6e chip, each a fresh server boot,
-  # with the perf lane's settings (BENCHMARK_WARMUP_RUNS=1). --skip-perf-check
-  # reports without the gate: there is no v6e baseline yet. Each job's
-  # perf_eval_results/qwen3-0.6b-tp1/ artifacts are one --calibrate input.
+  # Three runs of each perf-lane config that is not v7x-only, on a v6e 2x4
+  # slice (8 chips, one host), each a fresh server boot, with the perf lane's
+  # settings (BENCHMARK_WARMUP_RUNS=1, VLLM_ENGINE_READY_TIMEOUT_S=7200).
+  # --skip-perf-check reports without the gate (no v6e baseline yet), and
+  # --eval-suites none keeps the runs to perf. Each job's
+  # perf_eval_results/<config>/ artifacts are one --calibrate input.
+  # qwen3-0.6b-tp1 (one chip) is already calibrated.
   # -----------------------------------------------------------------
-  - label: ":stopwatch: Calibrate qwen3-0.6b-tp1 on v6e (run {{matrix}})"
-    key: calibrate_qwen3_0_6b_tp1_v6e
+  - label: ":stopwatch: Calibrate {{matrix.config}} on v6e (run {{matrix.run}})"
+    key: calibrate_v6e
     if: 'build.env("K3_PD_CONFIG") == null'
     depends_on: build_docker
-    matrix: ["1", "2", "3"]
+    matrix:
+      setup:
+        config:
+          # General suite (every perf build)
+          - "qwen3-coder-30b-fp8-tp8-ep"
+          - "qwen3.5-35b-fp8-tp4-ep"
+          - "gemma-4-31b-fp8-dp4-tp2-multimodal"
+          - "gemma-4-26b-fp8-dp4-tp2-multimodal"
+          # Nightly general suite
+          - "qwen3-coder-30b-tp8-ep"
+          - "qwen3.5-35b-fp8-dp8-ep"
+          - "qwen3.5-35b-fp8-dp4-tp2-ep"
+          - "qwen3.5-35b-fp8-tp8-ep"
+          # Nightly, own step
+          - "qwen3-32b-tp8-offload-prefix"
+        run: ["1", "2", "3"]
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -104,12 +122,13 @@ steps:
       - kubernetes:
           podTemplate: tpu-launcher
     env:
-      SHAPE: "ct6e-standard-1t/1x1"
+      SHAPE: "ct6e-standard-8t/2x4"
       TPU_ACCELERATOR_TYPE: "v6e"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
       BENCHMARK_WARMUP_RUNS: "1"
       ARTIFACTS_DIR: "perf_eval_results"
     commands:
-      - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-0.6b-tp1 --perf-suites bench_serve --skip-perf-check
+      - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config {{matrix.config}} --perf-suites bench_serve --eval-suites none --skip-perf-check
 
   # -----------------------------------------------------------------
   # Kimi-K3 megakernel AgentX, on a build that sets K3_PD_CONFIG
