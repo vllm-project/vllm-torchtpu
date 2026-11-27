@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from tests.megakernel.core.megakernel_fakes import FakeGeometry
 from vllm_torchtpu.megakernel.core.decls import (
     REQUIRED,
     FrozenDict,
@@ -35,6 +36,13 @@ from vllm_torchtpu.megakernel.core.decls import (
     VLLMAlias,
     apply_decl_overrides,
     combined_hf_param_shapes,
+)
+from vllm_torchtpu.megakernel.core.modules import (
+    EmbeddingModule,
+    GDNModule,
+    GQAModule,
+    MoEModule,
+    NormModule,
 )
 from vllm_torchtpu.megakernel.core.ops import BF16, F32, FP8
 from vllm_torchtpu.megakernel.core.spec import Module
@@ -345,3 +353,68 @@ def test_rename_transforms_validation_and_reference_lookup():
     assert plain.options == FrozenDict({"flag": True})
     with pytest.raises(TypeError, match="unexpected option"):
         _PlainModule(bad_opt=1)
+
+
+def test_builtin_modules_options_consistent_across_init_bind_and_instantiate():
+    """All built-in `Module`s normalize `.options` identically across entry points."""
+    hf_cfg = {
+        "vocab_size": 1024,
+        "hidden_size": 256,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 8,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 128,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 256,
+        "shared_expert_intermediate_size": 256,
+    }
+    g = FakeGeometry(L=2, att_every=2, H=256, moe_tp=True, e_slots=0)
+
+    for cls, prefix in (
+        (GQAModule, "self_attn"),
+        (GDNModule, "linear_attn"),
+        (MoEModule, "mlp"),
+        (NormModule, "input_layernorm"),
+        (EmbeddingModule, "model.embed_tokens"),
+    ):
+        b = cls.bind(prefix)
+        res = b.resolve(hf_cfg)
+        m_bare = cls(prefix=prefix)
+        m_geom = cls(prefix=prefix, geometry=g)
+        m_from_res = b.to_module(hf_cfg)
+        assert m_bare.options == m_geom.options == res.options == m_from_res.options, (
+            f"options mismatch for {cls.__name__}"
+        )
+
+    for cls, prefix, wd in (
+        (GQAModule, "self_attn", {"att_in": "bf16"}),
+        (GDNModule, "linear_attn", {"lin_in": "bf16"}),
+        (MoEModule, "mlp", {"sh13": "bf16"}),
+    ):
+        b_wd = cls.bind(prefix, weight_dtypes=wd)
+        assert (
+            cls(prefix=prefix, weight_dtypes=wd).options
+            == b_wd.resolve(hf_cfg).options
+            == b_wd.to_module(hf_cfg).options
+        )
+
+    # A non-default GDN gate from the geometry / HF config is recorded the same
+    # way as an explicit one.
+    b_gate = GDNModule.bind("linear_attn")
+    res_gate = b_gate.resolve(hf_cfg | {"gdn_gate": "sigmoid"})
+    g_gate = FakeGeometry(L=2, att_every=2, H=256, gdn_gate="sigmoid")
+    m_geom_gate = GDNModule(prefix="linear_attn", geometry=g_gate)
+    m_from_res_gate = b_gate.to_module(hf_cfg | {"gdn_gate": "sigmoid"})
+    assert (
+        m_geom_gate.options
+        == res_gate.options
+        == m_from_res_gate.options
+        == {"gate": "sigmoid"}
+    )
