@@ -105,6 +105,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.sample import uniform_draws
 from vllm_torchtpu.layers.adapter.sample.fused_greedy_head import (
     FusedGreedyHead,
     GreedyTokenIds,
@@ -1003,6 +1004,7 @@ class TPUModelRunner(GPUModelRunner):
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
         self._sampling_generator: torch.Generator | None = None
+        self._verify_rng_state: torch.Tensor | None = None
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
@@ -4315,6 +4317,19 @@ class TPUModelRunner(GPUModelRunner):
             self._sampling_generator = gen
         return self._sampling_generator
 
+    def _get_verify_rng_state(self) -> torch.Tensor:
+        """The fused non-greedy verify's generator state (``uniform_draws``).
+
+        Seeded lazily from ``model_config.seed``, like the sampling generator,
+        and replaced by the state each verify returns, so TP ranks stay in
+        lockstep the same way.
+        """
+        if self._verify_rng_state is None:
+            self._verify_rng_state = torch.from_numpy(
+                uniform_draws.initial_state(int(self.model_config.seed or 0))
+            ).to(self.device)
+        return self._verify_rng_state
+
     @torch.no_grad()
     def _update_mamba_slot_read_offsets(
         self,
@@ -4552,37 +4567,23 @@ class TPUModelRunner(GPUModelRunner):
                 logits,
                 padded_num_reqs=md.bonus_logits_indices.shape[0],
             )
-            # Same draws, in the same order, as the unfused path below.
-            vocab = logits.shape[-1]
-            bonus_u, accept_u, recover_u = (
-                torch.rand(
-                    shape,
-                    dtype=torch.float32,
-                    device=logits.device,
-                    generator=sampling_generator,
-                )
-                for shape in (
-                    (md.bonus_logits_indices.shape[0], vocab),
-                    md.draft_token_ids.shape,
-                    (md.target_logits_indices.shape[0], vocab),
+            next_tokens, self._verify_rng_state = (
+                self.rejection_sampler.sample_and_verify(
+                    logits,
+                    md.bonus_logits_indices,
+                    md.target_logits_indices,
+                    md.draft_token_ids,
+                    md.draft_lengths,
+                    md.segment_ids,
+                    md.group_indices,
+                    self.speculative_config.num_speculative_tokens,
+                    req_temperatures,
+                    req_top_k,
+                    req_top_p,
+                    self._get_verify_rng_state(),
                 )
             )
-            return self.rejection_sampler.sample_and_verify(
-                logits,
-                md.bonus_logits_indices,
-                md.target_logits_indices,
-                md.draft_token_ids,
-                md.draft_lengths,
-                md.segment_ids,
-                md.group_indices,
-                self.speculative_config.num_speculative_tokens,
-                req_temperatures,
-                req_top_k,
-                req_top_p,
-                bonus_u,
-                accept_u,
-                recover_u,
-            )
+            return next_tokens
         else:
             # Grammar-masked chunks: the masks apply between the gather and the
             # samplers, so they keep the separate programs.
@@ -6520,14 +6521,14 @@ class TPUModelRunner(GPUModelRunner):
                     warm_req_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                         self.device
                     )
-                    warm_bonus_u = torch.zeros(
-                        (num_reqs, self.vocab_size), dtype=torch.float32
-                    ).to(self.device)
+                    # The verify returns the next state; dropping it here
+                    # leaves the serving stream where it was.
+                    warm_rng_state = self._get_verify_rng_state()
                     for top_k, top_p in [
                         (warm_req_top_k, warm_req_top_p),
                         (None, None),
                     ]:
-                        out = self.rejection_sampler.sample_and_verify(
+                        out, _ = self.rejection_sampler.sample_and_verify(
                             dummy_logits,
                             bonus_logits_indices,
                             target_logits_indices,
@@ -6539,9 +6540,7 @@ class TPUModelRunner(GPUModelRunner):
                             warm_req_temps,
                             top_k,
                             top_p,
-                            warm_bonus_u,
-                            warm_accept_u,
-                            warm_recover_u,
+                            warm_rng_state,
                         )
                         synchronize_tensors(out)
                     logger.info(

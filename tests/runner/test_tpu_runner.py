@@ -3262,14 +3262,16 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     assert seen_u_dtypes == [torch.float32] * 3
     seen_u_dtypes.clear()
 
-    # 2. _sample_spec_verify_chunk (bonus_u, accept_u and recover_u)
-    seen_recover_dtypes: list[torch.dtype] = []
+    # 2. _sample_spec_verify_chunk: the fused verify draws its own uniforms
+    # (uniform_draws, float32 by construction) from the runner's RNG state
+    # and hands back the next state, which the runner keeps.
+    state = torch.zeros(4, dtype=torch.int32)
+    next_state = torch.ones(4, dtype=torch.int32)
+    seen_states: list[torch.Tensor] = []
 
     def fake_sample_and_verify(*args):
-        bonus_u, accept_u, recover_u = args[-3:]
-        seen_u_dtypes.append(bonus_u.dtype)
-        seen_recover_dtypes.extend((accept_u.dtype, recover_u.dtype))
-        return torch.zeros((2, 2), dtype=torch.int32)
+        seen_states.append(args[-1])
+        return torch.zeros((2, 2), dtype=torch.int32), next_state
 
     spec_runner = SimpleNamespace(
         _build_padded_sampling_params=(
@@ -3278,6 +3280,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        _get_verify_rng_state=lambda: state,
     )
     spec_runner.rejection_sampler = SimpleNamespace(
         synthetic_mode=False, sample_and_verify=fake_sample_and_verify
@@ -3301,9 +3304,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         scheduler_output=SimpleNamespace(),
         sampling_generator=None,
     )
-    assert seen_u_dtypes == [torch.float32]
-    assert seen_recover_dtypes == [torch.float32] * 2
-    seen_u_dtypes.clear()
+    assert seen_states == [state]
+    assert spec_runner._verify_rng_state is next_state
+    assert seen_u_dtypes == []
 
     # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
     for spec_method in (None, "ngram"):

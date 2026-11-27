@@ -19,7 +19,11 @@ import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
 from vllm_torchtpu.compilation.direct_call import direct_compile
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    MASKED_LOGIT_VALUE,
+    apply_top_k_top_p,
+)
+from vllm_torchtpu.layers.adapter.sample.uniform_draws import uniform_draws
 from vllm_torchtpu.layers.core import table_lookup
 
 if TYPE_CHECKING:
@@ -268,19 +272,17 @@ class RejectionSampler:
         temperatures: torch.Tensor,
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
-        bonus_u: torch.Tensor,
-        accept_u: torch.Tensor,
-        recover_u: torch.Tensor,
-    ) -> torch.Tensor:
+        rng_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Non-greedy verify of one chunk as a single compiled program.
 
-        Gathers the bonus and target rows of ``logits``, samples the bonus
-        tokens (``gumbel_sample``) and runs the random rejection sampler.
-        ``temperatures``, ``top_k`` and ``top_p`` are per request
-        ([padded_num_reqs, 1]); the uniform draws come from the caller, so
-        the random stream is the caller's.
+        Draws its uniforms from ``rng_state`` (``uniform_draws``) inside the
+        program, then verifies with one sample per request
+        (``_sample_one_row_per_request``). ``temperatures``, ``top_k`` and
+        ``top_p`` are per request ([padded_num_reqs, 1]). Returns the selected
+        tokens and the generator state for the next call.
         """
-        return _sample_and_random_rejection(
+        return _draw_and_verify(
             logits,
             bonus_indices,
             target_indices,
@@ -292,9 +294,7 @@ class RejectionSampler:
             temperatures,
             top_k,
             top_p,
-            bonus_u,
-            accept_u,
-            recover_u,
+            rng_state,
             self.synthetic_conditional_rates,
             self.synthetic_mode,
         )
@@ -704,8 +704,7 @@ def _random_rejection_sample_with_segment(
     return selected_tokens[:batch_size]
 
 
-@direct_compile(backend="tpu")
-def _sample_and_random_rejection(
+def _sample_one_row_per_request(
     logits: torch.Tensor,
     bonus_indices: torch.Tensor,
     target_indices: torch.Tensor,
@@ -717,30 +716,197 @@ def _sample_and_random_rejection(
     temperatures: torch.Tensor,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
-    bonus_u: torch.Tensor,
+    sample_u: torch.Tensor,
     accept_u: torch.Tensor,
-    recover_u: torch.Tensor,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
 ) -> torch.Tensor:
-    bonus_logits = torch.index_select(logits, 0, bonus_indices)
-    target_logits = torch.index_select(logits, 0, target_indices)
-    bonus_token_ids = gumbel_sample(
-        bonus_logits, temperatures, bonus_u, top_k, top_p
-    ).view(-1)
-    return _random_rejection_sample_with_segment(
+    """Non-greedy verify with one vocabulary-wide sample per request.
+
+    Each request emits exactly one sampled token: the bonus token when every
+    draft is accepted, else the recovered token at its first rejection. So
+    the accept test runs first and then one Gumbel-max pass over one logits
+    row per request picks that token, from ``sample_u`` [num_reqs, vocab]:
+    the bonus row as ``gumbel_sample`` does, or the rejected slot's target row
+    with the draft token excluded, which samples the residual max(0, p - q)
+    of a greedy draft q (Gumbel-max over log p restricted to tokens other
+    than the draft). Greedy requests take the row's argmax either way.
+    ``temperatures``, ``top_k`` and ``top_p`` are per request ([num_reqs, 1]);
+    ``accept_u`` holds one uniform per draft slot.
+    """
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+
+    draft_token_ids = draft_token_ids.to(torch.int64)
+    valid_draft_token_ids = draft_token_ids >= 0
+    if synthetic_mode:
+        assert synthetic_conditional_rates is not None
+        conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
+        accepted = accept_u < conditional_rates
+    else:
+        # Accept test is the Leviathan ratio min(1, p(x) / q(x)); the draft is
+        # greedy (q(x) == 1), so it collapses to p(x).
+        target_logits = torch.index_select(logits, 0, target_indices)
+        scaled_logits = target_logits.to(torch.float32) / (
+            temperatures[segment_ids].to(torch.float32) + TEMPERATURE_EPS
+        )
+        masked_logits = apply_top_k_top_p(
+            scaled_logits,
+            None if top_k is None else top_k[segment_ids],
+            None if top_p is None else top_p[segment_ids],
+        )
+        target_probs = torch.softmax(masked_logits, dim=-1)
+        target_token_probs = target_probs.gather(
+            -1, draft_token_ids.clamp(min=0).unsqueeze(-1)
+        ).squeeze(-1)
+        accepted = target_token_probs >= accept_u
+    accepted = accepted & valid_draft_token_ids
+
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+    match_mask = segment_ids.unsqueeze(0) == batch_indices
+    # Only declared draft slots may participate in rejection sampling.
+    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
+    valid_slot_mask = torch.any(
+        match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
+    )
+    large_value = total_tokens
+    rejected_slot = valid_slot_mask & ~accepted
+    rejection_indices = torch.where(
+        rejected_slot,
+        group_indices,
+        torch.tensor(large_value, dtype=torch.int32, device=device),
+    )
+    first_rejection_idx_per_segment = torch.min(
+        torch.where(
+            match_mask,
+            rejection_indices.unsqueeze(0),
+            torch.tensor(large_value, dtype=torch.int32, device=device),
+        ),
+        dim=1,
+    ).values
+    all_accepted = first_rejection_idx_per_segment == large_value
+    should_get_bonus = all_accepted | (num_draft_tokens == 0)
+
+    # The row each request samples from: its first rejected slot's target row,
+    # else its bonus row; a rejected slot's (valid) draft is excluded.
+    at_first_rejection = match_mask & (
+        group_indices.unsqueeze(0) == first_rejection_idx_per_segment.unsqueeze(1)
+    )
+    rejected_slot_row = torch.argmax(at_first_rejection.to(torch.int32), dim=1)
+    sample_rows = torch.where(
+        should_get_bonus, bonus_indices, target_indices[rejected_slot_row]
+    )
+    excluded_token_ids = torch.where(
+        should_get_bonus | ~valid_draft_token_ids[rejected_slot_row],
+        -1,
+        draft_token_ids[rejected_slot_row],
+    )
+
+    row_logits = torch.index_select(logits, 0, sample_rows).to(torch.float32)
+    is_greedy = temperatures <= SAMPLING_EPS
+    safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
+    masked_logits = apply_top_k_top_p(row_logits / safe_temperatures, top_k, top_p)
+    sample_u = torch.clamp(
+        sample_u,
+        min=torch.finfo(sample_u.dtype).tiny,
+        max=1.0 - torch.finfo(sample_u.dtype).eps,
+    )
+    noisy_logits = masked_logits - torch.log(-torch.log(sample_u))
+    vocab_ids = torch.arange(logits.shape[-1], device=device).unsqueeze(0)
+    noisy_logits = torch.where(
+        vocab_ids == excluded_token_ids.unsqueeze(1), float("-inf"), noisy_logits
+    )
+    best, sampled = torch.max(torch.where(is_greedy, row_logits, noisy_logits), dim=-1)
+    # With the draft excluded, only filtered-out tokens may be left: the
+    # residual has no mass and the slot takes the draft, as p's argmax. A
+    # residual that is merely tiny (p(draft) ~ 1 at a low temperature) is
+    # still sampled, where a softmax over it would have underflowed to zero.
+    sampled_token_ids = torch.where(
+        (excluded_token_ids >= 0) & (best <= MASKED_LOGIT_VALUE / 2),
+        excluded_token_ids,
+        sampled,
+    ).to(torch.int32)
+
+    # Drafts before the first rejection, the sampled token at it.
+    safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
+    first_rejection_idx_broadcast = first_rejection_idx_per_segment[safe_segment_ids]
+    before_rejection = valid_slot_mask & (group_indices < first_rejection_idx_broadcast)
+    at_rejection = valid_slot_mask & (group_indices == first_rejection_idx_broadcast)
+    main_tokens = torch.where(
+        before_rejection,
+        draft_token_ids.to(torch.int32),
+        torch.where(
+            at_rejection,
+            sampled_token_ids[safe_segment_ids],
+            torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+        ),
+    )
+
+    # Route padding positions to an extra sink row for a safe scatter.
+    selected_tokens = torch.full(
+        (batch_size + 1, max_draft_tokens + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+    segment_ids = segment_ids.to(torch.int64)
+    group_indices = group_indices.to(torch.int64)
+    scatter_segment_ids = torch.where(
+        valid_slot_mask, segment_ids, torch.full_like(segment_ids, batch_size)
+    )
+    scatter_group_indices = torch.where(
+        valid_slot_mask, group_indices, torch.zeros_like(group_indices)
+    )
+    selected_tokens[scatter_segment_ids, scatter_group_indices] = main_tokens
+
+    accepted_count = torch.where(
+        all_accepted, num_draft_tokens, first_rejection_idx_per_segment
+    ).to(torch.int64)
+    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
+    selected_tokens[batch_range, accepted_count] = torch.where(
+        should_get_bonus,
+        sampled_token_ids,
+        selected_tokens[batch_range, accepted_count],
+    )
+    return selected_tokens[:batch_size]
+
+
+@direct_compile(backend="tpu")
+def _draw_and_verify(
+    logits: torch.Tensor,
+    bonus_indices: torch.Tensor,
+    target_indices: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    rng_state: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sample_u, accept_u, rng_state = uniform_draws(
+        rng_state, bonus_indices.shape[0], logits.shape[-1], draft_token_ids.shape[0]
+    )
+    selected_tokens = _sample_one_row_per_request(
+        logits,
+        bonus_indices,
+        target_indices,
         draft_token_ids,
-        target_logits,
         num_draft_tokens,
-        bonus_token_ids,
         segment_ids,
         group_indices,
         max_draft_tokens,
-        temperatures[segment_ids],
-        None if top_k is None else top_k[segment_ids],
-        None if top_p is None else top_p[segment_ids],
+        temperatures,
+        top_k,
+        top_p,
+        sample_u,
         accept_u,
-        recover_u,
         synthetic_conditional_rates,
         synthetic_mode,
     )
+    return selected_tokens, rng_state

@@ -20,9 +20,11 @@ import pytest
 import torch
 import torch._dynamo
 
+from vllm_torchtpu.layers.adapter.sample import uniform_draws
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    _sample_one_row_per_request,
     gumbel_sample,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
@@ -889,73 +891,170 @@ def test_greedy_token_ids_match_logits_path(device, synthetic, edge):
     assert torch.equal(actual.cpu(), expected.cpu())
 
 
-@pytest.mark.parametrize("synthetic", [False, True])
-@pytest.mark.parametrize("filtered", [False, True])
-def test_sample_and_verify_matches_unfused_path(device, synthetic, filtered):
-    """The single-program non-greedy verify returns what the gather, the bonus
-    sampler and the random rejection sampler return as separate calls."""
+def _verify_chunk(device, synthetic, filtered, seed=7):
+    """3 requests padded to 4; request 1 has no drafts, the last slot is
+    padding with the num_reqs sentinel segment."""
+    gen = torch.Generator().manual_seed(seed)
+    vocab = 64
+    logits = torch.randn((12, vocab), generator=gen)
+    target_indices = torch.tensor([0, 1, 2, 6, 7, 9, 10], dtype=torch.int32)
+    drafts = torch.argmax(torch.index_select(logits, 0, target_indices), dim=-1)
+    drafts = drafts.to(torch.int32)
+    drafts[1] = (drafts[1] + 1) % vocab
+    drafts[-1] = PLACEHOLDER_TOKEN_ID
+    chunk = dict(
+        logits=logits,
+        bonus_indices=torch.tensor([3, 5, 8, 11], dtype=torch.int32),
+        target_indices=target_indices,
+        draft_token_ids=drafts,
+        num_draft_tokens=torch.tensor([3, 0, 3, 0], dtype=torch.int32),
+        segment_ids=torch.tensor([0, 0, 0, 2, 2, 2, 3], dtype=torch.int64),
+        group_indices=torch.tensor([0, 1, 2, 0, 1, 2, 0], dtype=torch.int32),
+        temperatures=torch.tensor([[0.7], [1.0], [0.0], [1.0]]),
+        top_k=None,
+        top_p=None,
+    )
+    if filtered:
+        chunk["top_k"] = torch.tensor([[5], [0], [0], [0]], dtype=torch.int32)
+        chunk["top_p"] = torch.tensor([[1.0], [0.9], [1.0], [1.0]])
+    chunk = {k: None if v is None else v.to(device) for k, v in chunk.items()}
     sampler = (
         _synthetic_sampler([0.9, 0.6, 0.3], device) if synthetic else RejectionSampler()
     )
-    gen = torch.Generator().manual_seed(7)
-    vocab = 64
-    logits = torch.randn((12, vocab), generator=gen).to(device)
-    # 3 requests padded to 4; request 1 has no drafts, the last slot is padding
-    # with the num_reqs sentinel segment.
-    target_indices = torch.tensor([0, 1, 2, 6, 7, 9, 10], dtype=torch.int32).to(device)
-    bonus_indices = torch.tensor([3, 5, 8, 11], dtype=torch.int32).to(device)
-    num_drafts = torch.tensor([3, 0, 3, 0], dtype=torch.int32).to(device)
-    segments = torch.tensor([0, 0, 0, 2, 2, 2, 3], dtype=torch.int64).to(device)
-    groups = torch.tensor([0, 1, 2, 0, 1, 2, 0], dtype=torch.int32).to(device)
-    gathered = torch.index_select(logits, 0, target_indices)
-    drafts = torch.argmax(gathered, dim=-1).to(torch.int32)
-    drafts[1] = (drafts[1] + 1) % vocab
-    drafts[-1] = PLACEHOLDER_TOKEN_ID
-    temperatures = torch.tensor([[0.7], [1.0], [0.0], [1.0]]).to(device)
-    top_k = top_p = None
-    if filtered:
-        top_k = torch.tensor([[5], [0], [0], [0]], dtype=torch.int32).to(device)
-        top_p = torch.tensor([[1.0], [0.9], [1.0], [1.0]]).to(device)
-    bonus_u = torch.rand((4, vocab), generator=gen).to(device)
-    accept_u = torch.rand((7,), generator=gen).to(device)
-    recover_u = torch.rand((7, vocab), generator=gen).to(device)
+    return sampler, chunk
 
-    bonus = gumbel_sample(
-        torch.index_select(logits, 0, bonus_indices),
-        temperatures,
-        bonus_u,
-        top_k,
-        top_p,
-    ).view(-1)
-    expected = sampler(
-        draft_token_ids=drafts,
-        num_draft_tokens=num_drafts,
-        target_logits=gathered,
-        bonus_token_ids=bonus,
-        segment_ids=segments,
-        group_indices=groups,
-        max_draft_tokens=3,
-        temperatures=temperatures[segments],
-        top_k=None if top_k is None else top_k[segments],
-        top_p=None if top_p is None else top_p[segments],
-        accept_u=accept_u,
-        recover_u=recover_u,
-        do_sampling=True,
+
+@pytest.mark.parametrize("synthetic", [False, True])
+@pytest.mark.parametrize("filtered", [False, True])
+def test_sample_and_verify_draws_in_program(device, synthetic, filtered):
+    """The single-program verify draws from its generator state and returns
+    the next one: the same as drawing first and verifying with those draws.
+    Off TPU the draws come from the bridge's hash stand-in, so only a TPU run
+    reaches the RngBitGenerator op."""
+    sampler, chunk = _verify_chunk(device, synthetic, filtered)
+    state = torch.from_numpy(uniform_draws.initial_state(3)).to(device)
+    sample_u, accept_u, next_state = uniform_draws.uniform_draws(
+        state, 4, chunk["logits"].shape[-1], 7
     )
-    actual = sampler.sample_and_verify(
-        logits,
-        bonus_indices,
-        target_indices,
-        drafts,
-        num_drafts,
-        segments,
-        groups,
+    assert sample_u.dtype == accept_u.dtype == torch.float32
+    assert float(sample_u.min()) >= 0.0 and float(sample_u.max()) < 1.0
+    expected = _sample_one_row_per_request(
+        **chunk,
+        max_draft_tokens=3,
+        sample_u=sample_u,
+        accept_u=accept_u,
+        synthetic_conditional_rates=sampler.synthetic_conditional_rates,
+        synthetic_mode=sampler.synthetic_mode,
+    )
+    actual, actual_state = sampler.sample_and_verify(
+        chunk["logits"],
+        chunk["bonus_indices"],
+        chunk["target_indices"],
+        chunk["draft_token_ids"],
+        chunk["num_draft_tokens"],
+        chunk["segment_ids"],
+        chunk["group_indices"],
         3,
-        temperatures,
-        top_k,
-        top_p,
-        bonus_u,
-        accept_u,
-        recover_u,
+        chunk["temperatures"],
+        chunk["top_k"],
+        chunk["top_p"],
+        state,
     )
     assert torch.equal(actual.cpu(), expected.cpu())
+    assert torch.equal(actual_state.cpu(), next_state.cpu())
+    assert not torch.equal(next_state.cpu(), state.cpu())
+
+
+@pytest.mark.parametrize("synthetic", [False, True])
+@pytest.mark.parametrize("filtered", [False, True])
+def test_one_row_per_request_accepts_like_unfused_path(device, synthetic, filtered):
+    """Given the same accept draws, the verify accepts the same drafts as the
+    unfused random rejection sampler, and a greedy request (temperature 0)
+    gets the same tokens whatever the noise."""
+    sampler, chunk = _verify_chunk(device, synthetic, filtered)
+    gen = torch.Generator().manual_seed(11)
+    vocab = chunk["logits"].shape[-1]
+    accept_u = torch.rand((7,), generator=gen).to(device)
+    actual = _sample_one_row_per_request(
+        **chunk,
+        max_draft_tokens=3,
+        sample_u=torch.rand((4, vocab), generator=gen).to(device),
+        accept_u=accept_u,
+        synthetic_conditional_rates=sampler.synthetic_conditional_rates,
+        synthetic_mode=sampler.synthetic_mode,
+    )
+    segments = chunk["segment_ids"]
+    bonus = gumbel_sample(
+        torch.index_select(chunk["logits"], 0, chunk["bonus_indices"]),
+        chunk["temperatures"],
+        torch.rand((4, vocab), generator=gen).to(device),
+        chunk["top_k"],
+        chunk["top_p"],
+    ).view(-1)
+    expected = sampler(
+        draft_token_ids=chunk["draft_token_ids"],
+        num_draft_tokens=chunk["num_draft_tokens"],
+        target_logits=torch.index_select(chunk["logits"], 0, chunk["target_indices"]),
+        bonus_token_ids=bonus,
+        segment_ids=segments,
+        group_indices=chunk["group_indices"],
+        max_draft_tokens=3,
+        temperatures=chunk["temperatures"][segments],
+        top_k=None if chunk["top_k"] is None else chunk["top_k"][segments],
+        top_p=None if chunk["top_p"] is None else chunk["top_p"][segments],
+        accept_u=accept_u,
+        recover_u=torch.rand((7, vocab), generator=gen).to(device),
+        do_sampling=True,
+    )
+    actual, expected = actual.cpu(), expected.cpu()
+    emitted = (actual != PLACEHOLDER_TOKEN_ID).sum(dim=1)
+    assert torch.equal(emitted, (expected != PLACEHOLDER_TOKEN_ID).sum(dim=1))
+    for row, count in enumerate(emitted.tolist()):
+        assert torch.equal(actual[row, : count - 1], expected[row, : count - 1])
+    greedy = (chunk["temperatures"].cpu() == 0).view(-1)
+    assert torch.equal(actual[greedy], expected[greedy])
+
+
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_one_row_per_request_samples_the_target_distribution(device, synthetic):
+    """Speculative sampling's guarantee: with one draft per request, the first
+    emitted token follows the target distribution p, the recovered token the
+    residual (p without the draft, renormalized) and the bonus token p."""
+    num_reqs, vocab, draft = 20000, 8, 4
+    row = torch.tensor([1.0, 2.5, 0.3, -1.0, 2.0, 0.0, 1.5, -0.5])
+    rates = torch.tensor([0.6], device=device) if synthetic else None
+    gen = torch.Generator().manual_seed(5)
+    out = _sample_one_row_per_request(
+        logits=row.repeat(2 * num_reqs, 1).to(device),
+        bonus_indices=torch.arange(1, 2 * num_reqs, 2, dtype=torch.int32).to(device),
+        target_indices=torch.arange(0, 2 * num_reqs, 2, dtype=torch.int32).to(device),
+        draft_token_ids=torch.full((num_reqs,), draft, dtype=torch.int32).to(device),
+        num_draft_tokens=torch.ones(num_reqs, dtype=torch.int32).to(device),
+        segment_ids=torch.arange(num_reqs).to(device),
+        group_indices=torch.zeros(num_reqs, dtype=torch.int32).to(device),
+        max_draft_tokens=1,
+        temperatures=torch.ones(num_reqs, 1).to(device),
+        top_k=None,
+        top_p=None,
+        sample_u=torch.rand((num_reqs, vocab), generator=gen).to(device),
+        accept_u=torch.rand((num_reqs,), generator=gen).to(device),
+        synthetic_conditional_rates=rates,
+        synthetic_mode=synthetic,
+    ).cpu()
+    p = torch.softmax(row.double(), dim=-1)
+    residual = torch.where(torch.arange(vocab) == draft, 0.0, p)
+    residual /= residual.sum()
+
+    def chi_square(tokens, q):
+        observed = torch.bincount(tokens.long(), minlength=vocab).double()
+        expected = q * tokens.numel()
+        assert observed[expected == 0].sum() == 0
+        keep = expected > 0
+        return float(((observed - expected)[keep] ** 2 / expected[keep]).sum())
+
+    accepted = out[:, 0] == draft
+    # 99.9th percentile of chi-square with 6 / 7 degrees of freedom.
+    assert chi_square(out[~accepted, 0], residual) < 22.5
+    assert chi_square(out[accepted, 1], p) < 24.3
+    if not synthetic:
+        assert chi_square(out[:, 0], p) < 24.3
