@@ -1332,6 +1332,7 @@ def exchange_partner_pages_wait(
     rank: jax.Array,
     need: jax.Array,
     xfer: jax.Array,
+    sources: tuple[jax.Array, ...] = (),
     *,
     dcp: int,
     replicas: int,
@@ -1340,12 +1341,15 @@ def exchange_partner_pages_wait(
 ) -> tuple[jax.Array, ...]:
     """Retires `exchange_partner_pages_start`'s copies: this rank's sends
     and its receives (the partner head's pages if ``need[rank] > 0``, the
-    ``xfer[3]`` tiles). Returns ``(pages, scales, queries, keys)``."""
+    ``xfer[3]`` tiles). Returns ``(pages, scales, queries, keys)``.
+    `sources`: the start's query and key inputs, operands here so that their
+    buffers outlive the copies that read them."""
     bufs = future[:4]
     sems = future[5 : 5 + _PARTNER_SEMS]
     part = bufs[0].shape[2]
 
     def kernel(live_ref, rank_ref, need_ref, xfer_ref, *refs):
+        refs = refs[: 4 + _PARTNER_SEMS] + refs[4 + _PARTNER_SEMS + len(sources) :]
         sems = refs[4 : 4 + _PARTNER_SEMS]
         out_ref, sc_out_ref, q_out_ref, k_out_ref = refs[4 + _PARTNER_SEMS :]
         _partner_waits(
@@ -1361,7 +1365,9 @@ def exchange_partner_pages_wait(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
             grid=(1,),
-            in_specs=[any_spec] * 4 + [sem_spec] * _PARTNER_SEMS,
+            in_specs=[any_spec] * 4
+            + [sem_spec] * _PARTNER_SEMS
+            + [any_spec] * len(sources),
             out_specs=(any_spec,) * 4,
         ),
         out_shape=tuple(jax.ShapeDtypeStruct(b.shape, b.dtype) for b in bufs),
@@ -1369,7 +1375,7 @@ def exchange_partner_pages_wait(
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_partner_wait",
-    )(live, rank, need, xfer, *bufs, *sems)
+    )(live, rank, need, xfer, *bufs, *sems, *sources)
 
 
 def exchange_partner_pages(
@@ -1574,11 +1580,14 @@ def _attend_row_split_balanced(attend, q, kv, keys, local, limit, page_table, *,
 
     def moved(q_rows):
         future = partner_start(q_rows, keys, xfer)
+        q_sent = q_rows
         future, q_rows, own_keys_ = jax.lax.optimization_barrier(
             (future, q_rows, own_keys)
         )
         out, _ = attend(q_rows, kv, own_keys_, own_local, limit, page_table)
-        attend_partner, q_win, k_win = partner_wait(future, out, xfer)
+        attend_partner, q_win, k_win = partner_wait(
+            future, out, xfer, (q_sent, keys)
+        )
 
         def helper(args):
             q_win, k_win = args
@@ -1804,11 +1813,11 @@ def _head_parallel_attend(
             def partner_start(*args):
                 return partner(need, *args) if asynchronous else (need, args)
 
-            def partner_wait(fut, deps, xfer):
+            def partner_wait(fut, deps, xfer, sources):
                 fut, _ = jax.lax.optimization_barrier((fut, deps))
                 if asynchronous:
                     kv2, sc2, q_in, k_in = exchange_partner_pages_wait(
-                        fut, live1, rank1, need, xfer, dcp=dcp,
+                        fut, live1, rank1, need, xfer, sources, dcp=dcp,
                         replicas=replicas, block_q=block_q, interpret=interpret,
                     )
                 else:
