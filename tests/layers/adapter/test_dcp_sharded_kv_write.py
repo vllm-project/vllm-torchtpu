@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -35,6 +36,7 @@ from vllm_torchtpu.layers.adapter import dcp_token_parallel_op as tp_op_mod
 from vllm_torchtpu.layers.adapter import moe_prefill_sp as sp
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+from vllm_torchtpu.models.vllm import glm_dsa_dispatch
 
 
 def _make_16dev_mesh() -> Mesh:
@@ -1445,3 +1447,203 @@ def test_should_match_replicated_kv_write_across_tight_tier_switches() -> None:
             block_tables=bt,
             query_start_loc=qsl,
         )
+
+
+def _make_dcp_mesh(dcp: int) -> Mesh:
+    devs = jax.devices()
+    if len(devs) < dcp:
+        pytest.skip(f"needs {dcp} JAX devices, got {len(devs)}")
+    return Mesh(np.array(devs[:dcp]), ("dcp",))
+
+
+def _make_unique_bf16_rows(
+    num_tokens: int,
+    cols: int,
+    split_rows: int,
+) -> jax.Array:
+    assert cols >= 16 and num_tokens <= 16384
+    rows = np.arange(num_tokens, dtype=np.int32)
+    arr = np.empty((num_tokens, cols), dtype=np.float32)
+    # Exact bf16 base-128 coordinates stay collision-free up to 16,384 rows.
+    arr[:, 0] = (rows // 128).astype(np.float32)
+    arr[:, 1] = (rows % 128).astype(np.float32)
+    arr[:, 2] = -((rows % 64) + 1).astype(np.float32)
+    col_off = np.arange(cols - 3, dtype=np.float32)[None, :] * 0.125
+    arr[:, 3:] = (rows[:, None] % 31).astype(np.float32) * 0.25 + col_off
+    for row_idx, sentinel in (
+        (0, 101.0),
+        (split_rows - 1, -103.0),
+        (split_rows, 107.0),
+        (num_tokens - 1, -109.0),
+    ):
+        arr[row_idx, -1] = sentinel
+    bf16 = jnp.asarray(arr, dtype=jnp.bfloat16)
+    u16 = np.asarray(jax.lax.bitcast_convert_type(bf16, jnp.uint16))
+    assert np.unique(u16, axis=0).shape[0] == num_tokens
+    return bf16
+
+
+def _capture_qc_head_shift_fn(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mesh: Mesh,
+    layout: dcp_token_parallel.TokenParallelLayout,
+) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    captured: list[dict] = []
+
+    def _capture_op(name, fn, **kwargs):
+        record = {"name": name, "fn": fn, "kwargs": kwargs, "fake": None}
+
+        def _op(*args):
+            return record["fake"](*args)
+
+        def _register_fake(fake_fn):
+            record["fake"] = fake_fn
+
+        _op.register_fake = _register_fake
+        captured.append(record)
+        return _op
+
+    monkeypatch.setattr(glm_dsa_dispatch, "_shared_jax_ops", {})
+    monkeypatch.setattr(tp_op_mod, "pcp_streaming_jax_op", _capture_op)
+    monkeypatch.setattr(
+        tp_op_mod, "_sharded_rank_ids", lambda: torch.zeros((1,), dtype=torch.int32)
+    )
+    monkeypatch.setattr(
+        tp_op_mod, "dcp_rank_operand", lambda: torch.zeros((1,), dtype=torch.int32)
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size",
+        lambda: layout.dcp_size,
+    )
+
+    class _LayerStub:
+        kv_cache_quantized_dtype = None
+        scale = 0.125
+        num_heads = 4
+        v_head_dim = 16
+        kv_lora_rank = 32
+
+    layer = _LayerStub()
+    impl = SimpleNamespace(
+        _dcp_mesh=mesh,
+        dcp_size=layout.dcp_size,
+        dcp_interleave_size=layout.interleave_size,
+    )
+    tp_op_mod.build_attention_op(layer, impl, layout, q_replicated=True)
+
+    matches = [r for r in captured if r["name"].startswith("pallas::dcp_qc_head_shift")]
+    assert len(matches) == 1
+    record = matches[0]
+    assert record["kwargs"]["mesh"] is mesh
+    assert record["kwargs"]["input_partition_specs"] == (P("dcp"), P("dcp"))
+    assert record["kwargs"]["output_partition_specs"] == (P("dcp"),)
+    return record["fn"]
+
+
+def _assert_qc_head_shift_matches_q_rows(
+    *,
+    shift_fn: Callable[[jax.Array, jax.Array], jax.Array],
+    mesh: Mesh,
+    layout: dcp_token_parallel.TokenParallelLayout,
+    cases: list[tuple[int, int]],
+) -> None:
+    dcp = layout.dcp_size
+    split_rows = layout.split_rows
+    shd = NamedSharding(mesh, P("dcp"))
+    ranks_shd = _sharded_array(np.arange(dcp, dtype=np.int32), mesh)
+    mismatches: list[tuple[int, int, int, list[int]]] = []
+
+    for num_tokens, cols in cases:
+        rows_local = layout.rows_per_rank(num_tokens)
+        nb = layout.effective_zigzag_bands(num_tokens)
+        full_qc = _make_unique_bf16_rows(num_tokens, cols, split_rows)
+        full_u16 = np.asarray(jax.lax.bitcast_convert_type(full_qc, jnp.uint16))
+        full_np = np.asarray(full_qc)
+
+        rank_chunks = [
+            full_np[
+                np.asarray(
+                    dcp_token_parallel.zigzag_rank_global_tokens(r, rows_local, dcp, nb)
+                )
+            ]
+            for r in range(dcp)
+        ]
+        qc_shd = jax.device_put(
+            jnp.asarray(np.concatenate(rank_chunks, axis=0), dtype=jnp.bfloat16),
+            shd,
+        )
+        got = jax.jit(shift_fn)(qc_shd, ranks_shd)
+        got_u16 = np.asarray(jax.lax.bitcast_convert_type(got, jnp.uint16)).reshape(
+            dcp, split_rows + rows_local, cols
+        )
+
+        bad_ranks: list[int] = []
+        for r in range(dcp):
+            want_idx = tp_op_mod.q_rows(
+                SimpleNamespace(
+                    layout=layout, rank=torch.tensor([r], dtype=torch.int32)
+                ),
+                num_tokens,
+            ).numpy()
+            if not np.array_equal(got_u16[r], full_u16[want_idx]):
+                bad_ranks.append(r)
+        if bad_ranks:
+            mismatches.append((num_tokens, cols, nb, bad_ranks))
+
+    assert not mismatches, (
+        f"qc_head_shift mismatches (T, cols, nb, bad_ranks): {mismatches}"
+    )
+
+
+def test_should_align_qc_head_shift_with_global_token_count_on_4dev(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dcp = 4
+    mesh = _make_dcp_mesh(dcp)
+    layout = dcp_token_parallel.TokenParallelLayout(
+        dcp_size=dcp,
+        page_size=16,
+        interleave_size=4,
+        split_rows=16,
+        max_pages=8,
+        zigzag_bands=4,
+    )
+    shift_fn = _capture_qc_head_shift_fn(monkeypatch, mesh=mesh, layout=layout)
+    _assert_qc_head_shift_matches_q_rows(
+        shift_fn=shift_fn,
+        mesh=mesh,
+        layout=layout,
+        cases=[
+            (64, 16),  # R == split_rows, band-size contiguous fallback (nb=1)
+            (128, 16),  # band-size contiguous fallback (nb=1)
+            (256, 16),  # active 4-band zigzag (nb=4)
+            (260, 24),  # indivisible by dcp*zb (nb=1) and wider [T, Q+W] width
+        ],
+    )
+
+
+def test_should_align_qc_head_shift_with_global_token_count_on_16dev(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dcp = 16
+    mesh = _make_dcp_mesh(dcp)
+    layout = dcp_token_parallel.TokenParallelLayout(
+        dcp_size=dcp,
+        page_size=64,
+        interleave_size=4,
+        split_rows=64,
+        max_pages=8,
+        zigzag_bands=4,
+    )
+    shift_fn = _capture_qc_head_shift_fn(monkeypatch, mesh=mesh, layout=layout)
+    _assert_qc_head_shift_matches_q_rows(
+        shift_fn=shift_fn,
+        mesh=mesh,
+        layout=layout,
+        cases=[
+            (1024, 16),  # R == split_rows, contiguous fallback (nb=1)
+            (2048, 24),  # contiguous fallback (nb=1) and wider [T, Q+W] width
+            (4096, 16),  # active 4-band zigzag (nb=4)
+        ],
+    )
