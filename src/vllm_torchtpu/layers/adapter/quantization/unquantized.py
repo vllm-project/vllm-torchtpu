@@ -285,6 +285,12 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
         layer = cast("TpuRoutedExperts", layer)
+        if (
+            getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+            and getattr(layer.w13_weight, WEIGHT_FLIPPED_ATTR, False)
+            and getattr(layer.w2_weight, WEIGHT_FLIPPED_ATTR, False)
+        ):
+            return  # already flipped; reload paths replace Parameter objects
 
         # Pre-compute activation string: layer.activation is a MoEActivation
         # enum in v0.17.1 but the Pallas kernel expects a plain string.
@@ -319,6 +325,9 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+        setattr(layer.w13_weight, WEIGHT_FLIPPED_ATTR, True)
+        setattr(layer.w2_weight, WEIGHT_FLIPPED_ATTR, True)
+        setattr(layer, WEIGHT_FLIPPED_ATTR, True)
 
         if self.moe.has_bias:
             assert layer.w13_bias is not None and layer.w2_bias is not None

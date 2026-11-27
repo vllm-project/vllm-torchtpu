@@ -224,6 +224,10 @@ if TYPE_CHECKING:
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
     VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
+    WEIGHT_SYNC_PARALLEL_H2H: bool = False
+    RAIDEN_PARALLELISM: int | None = None
+    RAIDEN_BIND_IP: str = ""
+    VERIFY_WEIGHTS: bool = False
 
 
 def env_with_choices(
@@ -1380,6 +1384,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
+    # Enable explicit two-phase H2H + H2D Raiden RL weight synchronization.
+    "WEIGHT_SYNC_PARALLEL_H2H": env_bool("WEIGHT_SYNC_PARALLEL_H2H", default=False),
+    # Override number of parallel transfer streams per Raiden WeightSynchronizer.
+    "RAIDEN_PARALLELISM": env_positive_int_or_none("RAIDEN_PARALLELISM"),
+    # Explicit bind/advertise IP address override for Raiden weight sync.
+    "RAIDEN_BIND_IP": env_str("RAIDEN_BIND_IP", ""),
+    # Log bound variable layouts and return L1 checksums after Raiden H2D sync.
+    "VERIFY_WEIGHTS": env_bool("VERIFY_WEIGHTS", default=False),
 }
 
 

@@ -175,6 +175,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_ADVERTISE_HOST",
     "TPU_RAIDEN_RESHARD_PORT_BASE",
     "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE",
+    # RL Raiden weight-sync transport/debug knobs; consumed out-of-band by
+    # RaidenWorkerSync and never affect compiled XLA graphs.
+    "RAIDEN_BIND_IP",
+    "RAIDEN_PARALLELISM",
+    "VERIFY_WEIGHTS",
+    "WEIGHT_SYNC_PARALLEL_H2H",
     "TPU_WORKER_ID",
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
