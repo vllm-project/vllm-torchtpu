@@ -3725,8 +3725,10 @@ class TPUModelRunner(GPUModelRunner):
             request_major_input_ids_cpu_padded.narrow(0, 0, global_num_tokens).copy_(
                 request_major_input_ids_cpu
             )
-            request_major_input_ids = request_major_input_ids_cpu_padded.to(
-                self.device, non_blocking=True
+            # A host tensor built for this step: staging keeps it alive until
+            # the upload is fenced.
+            request_major_input_ids = stage_h2d_upload(
+                self, request_major_input_ids_cpu_padded
             )
         if zero_pad_tail:
             # Zero out to avoid spurious values from prev iteration.

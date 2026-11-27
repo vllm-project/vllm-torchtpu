@@ -29,6 +29,11 @@ from runner_input_test_utils import _make_runner, _scheduler_output
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
+_PCP_LAYOUT_RANK = "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank"
+_PCP_LAYOUT_WORLD_SIZE = (
+    "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_world_size"
+)
+
 
 def _ids(tensors):
     return {id(t) for t in tensors}
@@ -96,3 +101,28 @@ def test_logits_indices_upload_is_staged():
     logits_indices = prepared[1]
     assert id(logits_indices) in _ids(_staged(runner))
     assert logits_indices.tolist()[:2] == [2, 4]
+
+
+def test_pcp_mtp_request_major_input_ids_upload_is_staged(monkeypatch):
+    """With PCP and MTP, `_prepare_inputs` copies the request-major input ids
+    into a host tensor built for the step; its upload is staged."""
+    scheduled = [25]
+    runner = _make_runner(
+        num_computed_tokens=[0],
+        prompt_tokens=scheduled,
+        scheduled_tokens=scheduled,
+        token_paddings=[256],
+        mtp_enabled=True,
+        pcp_size=2,
+    )
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 1)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    prepared = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output(scheduled), 0, 0
+    )
+
+    request_major_input_ids = prepared[-2]
+    assert request_major_input_ids is not None
+    assert id(request_major_input_ids) in _ids(_staged(runner))
+    assert request_major_input_ids[:25].tolist() == list(range(100, 125))
