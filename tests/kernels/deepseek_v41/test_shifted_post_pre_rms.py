@@ -200,3 +200,25 @@ def test_multi_tile_rows_match_single_tiles(tokens):
                 np.ascontiguousarray(f[rows]).view(np.uint8),
                 np.ascontiguousarray(b).view(np.uint8),
             )
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
+def test_chunked_weight_projection_is_bitwise_one_dot(monkeypatch):
+    # The 16-token seam projects per MXU K step as its weight chunks land;
+    # summed in order, the steps must give exactly the one-dot projection.
+    args = _inputs(16)
+    layout = {
+        "unpadded_gates": True,
+        "gate_input_mode": mhc.GateInputMode.HBM,
+        "early_prep": True,
+        "fused_gates": True,
+    }
+    assert mhc._WEIGHT_CHUNKS > 1
+    got = jax.jit(lambda *a: _layers(layout, *a))(*args)
+    monkeypatch.setattr(mhc, "_WEIGHT_CHUNKS", 1)
+    ref = jax.jit(lambda *a: _layers(layout, *a))(*args)
+    for r, g in zip(ref, got, strict=True):
+        np.testing.assert_array_equal(
+            np.ascontiguousarray(r).view(np.uint8),
+            np.ascontiguousarray(g).view(np.uint8),
+        )

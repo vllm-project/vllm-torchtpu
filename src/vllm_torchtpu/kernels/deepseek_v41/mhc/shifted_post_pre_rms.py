@@ -46,6 +46,15 @@ def is_supported_shape(t: int, m: int, d: int) -> bool:
     return t > 0 and t % 16 == 0 and m == 4 and d == 5120
 
 
+# Up to this many tokens the seam's mix work ends well before its weight has
+# landed, so the weight is read in chunks and projected chunk by chunk.
+_CHUNKED_WEIGHT_MAX_TOKENS = 16
+_WEIGHT_CHUNKS = 4
+# The K step a TPU7x MXU dot accumulates in: dots of this depth summed in order
+# are bitwise one dot.
+_MXU_K_STEP = 256
+
+
 def _token_tile(t: int) -> int:
     """Tokens per pipelined tile: 32-token mix groups, else 16 (T % 32 != 0)."""
     for tile in (128, 96, 32, 80, 48, 16):
@@ -118,6 +127,12 @@ def shifted_post_pre_rms(
     tuning = PostPreTuning(
         token_tile, 32 if token_tile % 32 == 0 else 16, 256, 50 * 1024 * 1024
     )
+    weight_chunks = _WEIGHT_CHUNKS if t <= _CHUNKED_WEIGHT_MAX_TOKENS else 1
+    # Chunks are waited in the projection of the one tile; a second tile would
+    # wait again on semaphores nothing signals.
+    assert weight_chunks == 1 or num_tiles == 1
+    # Each chunk is waited before its first K step: chunks must tile the steps.
+    assert (width // weight_chunks) % _MXU_K_STEP == 0 and width % weight_chunks == 0
     tile, group, columns = (
         tuning.token_tile,
         tuning.mix_group,
@@ -190,9 +205,18 @@ def shifted_post_pre_rms(
             norm_work_refs = norm_weight_scratch
         copies = [
             pltpu.make_async_copy(src, dst, sems.at[i])
-            for i, (src, dst) in enumerate(copy_pairs)
+            for i, (src, dst) in enumerate(copy_pairs[:-1])
         ]
-        for copy in copies[:-1]:
+        chunk_rows = width // weight_chunks
+        weight_copies = [
+            pltpu.make_async_copy(
+                wh.at[pl.ds(c * chunk_rows, chunk_rows), :],
+                wr.at[pl.ds(c * chunk_rows, chunk_rows), :],
+                sems.at[len(copies) + c],
+            )
+            for c in range(weight_chunks)
+        ]
+        for copy in copies:
             copy.start()
         param_copies = []
         if fused_gates:
@@ -310,7 +334,7 @@ def shifted_post_pre_rms(
 
                 @pl.when(tile_index == 0)
                 def wait_gates():
-                    for copy in copies[:-1]:
+                    for copy in copies:
                         copy.wait()
                     prepare(0, 0)
 
@@ -380,28 +404,44 @@ def shifted_post_pre_rms(
                 )
 
             store_vector(sbuf[...].T, sh, tile_index * tile)
+            if weight_chunks == 1:
 
-            @pl.when(tile_index == 0)
-            def wait_weight():
-                copies[-1].wait()
+                @pl.when(tile_index == 0)
+                def wait_weight():
+                    weight_copies[0].wait()
 
             if early_output:
-                # Behind the weight read: started earlier, these writes share
-                # the DMA queue with it and delay the projection.
+                # Unchunked, behind the weight read: started earlier, these
+                # writes share the DMA queue with it and delay the projection.
+                # Chunked, here (before the first chunk wait) measured best.
                 output_copy(tile_index, 0).start()
                 output_copy(tile_index, 1).start()
-            projection_buf[...] = jax.lax.dot(
-                yr[...], wr[...], preferred_element_type=jnp.float32
-            )
+            projection_buf[...] = project(yr)
             store_projection(previous_projected, jnp.maximum(tile_index - 1, 0))
+
+        def project(yr):
+            if weight_chunks == 1:
+                return jax.lax.dot(yr[...], wr[...], preferred_element_type=jnp.float32)
+            # A single tile: start on each weight chunk as it lands.
+            projected = None
+            for start in range(0, width, _MXU_K_STEP):
+                if start % chunk_rows == 0:
+                    weight_copies[start // chunk_rows].wait()
+                k = pl.ds(start, _MXU_K_STEP)
+                part = jax.lax.dot(
+                    yr[:, k], wr[k, :], preferred_element_type=jnp.float32
+                )
+                projected = part if projected is None else projected + part
+            return projected
 
         for index in range(input_buffers):
             for copy in input_copies(index):
                 copy.start()
             if index == 0:
-                copies[-1].start()
+                for copy in weight_copies:
+                    copy.start()
         if early_prep:
-            for copy in copies[:-1]:
+            for copy in copies:
                 copy.wait()
             prepare(0, 0)
 
@@ -548,7 +588,11 @@ def shifted_post_pre_rms(
             pltpu.VMEM((tile, 1), jnp.float32),
             (pltpu.VMEM((tile, 1), jnp.float32),) if norm_weight is not None else (),
             pltpu.SemaphoreType.DMA(
-                (len(gate_scratch_shapes) + 1 + int(norm_weight is not None),)
+                (
+                    len(gate_scratch_shapes)
+                    + weight_chunks
+                    + int(norm_weight is not None),
+                )
             ),
             pltpu.VMEM((tile, 128), jnp.float32),
             *gate_extra_scratch,
