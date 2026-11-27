@@ -46,6 +46,9 @@ class RunnerStageTiming:
 
     @contextlib.contextmanager
     def host_stage(self, stage: str) -> Iterator[None]:
+        if not self._has_sink():
+            yield
+            return
         cpu_start = time.perf_counter()
         yield
         self._cpu_samples.append((self._rank, stage, time.perf_counter() - cpu_start))
@@ -53,14 +56,8 @@ class RunnerStageTiming:
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
         if not self._has_sink():
-            # Nothing will read the timings, but each record() also flushes
-            # the deferred op graph, and later programs are compiled with these
-            # boundaries; keep them with untimed, untracked events.
-            TpuEvent().record()
-            try:
-                yield
-            finally:
-                TpuEvent().record()
+            # Nothing would read the timings: record nothing.
+            yield
             return
         if len(self._pending) >= self.MAX_IN_FLIGHT_DEVICE_TIMINGS:
             with self.host_stage(stage):

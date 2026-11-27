@@ -141,13 +141,9 @@ def test_completed_stages_are_drained_in_record_order(events):
     )
 
 
-def test_without_sink_keeps_flush_points_but_no_timing(monkeypatch):
-    created = []
-
+def test_without_sink_records_nothing(monkeypatch):
     def make_event(**kwargs):
-        assert not kwargs.get("enable_timing")
-        created.append(MagicMock(spec=["record"]))
-        return created[-1]
+        raise AssertionError("no event without a sink")
 
     monkeypatch.setattr(stage_timing, "TpuEvent", make_event)
     timing = stage_timing.RunnerStageTiming(0, has_sink=lambda: False)
@@ -155,10 +151,7 @@ def test_without_sink_keeps_flush_points_but_no_timing(monkeypatch):
         pytest.raises(ValueError, match="stage body"),
         timing.stage("main_forward"),
     ):
-        assert len(created) == 1
         raise ValueError("stage body")
-    # record() flushes the deferred graph, so both boundaries remain.
-    assert len(created) == 2
-    for event in created:
-        event.record.assert_called_once_with()
+    with timing.host_stage("output_assembly"):
+        pass
     assert timing.take_samples() == ([], [])
