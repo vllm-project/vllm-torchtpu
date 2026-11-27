@@ -3,17 +3,17 @@
 Register all TPU patches and workarounds in the ordered `PATCHES` tuple in
 `src/vllm_torchtpu/patch_registry.py`. This registry defines when each patch runs.
 Keep implementations in the relevant modules; the existing lifecycle entry points
-call `apply(stage, model_config=...)` to apply them.
+call `apply(stage, model_config=..., vllm_config=...)` to apply them.
 
 ## Lifecycle stages
 
 | Stage | Entry point | Use |
 | --- | --- | --- |
 | `import` | `env_override.py`, after early environment setup | Import-time prerequisites, currently the JAX Pallas lowering patch. |
-| `platform_activation` | `TpuPlatform.check_and_update_config` | Shared TPU patches and model-specific patches with `vllm_config.model_config`. |
+| `platform_activation` | `TpuPlatform.check_and_update_config` | Shared TPU patches and model-specific patches with `vllm_config.model_config` and `vllm_config`. |
 | `engine_core` | `_run_engine_core_with_tpu_patches` | Scheduler, KV-cache, offloading, and multimodal patches before the original engine-core entry point. |
 | `worker_init` | `TPUWorker.__init__`, before `WorkerBase.__init__` | Shared patches in each worker, including spawned workers. |
-| `model_load` | `TPUWorker.load_model`, before the model runner loads the model | Model-specific patches with `self.model_config`. |
+| `model_load` | `TPUWorker.load_model`, before the model runner loads the model | Model-specific patches with `self.model_config` and `self.vllm_config`. |
 
 Choose stages according to where the patched code runs and when its dependencies
 are available. `_ACTIVE` means `platform_activation` and `worker_init`; `_ENGINE`
@@ -51,6 +51,7 @@ Patch(
 | `target` | `module:callable` imports the module and invokes the named callable. A bare module path imports it for its side effects. The exact target string is the completion key. |
 | `stages` | Tuple of supported stage names at which the entry is eligible. |
 | `model_config` | Defaults to `False`. When `True`, the callback receives `model_config` as a keyword argument, possibly `None`. |
+| `vllm_config` | Defaults to `False`. When `True`, the callback receives `vllm_config` as a keyword argument, possibly `None`. |
 | `refresh` | Optional lazy target invoked on subsequent eligible calls after the primary target completes. It receives no arguments. |
 
 Prefer an explicit callback for additions. The existing bare-module entry for

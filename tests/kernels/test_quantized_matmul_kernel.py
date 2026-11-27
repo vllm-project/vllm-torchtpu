@@ -404,3 +404,31 @@ def test_quantized_matmul_blockwise_int4_fp8(
         block_size=512,
         x_q_dtype=jnp.float8_e4m3fn,
     )
+
+
+@pytest.mark.parametrize("tp", [1, 8])
+def test_quantized_token_shards_match_fused_fp8_matmul(tp: int) -> None:
+    """Rows quantized per token shard, then gathered, match xla_quantized_matmul."""
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.standard_normal((16, 48)) * 3.0, dtype=jnp.bfloat16)
+    x = x.at[3].set(0)
+    w = jnp.asarray(rng.standard_normal((48, 40)), dtype=jnp.float8_e4m3fn)
+    w_scale = jnp.asarray(rng.uniform(0.01, 0.1, (40,)), dtype=jnp.float32)
+
+    shards = [quantize_tensor(s, jnp.float8_e4m3fn) for s in jnp.split(x, tp)]
+    x_q = jnp.concatenate([q for q, _ in shards])
+    x_scale = jnp.concatenate([s for _, s in shards])
+    assert x_scale.shape == (16, 1)
+
+    out = util.xla_prequantized_matmul(x_q, x_scale, w, w_scale, out_dtype=jnp.bfloat16)
+    fused = xla_quantized_matmul(x, w, w_scale)
+    ref = (
+        (x_q.astype(jnp.float32) * x_scale) @ (w.astype(jnp.float32) * w_scale)
+    ).astype(jnp.bfloat16)
+    assert out.dtype == fused.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(
+        np.asarray(out, np.float32), np.asarray(fused, np.float32)
+    )
+    np.testing.assert_allclose(
+        np.asarray(out, np.float32), np.asarray(ref, np.float32), rtol=2e-2, atol=2e-2
+    )

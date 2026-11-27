@@ -179,3 +179,133 @@ def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
         match="does not support pipeline parallelism",
     ):
         configure_sp_moe(vllm_config)
+
+
+@pytest.fixture(scope="module")
+def validate_dense_sp(configure_sp_moe):
+    """Yields `_validate_dense_sequence_parallel` with platform stubs active."""
+    del configure_sp_moe
+    from vllm_torchtpu.platforms.tpu_platform import _validate_dense_sequence_parallel
+
+    return _validate_dense_sequence_parallel
+
+
+def _gemma4_vllm_config(
+    *, enabled: bool = True, **overrides: object
+) -> SimpleNamespace:
+    parallel = SimpleNamespace(
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+    model = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="gemma4_text"),
+    )
+    cfg = SimpleNamespace(
+        additional_config={"tpu_dense_sequence_parallel": enabled} if enabled else {},
+        parallel_config=parallel,
+        model_config=model,
+        lora_config=None,
+        speculative_config=None,
+    )
+    for key, val in overrides.items():
+        if hasattr(parallel, key):
+            setattr(parallel, key, val)
+        elif key == "model_type":
+            model.hf_text_config.model_type = val
+        else:
+            setattr(cfg, key, val)
+    return cfg
+
+
+def test_dense_sp_platform_validation_admits_valid_and_ngram(validate_dense_sp) -> None:
+    from vllm.config import LoRAConfig
+
+    # Flag off: skips validation even at TP=1.
+    validate_dense_sp(_gemma4_vllm_config(enabled=False, tensor_parallel_size=1))
+
+    # Flag on with model_config=None (model-less VllmConfig()): returns cleanly.
+    validate_dense_sp(_gemma4_vllm_config(model_config=None))
+
+    validate_dense_sp(_gemma4_vllm_config())
+    validate_dense_sp(
+        _gemma4_vllm_config(speculative_config=SimpleNamespace(method="ngram"))
+    )
+
+    with pytest.raises(ValueError, match="tpu_dense_sequence_parallel"):
+        validate_dense_sp(
+            _gemma4_vllm_config(
+                additional_config={"tpu_dense_sequence_parallel": "true"}
+            )
+        )
+
+    with pytest.raises(NotImplementedError, match="LoRA"):
+        validate_dense_sp(_gemma4_vllm_config(lora_config=LoRAConfig(max_loras=1)))
+
+
+def test_dense_sp_platform_warns_once_on_non_gemma4(
+    monkeypatch: pytest.MonkeyPatch, validate_dense_sp
+) -> None:
+    from vllm_torchtpu.platforms import tpu_platform
+
+    warn = MagicMock()
+    monkeypatch.setattr(tpu_platform.logger, "warning_once", warn)
+    validate_dense_sp(
+        _gemma4_vllm_config(model_type="qwen3_5_text", tensor_parallel_size=1)
+    )
+    warn.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "exc_type", "match"),
+    [
+        ({"tensor_parallel_size": 1}, ValueError, "tensor_parallel_size > 1"),
+        (
+            {"pipeline_parallel_size": 2},
+            NotImplementedError,
+            "pipeline_parallel_size=2",
+        ),
+        (
+            {"prefill_context_parallel_size": 2},
+            NotImplementedError,
+            "prefill_context_parallel_size=2",
+        ),
+        (
+            {"decode_context_parallel_size": 2},
+            NotImplementedError,
+            "decode_context_parallel_size=2",
+        ),
+        (
+            {"speculative_config": SimpleNamespace(method="mtp")},
+            NotImplementedError,
+            "'mtp'",
+        ),
+        (
+            {"speculative_config": SimpleNamespace(method="eagle3")},
+            NotImplementedError,
+            "'eagle3'",
+        ),
+    ],
+)
+def test_dense_sp_platform_rejects_unsupported_configs(
+    validate_dense_sp,
+    overrides: dict[str, object],
+    exc_type: type[Exception],
+    match: str,
+) -> None:
+    with pytest.raises(exc_type, match=match):
+        validate_dense_sp(_gemma4_vllm_config(**overrides))
+
+
+def test_hier_rs_platform_validation_and_env_forwarding(
+    monkeypatch: pytest.MonkeyPatch, validate_dense_sp
+) -> None:
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    assert "TPU_DENSE_SP_HIER_RS" in TpuPlatform.additional_env_vars
+
+    monkeypatch.setattr(envs, "TPU_DENSE_SP_HIER_RS", "fp8")
+    with pytest.raises(ValueError, match="tpu_dense_sequence_parallel"):
+        validate_dense_sp(_gemma4_vllm_config(enabled=False))

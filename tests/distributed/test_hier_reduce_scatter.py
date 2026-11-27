@@ -310,8 +310,8 @@ def test_prebuild_refuses_on_every_rank_when_one_refuses(arming):
 
 def test_agreed_reason_when_every_rank_refuses_alike(monkeypatch):
     monkeypatch.setattr(hrs, "_gather_reasons", lambda reason: [reason] * 8)
-    assert hrs._agreed_reason("why") == "why"
-    assert hrs._agreed_reason(None) is None
+    assert hrs.agreed_refusal_reason("why") == "why"
+    assert hrs.agreed_refusal_reason(None) is None
 
 
 @pytest.mark.parametrize(

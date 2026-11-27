@@ -50,6 +50,7 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
 from vllm_torchtpu.distributed.ep_mesh import ep_device_placement_key
+from vllm_torchtpu.distributed.tp_mesh import tp_device_placement_key
 from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.logger import init_logger
 
@@ -304,7 +305,10 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/distributed/hier_reduce_scatter.py",
     # Inlined only in Trace 2 of Qwen3.5 overlap warmup while Trace 1 pins cache_dir.
     "vllm_torchtpu/distributed/collectives.py",
+    "vllm_torchtpu/layers/adapter/dense_sequence_parallel.py",
     "vllm_torchtpu/models/vllm/qwen3_next_patch.py",
+    # Owns the device-ordered TP mesh DeviceAssignment for dense SP custom ops.
+    "vllm_torchtpu/distributed/tp_mesh.py",
     # `prefill_checkpoint_enabled` decides whether the GDN op traces with
     # prefill checkpoint operands or with constant None inputs.
     "vllm_torchtpu/gdn_pool_layout.py",
@@ -472,6 +476,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             ),
         },
         "ep_device_placement": ep_device_placement_key(),
+        "tp_device_placement": tp_device_placement_key(),
         # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
         # resolved block count, which every rank shares via kv_cache_config.
         # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM

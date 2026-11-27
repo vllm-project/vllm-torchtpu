@@ -895,7 +895,11 @@ class TPUWorker(WorkerBase):
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         from vllm_torchtpu import patch_registry
 
-        patch_registry.apply("model_load", model_config=self.model_config)
+        patch_registry.apply(
+            "model_load",
+            model_config=self.model_config,
+            vllm_config=self.vllm_config,
+        )
         self.model_runner.load_model()
         # The host buffers the weights were staged in are freed, but the
         # allocator keeps their pages. Return them before initialize_from_config,
