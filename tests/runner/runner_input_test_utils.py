@@ -387,6 +387,7 @@ def _make_sample_runner(
         _adaptive_verification=None,
         _mtp_prefill_only=False,
         _tp_rank0_mask=None,
+        _spec_verify_sampler=None,
         _fence_spec_kv_under_token_copy=False,
         _is_dspark_pd_producer=False,
         is_pooling_model=False,

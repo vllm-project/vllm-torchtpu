@@ -58,6 +58,7 @@ def _runner(*, all_greedy: bool = True, spec_k: int | None = None) -> SimpleName
         ),
         _stage_timing=MagicMock(),
         _greedy_sample=lambda x: torch.argmax(x, dim=-1, keepdim=True),
+        _spec_verify_sampler=None,
         _sampler_topk_candidates=lambda *_args: 0,
         _build_padded_sampling_params=lambda _start, _end, logits: (
             torch.full((logits.shape[0], 1), 0.7),
