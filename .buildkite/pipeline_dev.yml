@@ -219,7 +219,7 @@ steps:
       # step's artifacts, as pipeline_perf.yml declares it.
       ARTIFACTS_DIR: "perf_eval_results"
       # bootstrap_dev.sh leaves dev builds unclassed (Kueue priority 0), the
-      # same standing as scheduled nightlies and behind CI. Setting integration
+      # same standing as the torch-tpu canary and behind CI. Setting integration
       # (30) keeps this 32-chip dev experiment strictly below post-merge (100,
       # main / merge queue) and pre-merge (50, pull requests) so it never blocks
       # or evicts CI, while still letting the 2x2x4 ClusterQueue reclaim lent

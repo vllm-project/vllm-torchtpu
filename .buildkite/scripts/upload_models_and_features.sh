@@ -24,11 +24,6 @@ FEATURE_LIST_KEY="feature-list"
 # SHAPE=${MODEL_SHAPE_MULTI} or ${MODEL_SHAPE_SINGLE}; each generation's group
 # below exports the pod shapes those name before its upload interpolates them.
 
-if [[ ! "${JOB_PRIORITY:-1}" =~ ^-?[0-9]+$ ]]; then
-  echo "ERROR: JOB_PRIORITY must be an integer, got: '${JOB_PRIORITY:-}'"
-  exit 1
-fi
-
 failure_handler() {
   local exit_code=$?
   local line_no=$1
@@ -47,6 +42,16 @@ trap 'failure_handler $LINENO' ERR
 SCRIPTS="$(dirname "${BASH_SOURCE[0]}")"
 V6E_SHAPES="$(python3 "${SCRIPTS}/bootstrap.py" tpu-shapes v6e)"
 V7X_SHAPES="$(python3 "${SCRIPTS}/bootstrap.py" tpu-shapes v7x)"
+
+# The build's job priority, which bootstrap.py records in meta-data: this step
+# runs on the cpu queue without it in its env, and the TPU steps it uploads
+# must queue at the same priority as the rest of the build.
+JOB_PRIORITY="${JOB_PRIORITY:-$(buildkite-agent meta-data get JOB_PRIORITY --default 1)}"
+if [[ ! "${JOB_PRIORITY}" =~ ^-?[0-9]+$ ]]; then
+  echo "ERROR: JOB_PRIORITY must be an integer, got: '${JOB_PRIORITY}'"
+  exit 1
+fi
+
 declare -a TARGET_FOLDERS=()
 
 # Append the kernel_microbenchmarks subdirectories
@@ -149,7 +154,7 @@ if [[ "${#pipeline_v6e_fragments[@]}" -gt 0 ]]; then
   export TENSOR_PARALLEL_SIZE_MULTI=8
   buildkite-agent meta-data set "run_v6_matrix" "true"
   {
-    echo "priority: ${JOB_PRIORITY:-1}"
+    echo "priority: ${JOB_PRIORITY}"
     echo "steps:"
     echo "  - group: \"TPU v6e nightly Tests\""
     echo "    key: \"v6e-group\""
@@ -172,7 +177,7 @@ if [[ "${#pipeline_v7x_fragments[@]}" -gt 0 ]]; then
   export TENSOR_PARALLEL_SIZE_MULTI=8
   buildkite-agent meta-data set "run_v7_matrix" "true"
   {
-    echo "priority: ${JOB_PRIORITY:-1}"
+    echo "priority: ${JOB_PRIORITY}"
     echo "steps:"
     echo "  - group: \"TPU v7x nightly Tests\""
     echo "    key: \"v7x-group\""

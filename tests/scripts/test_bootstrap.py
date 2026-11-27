@@ -352,16 +352,57 @@ class TestBootstrapUnits(unittest.TestCase):
     def test_build_context_properties_and_priorities(self) -> None:
         bp = self.bp
         ctx = bp.BuildContext.from_env
+        # The nightly on main ties with pull requests for agent pods.
+        self.assertEqual(bp.PRIORITIES["nightly"][0], bp.PRIORITIES["pre-merge"][0])
 
         for env, expected_kind, expected_prio in (
             (
-                {"NIGHTLY": "1", "BUILDKITE_SOURCE": "schedule"},
+                {
+                    "NIGHTLY": "1",
+                    "BUILDKITE_SOURCE": "schedule",
+                    "BUILDKITE_BRANCH": "main",
+                },
                 "nightly",
+                (6, "nightly"),
+            ),
+            # Started by hand on main: still the nightly.
+            (
+                {"NIGHTLY": "1", "BUILDKITE_SOURCE": "ui", "BUILDKITE_BRANCH": "main"},
+                "nightly",
+                (6, "nightly"),
+            ),
+            # NIGHTLY=1 off main: a manual full suite or a release gate.
+            (
+                {
+                    "NIGHTLY": "1",
+                    "BUILDKITE_SOURCE": "ui",
+                    "BUILDKITE_BRANCH": "exp/foo",
+                },
+                "unclassed-nightly",
                 (1, None),
             ),
             (
-                {"TORCHTPU_NIGHTLY": "1", "BUILDKITE_SOURCE": "schedule"},
-                "nightly",
+                {"NIGHTLY": "1", "BUILDKITE_BRANCH": "releases/v0.32.0"},
+                "unclassed-nightly",
+                (1, None),
+            ),
+            (
+                {
+                    "TORCHTPU_NIGHTLY": "1",
+                    "BUILDKITE_SOURCE": "schedule",
+                    "BUILDKITE_BRANCH": "main",
+                },
+                "unclassed-nightly",
+                (1, None),
+            ),
+            (
+                {
+                    "NIGHTLY": "1",
+                    "TORCHTPU_NIGHTLY": "1",
+                    "BUILDKITE_SOURCE": "schedule",
+                    "BUILDKITE_BRANCH": "main",
+                },
+                "unclassed-nightly",
                 (1, None),
             ),
             (
@@ -478,7 +519,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                     "BUILDKITE_SOURCE": "schedule",
                 },
-                "nightly",
+                "unclassed-nightly",
                 (1, None),
             ),
             (
@@ -487,7 +528,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                     "BUILDKITE_SOURCE": "api",
                 },
-                "nightly",
+                "unclassed-nightly",
                 (1, None),
             ),
             (
@@ -496,7 +537,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                     "BUILDKITE_SOURCE": "ui",
                 },
-                "nightly",
+                "unclassed-nightly",
                 (1, None),
             ),
             (
@@ -505,7 +546,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                     "BUILDKITE_SOURCE": "ui",
                 },
-                "nightly",
+                "unclassed-nightly",
                 (1, None),
             ),
         ):
@@ -1801,7 +1842,12 @@ class TestBootstrapUnits(unittest.TestCase):
             }
         )
         self.assertEqual(
-            nightly.meta[:2], [("JOB_PRIORITY", "1"), ("VLLM_COMMIT_HASH", self.pinned)]
+            nightly.meta[:3],
+            [
+                ("JOB_PRIORITY", "6"),
+                ("WORKLOAD_PRIORITY", "nightly"),
+                ("VLLM_COMMIT_HASH", self.pinned),
+            ],
         )
         tag_fx = self._run_bootstrap(
             {"BUILDKITE_TAG": "v0.32.0", "BUILDKITE_BRANCH": "v0.32.0"}

@@ -60,7 +60,10 @@ followed by a `wait` and an `upload-stages` step that uploads the TPU lanes
 `-omni`, and the CPU checks) passes. Retrying a failed stage-0 step in Buildkite
 releases the `wait` once the retry passes and runs the uploader step. The
 `oncall-fix` label raises job and Kueue workload priority without changing the
-suite.
+suite. A `NIGHTLY=1` build on `main` runs at the pre-merge job priority and in
+the fleet's `nightly` Kueue class, so its steps queue level with pull requests,
+in order of age. The torch-tpu and tpu-sync canaries and a `NIGHTLY=1` build off
+`main` stay unclassed, at the lowest job priority.
 
 By default, the `tests` lane's TPU steps run only on TPU v7x. A build picks
 other chips with one of these extras in `CI_EXTRAS` (set it in the Buildkite UI
