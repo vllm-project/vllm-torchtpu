@@ -125,7 +125,7 @@ def test_children_derive_one_shared_bootstrap(monkeypatch):
         seen.append((_bootstrap(), tuple(pc._data_parallel_master_port_list)))
     assert len(set(seen)) == 1
     (master_port, sb), ports = seen[0]
-    # The multi-host DP rendezvous port (rpc + 1), unused on this path.
+    # --data-parallel-rpc-port + 1.
     assert master_port == "29551"
     # One address per device of the whole DP4 x TP2 slice.
     assert sb == ",".join(f"localhost:{8070 + i}" for i in range(8))
@@ -154,10 +154,11 @@ def test_dp_group_ports_come_from_the_multi_host_dp_helper(monkeypatch):
 
 def test_bootstrap_honours_overrides(monkeypatch):
     monkeypatch.setenv("TORCH_TPU_BASE_PORT", "9000")
+    # The multi-host rendezvous port does not move the DP master port.
     monkeypatch.setenv("TORCH_TPU_MP_RENDEZVOUS_PORT", "9500")
     mpdp.prepare_multiport_dp_env(_vllm_config(_child_config(1), ON))
     assert _bootstrap() == (
-        "9500",
+        "29551",
         ",".join(f"localhost:{9000 + i}" for i in range(8)),
     )
 
