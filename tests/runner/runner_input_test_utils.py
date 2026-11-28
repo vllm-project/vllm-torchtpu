@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 from vllm.config.reasoning import ReasoningConfig
 from vllm.model_executor.layers.attention import Attention
@@ -27,10 +29,11 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
-from vllm_torchtpu.runner import min_tokens, repetition_penalty
+from vllm_torchtpu.runner import bounded_replay, min_tokens, repetition_penalty
 from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import CachedRequestState
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
     StructuredDecodingManager,
 )
@@ -180,6 +183,7 @@ def _make_runner(
     runner._collect_mamba_state_seed_copies = (
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
+    runner._bounded_replay = bounded_replay.BoundedReplayTracker()  # noqa: SLF001 -- test runner fixture exposes bounded-replay tracker
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),
@@ -462,3 +466,103 @@ def attention_layer_mock(backend=PallasAttentionBackend, **attrs):
         for name, value in {**defaults, **attrs}.items():
             setattr(layer, name, value)
     return layer
+
+
+def init_cpu_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    max_num_reqs: int = 16,
+    max_num_tokens: int = 64,
+    max_model_len: int = 64,
+) -> TPUModelRunner:
+    """Construct a real `TPUModelRunner` on CPU with GPU init stubbed out."""
+    pcfg = SimpleNamespace(
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        cp_kv_cache_interleave_size=16,
+        is_moe_model=False,
+        enable_expert_parallel=False,
+    )
+    mcfg = SimpleNamespace(
+        architecture="LlamaForCausalLM",
+        runner_type="generate",
+        enforce_eager=True,
+        quantization=None,
+        seed=0,
+        get_sliding_window=lambda: None,
+        get_num_layers_by_block_type=lambda _pc, _bt: 1,
+        get_num_kv_heads=lambda _pc: 1,
+        get_head_size=lambda: 64,
+        get_vocab_size=lambda: 128,
+    )
+    vllm_cfg = SimpleNamespace(
+        parallel_config=pcfg,
+        speculative_config=None,
+        kv_transfer_config=None,
+        quant_config=None,
+        reasoning_config=None,
+        load_config=SimpleNamespace(),
+        profiler_config=SimpleNamespace(torch_profiler_dir=""),
+        device_config=SimpleNamespace(device=torch.device("cpu")),
+        compilation_config=SimpleNamespace(
+            cudagraph_capture_sizes=[],
+            cudagraph_mode=None,
+            compile_sizes=[min(16, max_num_tokens), max_num_tokens],
+            static_forward_context={},
+        ),
+        model_config=mcfg,
+        cache_config=SimpleNamespace(cache_dtype="auto", block_size=16),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        additional_config={},
+    )
+
+    def _stub_gpu_init(self: GPUModelRunner, cfg: SimpleNamespace, dev: object) -> None:
+        self.vllm_config = cfg
+        self.model_config = cfg.model_config
+        self.cache_config = cfg.cache_config
+        self.parallel_config = cfg.parallel_config
+        self.scheduler_config = cfg.scheduler_config
+        self.speculative_config = cfg.speculative_config
+        self.load_config = cfg.load_config
+        self.lora_config = None
+        self.device = dev
+        self.dtype = torch.bfloat16
+        self.max_model_len = max_model_len
+        self.max_num_reqs = max_num_reqs
+        self.max_num_tokens = max_num_tokens
+        self.block_size = 16
+        self.uses_mrope = False
+        self.supports_mm_inputs = False
+        self.sample_from_logits = None
+        self.requests = {}
+        self.mesh = None
+        self.drafter = None
+        self.input_batch = SimpleNamespace(
+            block_table=[], _tpu_spec_room_guard=True, req_id_to_index={}
+        )
+
+    monkeypatch.setattr(GPUModelRunner, "__init__", _stub_gpu_init)
+    for attr in (
+        "_validate_libtpu_version",
+        "RunnerStageTiming",
+        "get_tpu_quantization_config",
+        "validate_online_fp8",
+        "install_kernel_block_tables",
+    ):
+        monkeypatch.setattr(f"vllm_torchtpu.runner.tpu_runner.{attr}", lambda *_a: None)
+    for cm in (
+        "_torch_tpu_wrapper",
+        "set_vllm_model_wrapper_context",
+        "set_current_vllm_config",
+    ):
+        monkeypatch.setattr(
+            f"vllm_torchtpu.runner.tpu_runner.{cm}",
+            lambda *_a, **_kw: contextlib.nullcontext(),
+        )
+    for method in ("_update_num_xla_graphs", "_create_mesh_for_parallelism"):
+        monkeypatch.setattr(TPUModelRunner, method, lambda *_a: None)
+    return TPUModelRunner(
+        vllm_cfg, torch.device("cpu"), profiler_rank=0, profiler_world_size=1
+    )

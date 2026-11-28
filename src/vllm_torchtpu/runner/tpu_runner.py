@@ -157,6 +157,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
+    HostScheduleSnapshot,
     attention_block_table_width,
     stage_block_table_uploads,
     stage_h2d_upload,
@@ -176,6 +177,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import (
+    bounded_replay,
     chunk_processors,
     distributed_sampling,
     greedy_top_tokens,
@@ -739,6 +741,7 @@ class TPUModelRunner(GPUModelRunner):
     # Default for a runner built without __init__.
     _pp_handoff: PPBuffered | None = None
     _dp_step_other_decode: bool = False
+    _bounded_replay: bounded_replay.BoundedReplayTracker | None = None
     _adaptive_verification: AdaptiveVerificationManager | None = None
     _thinking_budget: thinking_budget_tracker.ThinkingBudgetTracker | None = None
     _routed_experts: routed_experts.RoutedExpertsCapture | None = None
@@ -1172,6 +1175,10 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
+        # Per-request bounded-replay start positions (evicted in _update_states).
+        self._bounded_replay: bounded_replay.BoundedReplayTracker | None = (
+            bounded_replay.BoundedReplayTracker()
+        )
         # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
         # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
         # scans, unused per-row state) on every batch update.
@@ -3028,6 +3035,8 @@ class TPUModelRunner(GPUModelRunner):
             if slot is not None:
                 self._free_mamba_slots.append(slot)
         self._mamba_offset_seeded.difference_update(invalidated_req_ids)
+        if self._bounded_replay is not None:
+            self._bounded_replay.discard(invalidated_req_ids)
         if self._pre_async_results is not None and invalidated_req_ids:
             # These results belong to freed KV state, including a finished ID
             # resubmitted in this step. Other requests retain their source rows.
@@ -3072,6 +3081,8 @@ class TPUModelRunner(GPUModelRunner):
         self._min_tokens.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
+        if self._bounded_replay is not None:
+            self._bounded_replay.update(scheduler_output, self.kv_cache_config)
         if self._thinking_budget is not None:
             self._thinking_budget.update_states(
                 scheduler_output, self.input_batch.req_id_to_index, self.requests
@@ -4005,6 +4016,24 @@ class TPUModelRunner(GPUModelRunner):
                 self._prefill_ckpt_offsets_cpu[:target_num_reqs],
             )
 
+        is_all_layout = (
+            layout_plan is not None and layout_plan.kind is SequenceLayoutKind.ALL
+        )
+        host_schedule = (
+            bounded_replay.build_host_schedule_snapshot(
+                query_start_loc_np=self.query_start_loc_np,
+                seq_lens_np=self.seq_lens_np,
+                num_prompt_tokens=self.input_batch.num_prompt_tokens,
+                req_ids=self.input_batch.req_ids,
+                start_index=start_index,
+                num_reqs=num_reqs,
+                target_num_reqs=target_num_reqs,
+                replay_tracker=self._bounded_replay,
+                kv_cache_config=self.kv_cache_config,
+            )
+            if is_all_layout
+            else None
+        )
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=meta_num_reqs,
             start_index=start_index,
@@ -4012,6 +4041,7 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            host_schedule=host_schedule,
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
@@ -6954,6 +6984,13 @@ class TPUModelRunner(GPUModelRunner):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
+                # Avoid None on idle dp_lockstep ranks: None signals startup warmup
+                # to trace the full padded decoder bucket instead of 0 active rows.
+                host_schedule=(
+                    HostScheduleSnapshot.zeros(num_reqs)
+                    if dp_lockstep and not profiling
+                    else None
+                ),
                 mamba_state_indices=dummy_mamba_state_indices,
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
