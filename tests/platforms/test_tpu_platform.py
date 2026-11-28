@@ -1740,6 +1740,8 @@ def test_multimodal_stage_refreshes_direct_imports(isolated_registry, monkeypatc
 
     import vllm.model_executor.models.utils as utils
 
+    from vllm_torchtpu.models.vllm.multimodal_utils import merge_multimodal_embeddings
+
     reg = isolated_registry
     monkeypatch.setattr(
         reg,
@@ -1756,6 +1758,7 @@ def test_multimodal_stage_refreshes_direct_imports(isolated_registry, monkeypatc
     monkeypatch.setattr(utils, "_tpu_static_merge_mm_patch", False, raising=False)
     reg.apply("platform_activation")
     wrapper = utils._merge_multimodal_embeddings
+    assert wrapper is merge_multimodal_embeddings
     late_model = ModuleType("vllm.model_executor.models.test_late_model")
     late_model._merge_multimodal_embeddings = object()
     monkeypatch.setitem(sys.modules, late_model.__name__, late_model)

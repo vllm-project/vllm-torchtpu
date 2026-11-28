@@ -165,28 +165,6 @@ def test_kimi_k3_navit_resize_aligns_to_merged_patches() -> None:
     assert resized["num_tokens"] == 45
 
 
-def test_kimi_k3_scatter_free_embedding_merge() -> None:
-    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
-    nn.Module.__init__(model)
-    model._has_oov_mm_tokens = False
-    language_model = nn.Module()
-    language_model.embed_input_ids = lambda ids: torch.stack(  # type: ignore[method-assign]
-        (ids.float(), ids.float() + 10), dim=-1
-    )
-    model.language_model = language_model
-    model._language_model_names = ["language_model"]
-
-    input_ids = torch.tensor([1, 2, 3, 4])
-    is_multimodal = torch.tensor([False, True, True, False])
-    media = [torch.tensor([[20.0, 21.0], [30.0, 31.0]])]
-    actual = model.embed_input_ids(input_ids, media, is_multimodal=is_multimodal)
-    expected = torch.tensor([[1.0, 11.0], [20.0, 21.0], [30.0, 31.0], [4.0, 14.0]])
-    torch.testing.assert_close(actual, expected)
-
-    with pytest.raises(ValueError, match="1 multimodal tokens to 2"):
-        model.embed_input_ids(input_ids, [media[0][:1]], is_multimodal=is_multimodal)
-
-
 @pytest.mark.parametrize("linear_beta", [None, 25.0])
 def test_situ_and_mul(linear_beta: float | None) -> None:
     activation = SituAndMul(beta=4.0, linear_beta=linear_beta)

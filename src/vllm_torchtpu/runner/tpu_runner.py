@@ -4162,11 +4162,11 @@ class TPUModelRunner(GPUModelRunner):
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
 
-            # _gather_mm_embeddings returns is_mm_embed sized to the number
-            # of scheduled tokens, but TPU pads input_ids to a fixed bucket.
-            # Pad the multimodal mask (False for pad positions) and move it
-            # to the input device so the masked_scatter in embed_input_ids
-            # aligns with the padded inputs_embeds.
+            # _gather_mm_embeddings returns is_mm_embed on the host, sized to
+            # the number of scheduled tokens, but TPU pads input_ids to a fixed
+            # bucket. Pad the multimodal mask (False for pad positions) so it
+            # aligns with the padded inputs_embeds, and keep it on the host as
+            # vLLM's runner does: the merge reads it there.
             if is_mm_embed is not None:
                 n = input_ids.shape[0]
                 if is_mm_embed.shape[0] < n:
@@ -4176,7 +4176,6 @@ class TPUModelRunner(GPUModelRunner):
                         device=is_mm_embed.device,
                     )
                     is_mm_embed = torch.cat([is_mm_embed, pad])
-                is_mm_embed = is_mm_embed.to(input_ids.device)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)

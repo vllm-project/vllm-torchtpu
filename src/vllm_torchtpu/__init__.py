@@ -1551,42 +1551,20 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     `nonzero()` + `index_put_`, which creates dynamic coordinate shapes
     parameterized by the number of True entries. On TPU, this causes
     `tt_jit_index_put__nonzero` to recompile on every request with a different
-    image token count (~15s compilation each). We replace it with static prefix-sum
-    indexing and `torch.where`, which avoids `nonzero` and eliminates recompilation.
+    image token count (~15s compilation each). We install
+    `merge_multimodal_embeddings`, which uses static prefix-sum indexing and
+    `torch.where` instead, avoiding `nonzero` and the recompilation.
     """
     import sys
 
-    import torch
     import vllm.model_executor.models.utils as vllm_utils
-    from vllm.multimodal import NestedTensors
+
+    from vllm_torchtpu.models.vllm.multimodal_utils import merge_multimodal_embeddings
 
     if not getattr(vllm_utils, "_tpu_static_merge_mm_patch", False):
         orig_merge = vllm_utils._merge_multimodal_embeddings
-
-        def static_merge_multimodal_embeddings(
-            inputs_embeds: torch.Tensor,
-            multimodal_embeddings: NestedTensors,
-            is_multimodal: torch.Tensor,
-        ) -> torch.Tensor:
-            if len(multimodal_embeddings) == 0:
-                return inputs_embeds
-
-            mm_embeds_flat = vllm_utils._flatten_embeddings(multimodal_embeddings)
-            if mm_embeds_flat.numel() == 0:
-                return inputs_embeds
-
-            mm_embeds_flat = mm_embeds_flat.to(
-                dtype=inputs_embeds.dtype, device=inputs_embeds.device
-            )
-
-            idx = torch.cumsum(is_multimodal, dim=0, dtype=torch.int32) - 1
-            idx = torch.clamp(idx, 0, mm_embeds_flat.shape[0] - 1)
-            gathered = mm_embeds_flat[idx]
-            condition = is_multimodal.unsqueeze(-1)
-            return torch.where(condition, gathered, inputs_embeds)
-
         vllm_utils._original_merge_multimodal_embeddings = orig_merge
-        vllm_utils._merge_multimodal_embeddings = static_merge_multimodal_embeddings
+        vllm_utils._merge_multimodal_embeddings = merge_multimodal_embeddings
         vllm_utils._tpu_static_merge_mm_patch = True
         logger.info("Applied TPU patch: static _merge_multimodal_embeddings")
 
