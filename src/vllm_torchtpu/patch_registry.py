@@ -97,6 +97,10 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu.core.decode_priority:patch_decode_priority", _ENGINE),
     Patch("vllm_torchtpu.compilation.aot_guard_skip:patch_aot_guard_skip", _ACTIVE),
+    Patch(
+        "vllm_torchtpu.compilation.split_direct_call:patch_split_direct_call",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu.core.zero_schedule_diag:patch_zero_schedule_diag", _ENGINE),
     Patch(
         "vllm_torchtpu.core.prefix_aware_scheduler:patch_prompt_ids_ndarray_early",
