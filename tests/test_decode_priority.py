@@ -1,0 +1,283 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Decode priority N:K (model opt-in): K throttled (decode-only) schedules after a
+step with >= N prefill tokens."""
+
+import inspect
+import types
+
+import pytest
+from vllm.config import ModelConfig
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.scheduler import Scheduler
+
+from tests.test_srpt_prefill_scheduler import (
+    MODEL,
+    _build_real_scheduler,
+    _make_real_request,
+)
+from vllm_torchtpu.core import decode_priority
+
+ARCH = "ToyDecodePriorityForCausalLM"
+
+
+def _register(monkeypatch, spec):
+    monkeypatch.setattr(decode_priority, "_POLICIES", {})
+    decode_priority.register_decode_priority(spec, ARCH)
+
+
+def _run(monkeypatch, flag, steps):
+    """`steps`: per schedule call, the {req: tokens} the fake original returns.
+    Returns the throttle flag each call passed to the original."""
+    calls = []
+    plan = iter(steps)
+
+    def fake(self, throttle_prefills=False):
+        calls.append((throttle_prefills, self.prefill_capacity_bound))
+        return types.SimpleNamespace(num_scheduled_tokens=next(plan))
+
+    monkeypatch.setattr(Scheduler, "schedule", fake)
+    _register(monkeypatch, flag)
+    decode_priority.patch_decode_priority()
+    sched = types.SimpleNamespace(
+        vllm_config=types.SimpleNamespace(
+            model_config=types.SimpleNamespace(architecture=ARCH),
+            speculative_config=types.SimpleNamespace(num_speculative_tokens=3),
+        ),
+        prefill_capacity_bound=True,
+        running=[types.SimpleNamespace(is_prefill_chunk=False)],
+    )
+    for _ in steps:
+        Scheduler.schedule(sched)
+    # The window clears the capacity bound only for the calls it throttles.
+    assert sched.prefill_capacity_bound is True
+    return calls
+
+
+DEC = {"a": 4, "b": 4}  # decode-only step: 1 + 3 speculative tokens each
+
+
+def test_window_after_large_prefill(monkeypatch):
+    big = {**DEC, "p": 8192}
+    calls = _run(monkeypatch, "4096:3", [big, DEC, DEC, DEC, DEC, big, DEC])
+    assert [t for t, _ in calls] == [False, True, True, True, False, False, True]
+    # The DP capacity release is disabled inside the window only.
+    assert [c for t, c in calls] == [True, False, False, False, True, True, False]
+
+
+def test_small_prefill_and_decode_steps_do_not_open_a_window(monkeypatch):
+    small = {**DEC, "p": 1000}
+    calls = _run(monkeypatch, "4096:3", [small, DEC, {"a": 4, "b": 3}, DEC])
+    assert [t for t, _ in calls] == [False] * 4
+
+
+def test_caller_throttle_is_kept(monkeypatch):
+    calls = []
+
+    def fake(self, throttle_prefills=False):
+        calls.append(throttle_prefills)
+        return types.SimpleNamespace(num_scheduled_tokens=DEC)
+
+    monkeypatch.setattr(Scheduler, "schedule", fake)
+    _register(monkeypatch, "4096:3")
+    decode_priority.patch_decode_priority()
+    sched = types.SimpleNamespace(
+        vllm_config=types.SimpleNamespace(
+            model_config=types.SimpleNamespace(architecture=ARCH),
+            speculative_config=None,
+        ),
+        prefill_capacity_bound=False,
+    )
+    Scheduler.schedule(sched, True)
+    assert calls == [True]
+
+
+def test_off_and_bad_values(monkeypatch):
+    monkeypatch.setattr(decode_priority, "_POLICIES", {})
+    with pytest.raises(ValueError):
+        decode_priority.register_decode_priority("4096:0", ARCH)
+    seen = []
+    monkeypatch.setattr(
+        Scheduler,
+        "schedule",
+        lambda self, throttle_prefills=False: seen.append(throttle_prefills),
+    )
+    decode_priority.patch_decode_priority()
+    first = Scheduler.schedule
+    decode_priority.patch_decode_priority()
+    assert Scheduler.schedule is first
+    # Unregistered architecture: upstream schedule, untouched.
+    sched = types.SimpleNamespace(
+        vllm_config=types.SimpleNamespace(
+            model_config=types.SimpleNamespace(architecture="OtherForCausalLM")
+        )
+    )
+    Scheduler.schedule(sched, True)
+    assert seen == [True]
+
+
+def test_upstream_schedule_takes_throttle_prefills():
+    assert (
+        "throttle_prefills"
+        in inspect.signature(inspect.unwrap(Scheduler.schedule)).parameters
+    )
+
+
+def _req(prompt, computed, out, max_tokens, arrival=0.0):
+    return types.SimpleNamespace(
+        num_prompt_tokens=prompt,
+        num_computed_tokens=computed,
+        num_output_tokens=out,
+        max_tokens=max_tokens,
+        arrival_time=arrival,
+        is_prefill_chunk=computed < prompt,
+    )
+
+
+def _run_sched(monkeypatch, flag, steps, running=(), waiting=()):
+    calls = []
+    plan = iter(steps)
+
+    def fake(self, throttle_prefills=False):
+        calls.append(throttle_prefills)
+        return types.SimpleNamespace(num_scheduled_tokens=next(plan))
+
+    monkeypatch.setattr(Scheduler, "schedule", fake)
+    _register(monkeypatch, flag)
+    decode_priority.patch_decode_priority()
+    sched = types.SimpleNamespace(
+        vllm_config=types.SimpleNamespace(
+            model_config=types.SimpleNamespace(architecture=ARCH),
+            speculative_config=types.SimpleNamespace(num_speculative_tokens=3),
+        ),
+        prefill_capacity_bound=True,
+        running=list(running),
+        waiting=list(waiting),
+    )
+    for _ in steps:
+        Scheduler.schedule(sched)
+    return calls
+
+
+def test_scaled_window(monkeypatch):
+    half = {**DEC, "p": 4096}
+    calls = _run_sched(
+        monkeypatch,
+        "512:8:scale=8192",
+        [half] + [DEC] * 5,
+        running=[_req(100, 101, 1, 500)],
+    )
+    # 8 * 4096 / 8192 = 4 decode-only steps, then prefill is allowed again.
+    assert calls == [False, True, True, True, True, False]
+
+
+def test_protect_holds_prefill_for_near_done_decode(monkeypatch):
+    import time as _t
+
+    now = _t.time()
+    near = _req(100, 120, 20, 24)  # 4 tokens left
+    far = _req(100, 101, 1, 500)
+    partial = _req(9000, 4096, 0, 50, now)  # prefill in progress
+    small = {**DEC, "p": 1000}
+    calls = _run_sched(
+        monkeypatch,
+        "100000:1:protect=8:hold=2",
+        [DEC, DEC, small, DEC, DEC, DEC],
+        running=[near, far, partial],
+    )
+    # hold=2, then a chunk runs and resets the hold, then hold again.
+    assert calls == [True, True, False, True, True, False]
+
+
+def test_protect_needs_prefill_work(monkeypatch):
+    near = _req(100, 120, 20, 24)
+    calls = _run_sched(monkeypatch, "100000:1:protect=8", [DEC] * 2, running=[near])
+    assert calls == [False, False]
+
+
+def test_deadline_releases_window(monkeypatch):
+    import time as _t
+
+    old = _req(9000, 0, 0, 50, _t.time() - 10.0)  # waited 10 s
+    big = {**DEC, "p": 8192}
+    calls = _run_sched(
+        monkeypatch,
+        "512:4:deadline=5000",
+        [big, DEC, DEC],
+        running=[_req(100, 101, 1, 500)],
+        waiting=[old],
+    )
+    assert calls == [False, False, False]
+
+
+def test_option_errors(monkeypatch):
+    for bad in ["512:4:foo=1", "512:4:hold=0", "512"]:
+        with pytest.raises(ValueError):
+            decode_priority._parse(bad)
+
+
+def test_min_decodes_gates_the_window(monkeypatch):
+    big = {**DEC, "p": 8192}
+    one = [_req(100, 101, 1, 500)]
+    assert (
+        _run_sched(monkeypatch, "512:2:minb=2", [big, DEC, DEC], running=one)
+        == [False] * 3
+    )
+    two = [_req(100, 101, 1, 500), _req(100, 101, 1, 500)]
+    assert _run_sched(monkeypatch, "512:2:minb=2", [big, DEC, DEC], running=two) == [
+        False,
+        True,
+        True,
+    ]
+
+
+def test_real_scheduler_runs_decode_only_window(monkeypatch):
+    """Upstream behavior the patch relies on, on a real scheduler: with
+    throttle_prefills=True and the capacity bound cleared, a running prefill
+    chunk and a new admission both wait while decodes run; with nothing
+    decoding, prefill is admitted."""
+    model_config = ModelConfig(
+        model=MODEL, dtype="float16", seed=42, max_model_len=2048
+    )
+    monkeypatch.setattr(Scheduler, "schedule", Scheduler.schedule)
+    monkeypatch.setattr(decode_priority, "_POLICIES", {})
+    decode_priority.patch_decode_priority()
+    decode_priority.register_decode_priority("16:2", model_config.architecture)
+    scheduler, hasher = _build_real_scheduler(
+        model_config,
+        scheduler_cls=AsyncScheduler,
+        num_blocks=64,
+        max_num_batched_tokens=32,
+        long_prefill_token_threshold=16,
+    )
+    # Nothing decoding: the 32-token chunk opens a 2-step window, but the patch
+    # does not defer, so the next chunk still runs.
+    scheduler.add_request(_make_real_request("big0", 48, hasher, seed=1))
+    assert scheduler.schedule().num_scheduled_tokens == {"big0": 32}
+    assert scheduler.schedule().num_scheduled_tokens == {"big0": 16}
+    # "big0" now decodes: the window's last step holds admission of "big".
+    scheduler.add_request(_make_real_request("big", 64, hasher, seed=2))
+    assert scheduler.schedule().num_scheduled_tokens == {"big0": 1}
+
+    # Release step: a 16-token chunk of "big" opens a new 2-step window that
+    # holds both the running chunk and the new admission "new".
+    assert scheduler.schedule().num_scheduled_tokens == {"big0": 1, "big": 16}
+    scheduler.add_request(_make_real_request("new", 8, hasher, seed=3))
+    assert scheduler.schedule().num_scheduled_tokens == {"big0": 1}
+    assert scheduler.schedule().num_scheduled_tokens == {"big0": 1}
+    assert scheduler.schedule().num_scheduled_tokens == {
+        "big0": 1,
+        "big": 16,
+        "new": 8,
+    }
