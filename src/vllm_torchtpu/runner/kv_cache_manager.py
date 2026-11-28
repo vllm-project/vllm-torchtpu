@@ -357,7 +357,7 @@ class KVCacheManager:
             if has_mamba:
                 self._update_mamba_page_size_padded(layers, block_size)
 
-        # Compact-mamba sizing (above) gave the GDN layers their own slot
+        # Compact-mamba sizing (above) gave the GDN/KDA layers their own slot
         # arrays, indexed by the runner's per-request slot ids: their scheduler
         # blocks are never read.
         runner_owns_mamba_slots = (
@@ -1604,7 +1604,7 @@ class KVCacheManager:
             for gid in range(len(self.runner.kv_cache_config.kv_cache_groups))
         }
         if self.runner._unified_kv_layout:
-            # The unified pool stores GDN state in the scheduler's blocks.
+            # The unified pool stores GDN/KDA state in the scheduler's blocks.
             check_runner_slot_groups(kv_cache_config, runner_owns_slots=False)
             self._initialize_unified_kv_cache(kv_cache_config)
             return

@@ -230,7 +230,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Affects only scheduler prefix-cache hit length and runtime GDN checkpoint
     # offsets.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
-    # Scheduler block accounting for GDN groups only: block-table shapes and
+    # Scheduler block accounting for GDN/KDA groups only: block-table shapes and
     # num_gpu_blocks are the same either way, only the block ids differ.
     "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS",
     "TORCH_TPU_TIER2_COMPILATION_CACHE",

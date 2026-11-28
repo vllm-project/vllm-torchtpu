@@ -109,6 +109,16 @@ class DummyGdn(DummyMamba):
         )
 
 
+class DummyKda(DummyMamba):
+    """DummyMamba reporting LINEAR, as the KDA layers (Kimi, OLMo 3.5) do."""
+
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            mamba_type=MambaAttentionBackendEnum.LINEAR,
+        )
+
+
 class _FakeReserveSpec:
     """Offloading-spec stand-in resolved via kv_connector_extra_config by
     utils.estimate_kv_connector_hbm_reserve (same lookup as vLLM's
@@ -1145,6 +1155,9 @@ class TestKVCacheManager:
         ],
         ids=["compact_default", "compact_pinned", "opt_out", "uniform_mamba_layout"],
     )
+    @pytest.mark.parametrize(
+        "mamba_layer_cls", [DummyGdn, DummyKda], ids=["gdn", "kda"]
+    )
     @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
@@ -1154,20 +1167,21 @@ class TestKVCacheManager:
         "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
         return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
     )
-    def test_get_kv_cache_spec_gdn_runner_slot_flag(
+    def test_get_kv_cache_spec_runner_slot_flag(
         self,
         mock_mem_info,
         mock_get_page_size,
         mock_get_layers,
         monkeypatch,
+        mamba_layer_cls,
         env_value,
         uniform_mamba_layout,
         pinned_blocks,
         expect_runner_slot,
     ):
-        """GDN specs reach vLLM as RunnerSlotMambaSpec by default when
-        compact-mamba sizing gave the runner its own GDN slots, including under
-        --num-gpu-blocks-override; TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opts
+        """GDN and KDA specs reach vLLM as RunnerSlotMambaSpec by default when
+        compact-mamba sizing gave the runner its own mamba slots, including
+        under --num-gpu-blocks-override; TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opts
         out."""
         if env_value is None:
             monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
@@ -1183,7 +1197,7 @@ class TestKVCacheManager:
         mock_attn.kv_sharing_target_layer_name = None
         mock_attn.sliding_window = None
         layers = {"attn_0": mock_attn}
-        layers.update({f"gdn_{i}": DummyGdn() for i in range(3)})
+        layers.update({f"mamba_{i}": mamba_layer_cls() for i in range(3)})
         mock_get_layers.return_value = layers
 
         kv_cache_specs = self.runner.get_kv_cache_spec()
@@ -1191,7 +1205,7 @@ class TestKVCacheManager:
         assert (self.runner._mamba_num_blocks is not None) == (not uniform_mamba_layout)
         assert type(kv_cache_specs["attn_0"]) is FullAttentionSpec
         for i in range(3):
-            spec = kv_cache_specs[f"gdn_{i}"]
+            spec = kv_cache_specs[f"mamba_{i}"]
             expected = RunnerSlotMambaSpec if expect_runner_slot else MambaSpec
             assert type(spec) is expected
             assert spec.page_size_padded == 203776

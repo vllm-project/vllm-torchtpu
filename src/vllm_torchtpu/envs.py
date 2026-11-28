@@ -626,13 +626,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Debug escape hatch; 0 opts out. On the compact-mamba layout
     # (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0) with prefix caching off, the
-    # scheduler stops charging GDN layers one block per group per request from
-    # the attention pool: the runner keeps GDN state in its own slot arrays and
-    # never reads those blocks. Applies only where that holds (GDN layers, no
-    # speculative decoding, no KV connector); everything else keeps vLLM's
-    # stock accounting either way. Read by the model runner;
-    # TpuPlatform.additional_env_vars carries it to Ray workers. See
-    # core/runner_slot_mamba.py.
+    # scheduler stops charging GDN and KDA layers one block per group per
+    # request from the attention pool: the runner keeps their state in its own
+    # slot arrays and never reads those blocks. Applies only where that holds
+    # (GDN and KDA layers, no speculative decoding, no KV connector);
+    # everything else keeps vLLM's stock accounting either way. Read by the
+    # model runner; TpuPlatform.additional_env_vars carries it to Ray workers.
+    # See core/runner_slot_mamba.py.
     "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS": env_bool(
         "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", default=True
     ),

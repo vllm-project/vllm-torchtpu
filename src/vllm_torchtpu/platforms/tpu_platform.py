@@ -1626,7 +1626,7 @@ class TpuPlatform(Platform):
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None:
         # Unconditional: the manager is only used for the specs the runner
-        # emits where it owns the GDN state slots (core/runner_slot_mamba.py).
+        # emits where it owns the GDN/KDA state slots (core/runner_slot_mamba.py).
         from vllm_torchtpu.core.runner_slot_mamba import (
             register_runner_slot_mamba_spec,
         )
