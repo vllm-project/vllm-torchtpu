@@ -14,6 +14,7 @@
 
 import contextlib
 import copy
+import functools
 import inspect
 import weakref
 from collections import defaultdict
@@ -59,6 +60,7 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     apply_top_k_top_p,
     random_sampler_variants,
+    should_apply_top_k_top_p,
     topk_candidate_blocks,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
@@ -3710,8 +3712,8 @@ def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
 
 def _recording_sampler(record):
     """A `sample_from_logits_func` stand-in that calls
-    `record(u, (all_greedy, topk_candidates, apply_topk_topp))`, an omitted
-    argument taking `TPUModelRunner.sample_from_logits`'s default."""
+    `record(u, (all_greedy, topk_candidates, apply_topk_topp, apply_top_k))`, an
+    omitted argument taking `TPUModelRunner.sample_from_logits`'s default."""
     signature = inspect.signature(TPUModelRunner.sample_from_logits)
 
     def sample_from_logits(*args, **kwargs):
@@ -3720,7 +3722,12 @@ def _recording_sampler(record):
         arg = call.arguments
         record(
             arg["u"],
-            (arg["all_greedy"], arg["topk_candidates"], arg["apply_topk_topp"]),
+            (
+                arg["all_greedy"],
+                arg["topk_candidates"],
+                arg["apply_topk_topp"],
+                arg["apply_top_k"],
+            ),
         )
         return torch.zeros((arg["logits"].shape[0], 1), dtype=torch.int32)
 
@@ -3775,14 +3782,14 @@ def test_sampler_applies_topk_topp_only_when_a_request_sets_them(
 def test_every_runtime_sampler_variant_is_precompiled(
     speculative_config, candidate_blocks
 ):
-    """Every (all_greedy, topk_candidates, apply_topk_topp) graph that
+    """Every (all_greedy, topk_candidates, apply_topk_topp, apply_top_k) graph that
     sampling picks at runtime, random or all-greedy, is one the precompile
     warms in every num_reqs bucket, so serving compiles no sampler graph after
     warmup. The random path picks from random_sampler_variants, which both
     precompiles warm."""
     num_blocks = topk_candidate_blocks(candidate_blocks, _VOCAB_SIZE)
     num_reqs_paddings = (2, 4)
-    # (num_reqs, (all_greedy, topk_candidates, apply_topk_topp))
+    # (num_reqs, (all_greedy, topk_candidates, apply_topk_topp, apply_top_k))
     warmed = set()
     TPUModelRunner._precompile_sample_from_logits(
         _precompile_runner(
@@ -3792,7 +3799,12 @@ def test_every_runtime_sampler_variant_is_precompiled(
             num_reqs_paddings,
         )
     )
-    variants = {(False, *variant) for variant in random_sampler_variants(num_blocks)}
+    variants = {
+        (False, *variant, True) for variant in random_sampler_variants(num_blocks)
+    }
+    if speculative_config is not None:
+        # Top-p-only graph (_sampler_applies_top_k).
+        variants.add((False, 0, True, False))
     assert {(n, v) for n in num_reqs_paddings for v in variants} <= warmed
 
     # vLLM's InputBatch stores vocab_size as the top_k of a request that does
@@ -3808,6 +3820,11 @@ def test_every_runtime_sampler_variant_is_precompiled(
         runner = SimpleNamespace(
             speculative_config=speculative_config,
             _topk_candidate_blocks=lambda: num_blocks,
+            _sampler_applies_topk_topp=functools.partial(
+                should_apply_top_k_top_p,
+                all(k == unset for k in top_k),
+                all(p == 1.0 for p in top_p),
+            ),
             input_batch=SimpleNamespace(
                 top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
                 no_top_k=all(k == unset for k in top_k),
@@ -3819,6 +3836,7 @@ def test_every_runtime_sampler_variant_is_precompiled(
                 False,
                 TPUModelRunner._sampler_topk_candidates(runner, 0, 2, grammar_output),
                 TPUModelRunner._sampler_applies_topk_topp(runner),
+                TPUModelRunner._sampler_applies_top_k(runner),
             )
             assert variant in variants, (top_k, top_p, grammar_output, variant)
 
@@ -3931,6 +3949,7 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
             ),
             _sampler_topk_candidates=lambda start, end, grammar: 0,
             _sampler_applies_topk_topp=lambda: False,
+            _sampler_applies_top_k=lambda: True,
         )
         runner.input_batch.max_num_logprobs = max_logprobs
         runner.input_batch.all_greedy = False
@@ -4036,6 +4055,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         _sampler_applies_topk_topp=lambda: True,
+        _sampler_applies_top_k=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
@@ -4080,6 +4100,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
             _sampler_applies_topk_topp=lambda: True,
+            _sampler_applies_top_k=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
         )
         runner.input_batch.all_greedy = False
