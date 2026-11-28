@@ -625,12 +625,20 @@ def _patch_vllm_compile_all_ranges() -> None:
         if to_compile:
             compile_ranges(to_compile)
 
-        # Only the last trace stays live (shape_variants.retrace replaced the
-        # earlier ones), so only its refused buckets are handed over; an
-        # earlier trace's would be checked against a graph that never runs.
-        live = max((getattr(b, "_tpu_trace", 0) for b in backends), default=0)
+        # Only the last trace of each compiled module stays live
+        # (shape_variants.retrace replaced the earlier ones), so only its
+        # refused buckets are handed over; an earlier trace's would be checked
+        # against a graph that never runs. Modules are told apart by the
+        # compiled module whose routed call traced them
+        # (compilation/bucket_filter; None for a model that does not route
+        # buckets): a partial retrace keeps the other module's older trace live.
+        live: dict[object, int] = {}
+        for b in backends:
+            module = getattr(b, "_tpu_serves", None)
+            live[module] = max(live.get(module, 0), getattr(b, "_tpu_trace", 0))
         for backend, range_entry in to_hand_over:
-            if getattr(backend, "_tpu_trace", 0) == live:
+            module = getattr(backend, "_tpu_serves", None)
+            if getattr(backend, "_tpu_trace", 0) == live[module]:
                 compile_entry(backend, range_entry)
             else:
                 range_entry.runnable = shape_variants.refusing_runnable(
@@ -644,6 +652,46 @@ def _patch_vllm_compile_all_ranges() -> None:
         shape_variants.register_deferred_compiler(compile_deferred)
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
         logger.info("Applied TPU patch: compile_all_ranges.")
+
+
+def _patch_vllm_bucket_filter() -> None:
+    """Compile and load only the buckets the module being built serves.
+
+    A model that routes some buckets to a second compiled module (see
+    vllm_torchtpu.compilation.bucket_filter) has each module build, and load
+    from the cache, only its own buckets. Wraps whichever compile_all_ranges /
+    load_all_ranges is installed, so it holds with or without
+    TPU_PARALLEL_PRECOMPILE. Outside a routed call every bucket is kept.
+    """
+    from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+    from vllm_torchtpu.compilation import bucket_filter
+
+    def only_served(method):
+        def run(self, *args, **kwargs):
+            others = {
+                r: e
+                for r, e in self.range_entries.items()
+                if r.is_single_size() and not bucket_filter.serves(r.start)
+            }
+            order = list(self.range_entries)
+            for r in others:
+                del self.range_entries[r]
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                # Put the entries back in their original order.
+                merged = {**self.range_entries, **others}
+                self.range_entries.clear()
+                self.range_entries.update((r, merged[r]) for r in order)
+
+        return run
+
+    PiecewiseBackend.compile_all_ranges = only_served(
+        PiecewiseBackend.compile_all_ranges
+    )
+    PiecewiseBackend.load_all_ranges = only_served(PiecewiseBackend.load_all_ranges)
+    logger.info("Applied TPU patch: per-module bucket filter.")
 
 
 def _patch_sequence_parallel_moe_admission() -> None:
