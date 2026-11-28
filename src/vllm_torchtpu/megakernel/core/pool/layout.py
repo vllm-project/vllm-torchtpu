@@ -30,6 +30,7 @@ Each of the `num_pools` pools (one per attention layer) has shape
      `(conv_taps, QKV)` in `conv_dtype` (bf16 or f32), tap-major, as rows of
      `LANES` lanes (`conv_page_rows` rows per page: bf16 rows pack in pairs
      per u32 row, f32 rows are one u32 row each).
+   - Pages after the conv page (`conv_pages_per_slot > 1`) are unused.
 
 Checkpoint index conventions (`page_base`): a 3D `ckpt_indices`
 `[slots_per_pool, NS, K]` maps slot `c` to pages `[c * pps, (c + 1) * pps)`; a
@@ -47,7 +48,7 @@ gather / scatter kernels see the per-rank values `kh // R`, `vh // R`
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
@@ -69,8 +70,14 @@ LANES = 128
 # `PoolLayout.validate` rejects anything else instead of guessing.
 # - `hd == 256`, `page_size == 128`, `kvh == 1`: KV page `(2, 64, 4, 128)` and
 #   one `(K, V)` head pair per rank and page.
-# - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: the only slot
-#   geometry exercised on TPU.
+# - 5-page slots (`VALIDATED_SLOT_PAGES`): the recurrent state in the first
+#   `rec_pages_per_slot` pages (at most 4), then the conv window in the next
+#   page (`conv_page`). `derive_pool_layout` reserves 4 state pages (4 + 1, the
+#   state of 8 bf16 value heads of 128 x 128 per rank); `with_packed_slots`
+#   shrinks that to the pages a smaller state needs, leaving the pages after
+#   the conv window unused (2 + 3 for 4 value heads per rank). That matches the
+#   serving framework's slot (`vllm_torchtpu.gdn_pool_layout`) only when the
+#   state fills whole pages (`state_fills_whole_pages`).
 # - `KD == VD == LANES`, `conv_taps == 3`: recurrent rows are one lane-row wide
 #   and the recurrent conv state shapes (`round_up(3 * B, 8)`, `round_up(3 + T, 8)`)
 #   hard-code the 3-tap window.
@@ -79,6 +86,7 @@ VALIDATED_PAGE_SIZE = 128
 VALIDATED_KVH = 1
 VALIDATED_REC_PAGES_PER_SLOT = 4
 VALIDATED_CONV_PAGES_PER_SLOT = 1
+VALIDATED_SLOT_PAGES = VALIDATED_REC_PAGES_PER_SLOT + VALIDATED_CONV_PAGES_PER_SLOT
 VALIDATED_CONV_TAPS = 3
 # Conv window storage dtypes the split pool I/O path implements.
 VALIDATED_CONV_DTYPES = (BF16, F32)
@@ -301,11 +309,11 @@ class PoolLayout:
             else ""
         )
         _need(
-            self.rec_pages_per_slot == VALIDATED_REC_PAGES_PER_SLOT
-            and self.conv_pages_per_slot == VALIDATED_CONV_PAGES_PER_SLOT,
-            "pool kernels are only validated for "
-            f"{VALIDATED_REC_PAGES_PER_SLOT} recurrent + "
-            f"{VALIDATED_CONV_PAGES_PER_SLOT} conv page(s) per slot "
+            1 <= self.rec_pages_per_slot <= VALIDATED_REC_PAGES_PER_SLOT
+            and self.pages_per_slot == VALIDATED_SLOT_PAGES,
+            f"pool kernels are only validated for {VALIDATED_SLOT_PAGES}-page "
+            f"slots: 1 to {VALIDATED_REC_PAGES_PER_SLOT} recurrent pages, then "
+            "the conv page "
             f"(got rec_pages_per_slot={self.rec_pages_per_slot}, "
             f"conv_pages_per_slot={self.conv_pages_per_slot}{rec_hint})",
         )
@@ -396,6 +404,47 @@ class PoolLayout:
             conv_dtype=conv_dtype,
         )
 
+    def state_fills_whole_pages(self, R: int) -> bool:
+        """Whether one sequence's per-rank recurrent state on `R` ranks fills a
+        whole number of pages: an even number of 128 x 128 bf16 value heads per
+        rank. Only then does `with_packed_slots(R)` match the serving
+        framework's slot, which starts the conv window at the token row after
+        the state (`ceil(ssm_bytes / token_bytes)`), mid-page otherwise.
+        KV-only layouts have no state and return True."""
+        if not self.has_recurrent:
+            return True
+        rows_per_page = self.page_bytes // (4 * LANES)
+        return self.ssm_u32_rows(R) % rows_per_page == 0
+
+    def with_packed_slots(self, R: int) -> PoolLayout:
+        """This layout with the recurrent region shrunk to the pages the state fills.
+
+        TorchTPU's vLLM starts a GDN slot's conv window right after the per-rank
+        recurrent state (`vllm_torchtpu.gdn_pool_layout`), while
+        `derive_pool_layout` reserves at least 4 pages for the state. Here the
+        recurrent region shrinks to the pages the state needs on `R` ranks,
+        rounded up, and the conv region takes the rest of the slot, which keeps
+        its size: 2 + 3 pages for 4 bf16 value heads of 128 x 128 per rank. A
+        state that fills its region (8 such heads per rank: 4 + 1) and a
+        KV-only layout come back unchanged.
+
+        The result matches the framework's slot only when
+        `state_fills_whole_pages(R)`. Otherwise the framework starts the conv
+        window mid-page and no layout `validate` accepts can match it; callers
+        that must match the framework check that first.
+        """
+        if not self.has_recurrent:
+            return self
+        rows_per_page = self.page_bytes // (4 * LANES)
+        pages = max(1, (self.ssm_u32_rows(R) + rows_per_page - 1) // rows_per_page)
+        if pages >= self.rec_pages_per_slot:
+            return self
+        return replace(
+            self,
+            rec_pages_per_slot=pages,
+            conv_pages_per_slot=self.pages_per_slot - pages,
+        )
+
 
 __all__ = [
     "LANES",
@@ -406,5 +455,6 @@ __all__ = [
     "VALIDATED_KVH",
     "VALIDATED_PAGE_SIZE",
     "VALIDATED_REC_PAGES_PER_SLOT",
+    "VALIDATED_SLOT_PAGES",
     "PoolLayout",
 ]

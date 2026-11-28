@@ -60,10 +60,13 @@ def derive_pool_layout(
 
     Whenever an active `RecurrentCacheDecl` leaves `rec_pages_per_slot=None`,
     `R` (the tensor-parallel rank count) must be passed explicitly to size
-    per-rank recurrent state pages. `conv_dtype`, when given, overrides the
-    declared conv window storage dtype (e.g. to match the dtype the serving
-    framework stores in its pool). This function computes layout geometry only;
-    call `PoolLayout.validate` to enforce TPU pool-kernel support constraints.
+    per-rank recurrent state pages, at least 4 of them; the serving framework
+    packs a smaller state tighter, which `PoolLayout.with_packed_slots(R)`
+    matches when the state fills whole pages. `conv_dtype`, when given,
+    overrides the declared conv window storage dtype (e.g. to match the dtype
+    the serving framework stores in its pool). This function computes layout
+    geometry only; call `PoolLayout.validate` to enforce TPU pool-kernel
+    support constraints.
     """
     explicit_rec = _unwrap_cache_decl(rec_decl) if rec_decl is not None else None
     if isinstance(decls_or_kv, Sequence) and not isinstance(decls_or_kv, (str, bytes)):
