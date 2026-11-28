@@ -721,22 +721,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         """Probe ``self._lookup(req_status)`` starting from ``base_tokens``
         without emitting duplicate lookup events."""
         req_status.num_locally_computed_tokens = base_tokens
-        tracker = getattr(self, "_events_tracker", None)
-        orig_record = getattr(tracker, "record_lookup", None) if tracker else None
-        orig_partial = (
-            getattr(tracker, "record_partial_lookup", None) if tracker else None
-        )
+        # vLLM's OffloadingConnectorScheduler.__init__ builds the tracker.
+        tracker = self._events_tracker
+        orig_record = tracker.record_lookup
+        orig_partial = tracker.record_partial_lookup
+        tracker.record_lookup = lambda *a, **kw: None
+        tracker.record_partial_lookup = lambda *a, **kw: None
         try:
-            if tracker is not None:
-                tracker.record_lookup = lambda *a, **kw: None
-                tracker.record_partial_lookup = lambda *a, **kw: None
             return self._lookup(req_status)
         finally:
-            if tracker is not None:
-                if orig_record is not None:
-                    tracker.record_lookup = orig_record
-                if orig_partial is not None:
-                    tracker.record_partial_lookup = orig_partial
+            tracker.record_lookup = orig_record
+            tracker.record_partial_lookup = orig_partial
 
     def estimate_external_hit_tokens(
         self, request: Request, num_local_tokens: int
@@ -759,7 +754,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         within that time keeps its last answer. Otherwise a request the
         connector does not track, or one with a transfer in flight, answers 0.
         """
-        if getattr(request, "skip_reading_prefix_cache", False):
+        if request.skip_reading_prefix_cache:
             return 0
         if not self.config.kv_group_configs:
             return 0
@@ -820,7 +815,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         The pipeline chunk scheduler's local-hit lookup
         (``TpuPipelineChunkScheduler._get_local_prefix_cache_hit``) asks this
         when the connector reports divergent local hybrid hits."""
-        if getattr(request, "skip_reading_prefix_cache", False):
+        if request.skip_reading_prefix_cache:
             return None
         req_status = self._req_status.get(request.request_id)
         if req_status is None:
