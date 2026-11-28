@@ -254,6 +254,7 @@ class _FakeSublayer(nn.Module):
         self.kwargs = kwargs
         self.proj = nn.Linear(HIDDEN, HIDDEN, bias=False)
         self.calls: list[dict[str, torch.Tensor]] = []
+        self.indexer = None
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         self.calls.append(kwargs)
@@ -278,7 +279,7 @@ class _FakeLMHead(nn.Module):
 def fake_sublayers(monkeypatch):
     for name in (
         "QwenGatedDeltaNetAttention",
-        "Qwen4ExpQSAAttention",
+        "Qwen4ExpAttention",
         "Qwen3NextSparseMoeBlock",
     ):
         monkeypatch.setattr(qwen4_model, name, _FakeSublayer)
