@@ -107,6 +107,9 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
         _update_num_xla_graphs=lambda *_args: None,
         _modify_prev_results=lambda: None,
         _sync_replicated_drafts_across_tp=lambda drafts: drafts,
+        # Multi-chunk async sources keep their concatenated rows; the warm-up
+        # padding is checked in test_warmed_next_tokens.py.
+        _pad_substitute_source=lambda next_tokens: next_tokens,
         _stage_timing=MagicMock(),
     )
     runner._stage_timing.take_samples.return_value = ([], [])
