@@ -244,6 +244,12 @@ EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
     "throughput": (5000.0, 66.67),
 }
 
+
+# Warning a serving plan carries when no layout fits the chip budget and HBM.
+NO_FEASIBLE_LAYOUT_WARNING: str = (
+    "No feasible layout met memory and latency constraints."
+)
+
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
 CHIP_SPEC_SCHEMA: str = "vllm_torchtpu.roofline.chip_spec/v1"

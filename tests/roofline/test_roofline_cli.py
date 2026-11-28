@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable
 from pathlib import Path
 
 import huggingface_hub.constants as hf_constants
@@ -33,28 +33,6 @@ from vllm_torchtpu.roofline import (
     from_hf_config,
     plan,
 )
-
-
-def _iter_subcommand_options(
-    parser: argparse.ArgumentParser,
-) -> list[tuple[str, tuple[str, ...], str | None]]:
-    """Collect ``(subcommand, option_strings, help)`` across root and subparsers."""
-    items: list[tuple[str, tuple[str, ...], str | None]] = []
-
-    def _walk(cmd_name: str, subparser: argparse.ArgumentParser) -> None:
-        """Walk parser actions via stdlib attributes lacking public accessors."""
-        actions: Sequence[argparse.Action] = getattr(subparser, "_actions", ())
-        for action in actions:
-            if action.option_strings:
-                items.append((cmd_name, tuple(action.option_strings), action.help))
-            choices = getattr(action, "choices", None)
-            if isinstance(choices, Mapping):
-                for sub_name, child in choices.items():
-                    if isinstance(child, argparse.ArgumentParser):
-                        _walk(str(sub_name), child)
-
-    _walk("root", parser)
-    return items
 
 
 def test_cli_plan_json_schema(
@@ -663,3 +641,102 @@ def test_cli_plan_handles_gptq_default_scale_and_catches_invalid_4bit(
     rc_bad = cli.main(["plan", "--config", str(bad_path), "--tp", "8"])
     assert rc_bad == 2
     assert "scale_bytes" in capsys.readouterr().err
+
+
+def test_cli_help_clarifies_physics_pruning_vs_uncalibrated_rankings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify CLI help distinguishes physical pruning from uncalibrated rankings."""
+    for argv, expected_substrings in (
+        (["--help"], ("physical lower bounds", "uncalibrated serial-phase")),
+        (
+            ["solve", "--help"],
+            ("Prune parallel layouts via physical HBM bounds", "uncalibrated"),
+        ),
+        (["ceiling", "--help"], ("uncalibrated", "physics candidate")),
+        (["plan", "--help"], ("hard physical step floors", "uncalibrated")),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(argv)
+        assert exc_info.value.code == 0
+        help_text = capsys.readouterr().out
+        assert "winning" not in help_text.lower()
+        for expected in expected_substrings:
+            assert expected in help_text
+
+
+@pytest.mark.parametrize("mode", ("mixed", "disagg", "auto"))
+def test_cli_solve_and_ceiling_support_chip_spec_and_dtype_overrides(
+    mode: str,
+    tmp_path: Path,
+    locked_config_path: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify solve and ceiling honor --chip-spec, dtype flags, and 11-field parity."""
+    qwen35_path = locked_config_path("qwen3_5_397b_fp8.json")
+    spec_path = tmp_path / "custom_chip.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "vllm_torchtpu.roofline.chip_spec/v1",
+                "provenance": "projected",
+                "base": "tpu7x",
+                "name": "tpu7x_override_test",
+            }
+        ),
+        encoding="utf-8",
+    )
+    common_flags = [
+        "--config",
+        str(qwen35_path),
+        "--chip-spec",
+        str(spec_path),
+        "--kv-dtype",
+        "fp8",
+        "--act",
+        "a16",
+        "--isl",
+        "1024",
+        "--osl",
+        "128",
+        "--prefix-hit-rate",
+        "0.0",
+        "--accept-len",
+        "1.0",
+        "--think-time-s",
+        "0.0",
+        "--concurrency",
+        "4",
+        "--mode",
+        mode,
+        "--max-chips",
+        "8",
+        "--json",
+    ]
+    solve_argv = ["solve", *common_flags]
+    if mode in ("disagg", "auto"):
+        solve_argv.append("--pairs")
+    rc_solve = cli.main(solve_argv)
+    assert rc_solve == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["chip"] == "tpu7x_override_test"
+    assert payload["candidates"]
+
+    rc_ceil = cli.main(["ceiling", *common_flags])
+    assert rc_ceil == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == len(payload["candidates"])
+    for row, cand in zip(rows, payload["candidates"], strict=True):
+        assert row == {
+            "est_interactivity_tok_s": cand["est_interactivity_tok_s"],
+            "token_throughput_per_chip": cand["token_throughput_per_chip"],
+            "output_throughput_per_chip": cand["output_throughput_per_chip"],
+            "est_ttft_ms": cand["est_ttft_ms"],
+            "est_tpot_ms": cand["est_tpot_ms"],
+            "concurrency": cand["concurrency"],
+            "total_chips": cand["total_chips"],
+            "mode": cand["mode"],
+            "binding_unit": cand["binding"],
+            "slo_met": cand["slo_met"],
+            "is_pareto": cand["is_pareto"],
+        }
