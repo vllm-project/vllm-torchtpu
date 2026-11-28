@@ -46,9 +46,12 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
+from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker import gpu_model_runner
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
-from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner import min_tokens, tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner, _strip_prefill_only_padding
 
 
@@ -128,6 +131,24 @@ def test_leaves_real_drafts_and_in_prompt_steps_alone():
     so = _so({"b": 2}, {"b": [-1]}, new=[_new("b", 100, 5000)])
     assert _strip_prefill_only_padding(so, _requests()) is so
     assert so.num_scheduled_tokens["b"] == 2
+
+
+@pytest.mark.parametrize(
+    ("scheduled", "kept"),
+    [
+        # Two placeholders on the last prompt token: the step ends at the prompt.
+        (4, 2),
+        # A step that stops one token short of the prompt's end, crossing it
+        # only by its two placeholders: it ends inside the prompt.
+        (3, 1),
+    ],
+)
+def test_strips_two_placeholders(scheduled, kept):
+    so = _so({"r": scheduled}, {"r": [-1, -1]}, new=[_new("r", 126207, 126209)])
+    out = _strip_prefill_only_padding(so, _requests())
+    assert out.num_scheduled_tokens == {"r": kept}
+    assert out.total_num_scheduled_tokens == kept
+    assert "r" not in out.scheduled_spec_decode_tokens
 
 
 @pytest.mark.parametrize("computed", [126209, 126300])
@@ -218,6 +239,98 @@ def test_a_request_skipped_in_the_last_step_is_stripped():
     (out,) = seen
     assert out.num_scheduled_tokens == {"r": 1}
     assert "r" not in out.scheduled_spec_decode_tokens
+
+
+def _lifecycle_runner(monkeypatch):
+    """A TPU runner holding only what the TPU _update_states and vLLM's own
+    GPUModelRunner._update_states, which it calls, read for a text request."""
+    monkeypatch.setattr(
+        gpu_model_runner,
+        "get_pp_group",
+        lambda: types.SimpleNamespace(is_last_rank=True),
+    )
+    runner = object.__new__(TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.speculative_config = None
+    runner.scheduler_config = types.SimpleNamespace(async_scheduling=True)
+    runner.parallel_config = types.SimpleNamespace(
+        data_parallel_size=1, enable_expert_parallel=False
+    )
+    runner.use_async_scheduling = True
+    runner.use_async_spec_decode = False
+    runner.requests, runner.num_prompt_logprobs = {}, {}
+    runner._pre_async_results = None
+    runner._last_sequence_layout_plan = None
+    runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
+    runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
+    runner._install_spec_token_room_guard = lambda: None
+    runner._min_tokens = min_tokens.MinTokensTracker()
+    runner._thinking_budget = None
+    runner.input_batch = InputBatch(
+        max_num_reqs=4,
+        max_model_len=128,
+        max_num_batched_tokens=64,
+        device=torch.device("cpu"),
+        vocab_size=1000,
+        block_sizes=[16],
+        max_num_blocks_per_req=[8],
+        logitsprocs=LogitsProcessors(),
+        logitsprocs_need_output_token_ids=False,
+    )
+    runner.late_interaction_runner = types.SimpleNamespace(
+        on_requests_finished=lambda _ids: None,
+        register_request=lambda _rid, _params: None,
+    )
+    runner.encoder_cache = {}
+    runner.is_pooling_model = runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner._may_reorder_batch = lambda _output: None
+    return runner
+
+
+def test_a_preempted_request_is_stripped_when_it_resumes(monkeypatch):
+    """Through vLLM's own _update_states: a preempted request leaves the input
+    batch but keeps its entry in the runner's requests (vLLM pops only finished
+    ones), so on resuming with a -1 placeholder on its last prompt token the
+    strip reads its prompt length and drops the placeholder."""
+    prompt = list(range(1, 34))
+    new = NewRequestData(
+        req_id="r",
+        prompt_token_ids=prompt,
+        mm_features=[],
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_ids=([1, 2],),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+    first = _so({"r": 32}, {}, new=[new])
+    runner = _lifecycle_runner(monkeypatch)
+    runner._update_states(first)
+    preempt = dataclasses.replace(SchedulerOutput.make_empty(), preempted_req_ids={"r"})
+    runner._update_states(preempt)
+    assert "r" not in runner.input_batch.req_id_to_index
+    assert runner.requests["r"].num_prompt_tokens == len(prompt)
+    # Resumed on a two-block prefix hit: one prompt token and a placeholder.
+    resume = _so(
+        {"r": 2},
+        {"r": [-1]},
+        cached=CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids={"r"},
+            new_token_ids=[],
+            all_token_ids={"r": prompt},
+            new_block_ids=[([1, 2, 3],)],
+            num_computed_tokens=[32],
+            num_output_tokens=[0],
+        ),
+    )
+    ran = _strip_prefill_only_padding(resume, runner.requests)
+    assert ran.num_scheduled_tokens == {"r": 1}
+    assert "r" not in ran.scheduled_spec_decode_tokens
+    runner._update_states(ran)
+    assert "r" in runner.input_batch.req_id_to_index
+    assert runner.requests["r"].num_computed_tokens == 32
 
 
 _OPT = {
