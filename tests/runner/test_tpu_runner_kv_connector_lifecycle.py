@@ -172,6 +172,8 @@ def test_device_drafter_runs_before_kv_connector_save(
         return torch.tensor([[8]]) if is_async else None
 
     runner = _fake_runner(method, is_async, verify, propose)
+    # Record when the wait on the previous step's sampled-token copy runs.
+    runner._modify_prev_results = lambda: events.append("wait")
     connector = _recording_connector(events)
 
     with (
@@ -194,21 +196,24 @@ def test_device_drafter_runs_before_kv_connector_save(
         output = output.get_output()
     assert output.sampled_token_ids == [[7]]
 
+    # Async scheduling waits on the previous step's copy. Without a KV
+    # connector the wait runs after the draft launch so the draft overlaps
+    # the previous forward; with one it runs first, because the save relies
+    # on the previous forward having finished.
     if not with_connector:
-        assert events == ([] if method is None else ["draft"])
+        expected = [] if method is None else ["draft"]
+        assert events == (expected + ["wait"] if is_async else expected)
         assert output.kv_connector_output is None
         return
     # The device drafter writes the draft layers' KV into the blocks the
     # target just filled, so the connector may save them only afterwards.
     # ngram drafts on the host and writes no KV.
-    assert (
-        events
-        == {
-            None: ["save", "poll", "clear"],
-            "mtp": ["draft", "save", "poll", "clear"],
-            "ngram": ["save", "poll", "clear", "draft"],
-        }[method]
-    )
+    expected = {
+        None: ["save", "poll", "clear"],
+        "mtp": ["draft", "save", "poll", "clear"],
+        "ngram": ["save", "poll", "clear", "draft"],
+    }[method]
+    assert events == (["wait"] + expected if is_async else expected)
     assert output.kv_connector_output.finished_sending == {"sent"}
     assert output.kv_connector_output.finished_recving == {"loaded"}
 
