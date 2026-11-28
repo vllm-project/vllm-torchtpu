@@ -162,6 +162,17 @@ class KimiMLP(nn.Module):
         return hidden_states
 
 
+# Minimum per-rank row count (the padded compile_sizes bucket, or bucket // TP
+# under TPU_K3_SP_PREFILL) from which the fused kernel runs instead of the
+# inline reduction. Measured on TPU v7x only (the generation Kimi-K3 is deployed
+# on, hidden=7168) with 4, 8, 12 and 16 saved blocks. Below 2,048 rows the
+# inline path is faster in most cases: 22 of 28 measured at 16..1024 rows (up
+# to 2.0x) and 28 of 32 at 1152..1920 rows; the kernel is up to 1.3x faster in
+# the rest, at 4 and 16 blocks apart from one tie at 8. From 2,048 rows the
+# kernel is 1.2-2.0x faster at 4, 8 and 16 blocks and 5-10% slower at 12.
+_ATTNRES_KERNEL_MIN_TOKENS = 2048
+
+
 class AttentionResidual(nn.Module):
     """K3 attention residual with a fused kernel for tiled prefill."""
 
@@ -200,7 +211,11 @@ class AttentionResidual(nn.Module):
     ) -> torch.Tensor:
         if block_residuals.shape[1] == 0:
             return prefix_sum
-        if self._prefill_op is not None and prefix_sum.shape[0] % 16 == 0:
+        if (
+            self._prefill_op is not None
+            and prefix_sum.shape[0] >= _ATTNRES_KERNEL_MIN_TOKENS
+            and prefix_sum.shape[0] % 16 == 0
+        ):
             return self._prefill_op(prefix_sum, block_residuals, self.folded_weight)
         w = self.folded_weight
         if prefix_sum.shape[0] == 1:
