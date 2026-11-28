@@ -25,17 +25,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import vllm.distributed.parallel_state as parallel_state
-from jax.experimental.pallas import tpu as pltpu
-from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-    FusedMoEMethodBase,
-)
-from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as moe_runner_mod
-from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter import moe_routing, moe_tp_decode, token_padding
+from vllm_torchtpu.layers.adapter import moe_tp_decode, token_padding
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
@@ -89,91 +82,55 @@ class _Gate(torch.nn.Module):
         return torch.nn.functional.linear(x, self.weight).float(), None
 
 
-class _RoutedExperts(torch.nn.Module):
-    forward_monolithic = RoutedExperts.forward_monolithic
-
-    def __init__(self, moe_config, quant_method, scoring_func):
-        super().__init__()
-        self.moe_config = moe_config
-        self.quant_method = quant_method
-        self.global_num_experts = E
-        self.scoring_func = scoring_func
-        self.renormalize = True
-        self.use_grouped_topk = True
-        self.num_expert_group = 1
-        self.topk_group = 1
-        self.custom_routing_function = None
-        self.routed_scaling_factor = 1.0
-        self.expert_placement_strategy = "linear"
-
-        def param(t):
-            return torch.nn.Parameter(t, requires_grad=False)
-
-        self.w13_weight = param(torch.randn(E, H, 2 * INTER).to(FP8))
-        self.w2_weight = param(torch.randn(E, INTER, H).to(FP8))
-        self.w13_weight_scale_inv = param(torch.rand(E, 1, 1, 2 * INTER))
-        self.w2_weight_scale_inv = param(torch.rand(E, 1, 1, H))
-        self.e_score_correction_bias = param(torch.rand(E) * 0.1)
-        moe_routing.register_experts_start_buffer(self, device=torch.device("cpu"))
-
-    def _ensure_moe_quant_config_init(self):
-        pass
-
-
-def _moe_config(*, use_ep=False, skip_final_all_reduce=False):
-    par = SimpleNamespace(
-        use_ep=use_ep,
-        ep_size=16 if use_ep else 1,
-        ep_rank=0,
-        tp_size=1 if use_ep else 16,
-        dp_size=1,
-        pcp_size=1,
-        enable_eplb=False,
-        all2all_backend="allgather_reducescatter",
-        use_fi_nvl_two_sided_kernels=False,
-        use_all2all_kernels=False,
-    )
-    return SimpleNamespace(
-        moe_parallel_config=par,
-        experts_per_token=TOPK,
-        is_sequence_parallel=False,
-        skip_final_all_reduce=skip_final_all_reduce,
-        tp_size=par.tp_size,
-        ep_size=par.ep_size,
-        ep_rank=0,
-        dp_size=1,
-        pcp_size=1,
-        sp_size=1,
-        hidden_dim=H,
-        hidden_dim_unpadded=H,
-    )
-
-
 class _Harness:
-    def __init__(self):
-        self.layers = {}
-        self.all_reduces = 0
+    def __init__(self, kit):
+        self.kit = kit  # tests/conftest.py fp8_moe_runner_kit: runner hooks + builders
         self.op_calls = []
         self.selftest_calls = 0
         self.selftest_failures = []
         self.logs = []
 
-    def runner(self, name, *, scoring_func="sigmoid", shared=True, **config):
-        mcfg = _moe_config(**config)
-        qm = fp8_mod.VllmFp8MoEMethodTPU.__new__(fp8_mod.VllmFp8MoEMethodTPU)
-        FusedMoEMethodBase.__init__(qm, mcfg)
-        qm._tpu_activation_str = "silu"
-        runner = MoERunner(
-            layer_name=name,
-            moe_config=mcfg,
-            router=SimpleNamespace(prepare_monolithic_logits=lambda logits: logits),
-            routed_experts=_RoutedExperts(mcfg, qm, scoring_func),
+    @property
+    def all_reduces(self):
+        return self.kit.all_reduces
+
+    def runner(
+        self,
+        name,
+        *,
+        scoring_func="sigmoid",
+        shared=True,
+        use_ep=False,
+        skip_final_all_reduce=False,
+    ):
+        kit = self.kit
+        mcfg = kit.moe_config(
+            use_ep=use_ep,
+            n_ranks=16,
+            topk=TOPK,
+            hidden=H,
+            skip_final_all_reduce=skip_final_all_reduce,
+        )
+        qm = kit.fp8_method(mcfg)
+        routed = kit.routed_experts(
+            mcfg,
+            qm,
+            local_experts=E,
+            global_experts=E,
+            hidden=H,
+            inter=INTER,
+            scoring_func=scoring_func,
+            use_grouped_topk=True,
+            random_weights=True,
+        )
+        return kit.runner(
+            name,
+            mcfg,
+            routed,
             gate=_Gate(),
             shared_experts=_SharedMLP() if shared else None,
             routed_scaling_factor=ROUTED_SCALE,
         )
-        self.layers[name] = runner
-        return runner
 
     def model(self, *specs, prefix="model.layers"):
         model = torch.nn.Module()
@@ -194,38 +151,12 @@ class _Log:
 
 
 @pytest.fixture
-def harness(monkeypatch):
+def harness(monkeypatch, fp8_moe_runner_kit):
     torch.manual_seed(0)
-    h = _Harness()
-    # Set the attribute, not the environment: a test that monkeypatched this
-    # attribute earlier in the session leaves it set on the module, where it
-    # shadows envs.__getattr__ and with it any environment value.
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
-    monkeypatch.setattr(
-        pltpu,
-        "get_tpu_info",
-        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
-    )
-    monkeypatch.setattr(moe_runner_mod, "get_current_vllm_config", lambda: None)
-    monkeypatch.setattr(
-        moe_runner_mod, "register_layer_for_moe_forward_op", lambda config, layer: None
-    )
-    monkeypatch.setattr(moe_runner_mod, "get_layer_from_name", h.layers.__getitem__)
-    monkeypatch.setattr(
-        moe_runner_mod,
-        "get_forward_context",
-        lambda: SimpleNamespace(dp_metadata=None, all_moe_layers=None),
-    )
-    monkeypatch.setattr(moe_runner_mod, "is_forward_context_available", lambda: False)
-
-    def all_reduce(t):
-        h.all_reduces += 1
-        return t
-
-    monkeypatch.setattr(moe_runner_mod, "tensor_model_parallel_all_reduce", all_reduce)
-    monkeypatch.setattr(
-        parallel_state, "get_dp_group", lambda: SimpleNamespace(world_size=1)
-    )
+    h = _Harness(fp8_moe_runner_kit)
+    # Set the module dict entry, not the environment: undo then deletes it (or
+    # restores an earlier test's leftover), so envs.__getattr__ is not shadowed.
+    monkeypatch.setitem(vars(envs), "TPU_MOE_SKIP_PADDED_TOKENS", True)
     # The unarmed path's grouped matmul (a TPU kernel): a stand-in.
     monkeypatch.setattr(
         fp8_mod, "fused_moe_gmm", lambda hidden_states, **kw: hidden_states * 0.25
@@ -399,21 +330,21 @@ def test_refuses_topk_weights_float32(harness):
 
 
 def test_refuses_without_the_padding_mask(harness, monkeypatch):
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+    monkeypatch.setitem(vars(envs), "TPU_MOE_SKIP_PADDED_TOKENS", False)
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert "TPU_MOE_SKIP_PADDED_TOKENS" in harness.logs[-1]
 
 
 def test_refuses_when_the_moe_path_owns_its_collectives(harness, monkeypatch):
-    monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", True)
+    monkeypatch.setitem(vars(envs), "TPU_MOE_FP8_ALL_GATHER", True)
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert "owns its collectives" in harness.logs[-1]
 
 
 def test_stands_down_when_fused_moe_decode_is_on(harness, monkeypatch):
-    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL", True)
+    monkeypatch.setitem(vars(envs), "FUSED_MOE_DECODE_KERNEL", True)
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert not _armed(model.layers[0]) and harness.selftest_calls == 0

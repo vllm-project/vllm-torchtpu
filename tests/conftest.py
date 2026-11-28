@@ -350,6 +350,184 @@ def device(request):
     return torch.device("cpu")
 
 
+@pytest.fixture
+def fp8_moe_runner_kit(monkeypatch):
+    """CPU harness for vLLM `MoERunner`s over `VllmFp8MoEMethodTPU`.
+
+    It patches the MoERunner module's forward-context, layer-registry and
+    all-reduce hooks, the DP group, and `get_tpu_info` (a tpu7x chip). It
+    returns a kit that builds the MoE config, quant method, stand-in routed
+    experts and runner. Shared by the fused MoE decode and MoE TP decode tests,
+    so a vLLM `MoERunner` change needs one edit here.
+    """
+    from types import SimpleNamespace
+
+    import vllm.distributed.parallel_state as parallel_state
+    from jax.experimental.pallas import tpu as pltpu
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.runner import (
+        moe_runner as moe_runner_mod,
+    )
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    from vllm_torchtpu.layers.adapter import moe_routing
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+    class _StandInRoutedExperts(torch.nn.Module):
+        forward_monolithic = RoutedExperts.forward_monolithic
+
+        def __init__(
+            self,
+            moe_config,
+            quant_method,
+            *,
+            local_experts,
+            global_experts,
+            hidden,
+            inter,
+            scoring_func,
+            use_grouped_topk,
+            random_weights,
+        ):
+            super().__init__()
+            self.moe_config = moe_config
+            self.quant_method = quant_method
+            self.global_num_experts = global_experts
+            self.scoring_func = scoring_func
+            self.renormalize = True
+            self.use_grouped_topk = use_grouped_topk
+            self.num_expert_group = 1
+            self.topk_group = 1
+            self.custom_routing_function = None
+            self.routed_scaling_factor = 1.0
+            self.expert_placement_strategy = "linear"
+            f8 = torch.float8_e4m3fn
+
+            def param(t):
+                return torch.nn.Parameter(t, requires_grad=False)
+
+            e = local_experts
+            if random_weights:
+                self.w13_weight = param(torch.randn(e, hidden, 2 * inter).to(f8))
+                self.w2_weight = param(torch.randn(e, inter, hidden).to(f8))
+                self.w13_weight_scale_inv = param(torch.rand(e, 1, 1, 2 * inter))
+                self.w2_weight_scale_inv = param(torch.rand(e, 1, 1, hidden))
+                self.e_score_correction_bias = param(torch.rand(global_experts) * 0.1)
+            else:
+                self.w13_weight = param(torch.zeros((e, hidden, 2 * inter), dtype=f8))
+                self.w2_weight = param(torch.zeros((e, inter, hidden), dtype=f8))
+                self.w13_weight_scale_inv = param(torch.ones((e, 1, 1, 2 * inter)))
+                self.w2_weight_scale_inv = param(torch.ones((e, 1, 1, hidden)))
+                self.e_score_correction_bias = None
+            moe_routing.register_experts_start_buffer(self, device=torch.device("cpu"))
+
+        def _ensure_moe_quant_config_init(self):
+            pass
+
+    class Kit:
+        def __init__(self):
+            self.layers = {}
+            self.all_reduces = 0
+
+        def all_reduce(self, t):
+            self.all_reduces += 1
+            return t
+
+        @staticmethod
+        def moe_config(
+            *, use_ep, n_ranks, topk, hidden, in_dtype=None, skip_final_all_reduce=False
+        ):
+            par = SimpleNamespace(
+                use_ep=use_ep,
+                ep_size=n_ranks if use_ep else 1,
+                ep_rank=0,
+                tp_size=1 if use_ep else n_ranks,
+                dp_size=1,
+                pcp_size=1,
+                enable_eplb=False,
+                is_sequence_parallel=False,
+                all2all_backend="allgather_reducescatter",
+                use_fi_nvl_two_sided_kernels=False,
+                use_all2all_kernels=False,
+            )
+            return SimpleNamespace(
+                moe_parallel_config=par,
+                experts_per_token=topk,
+                in_dtype=in_dtype,
+                is_sequence_parallel=False,
+                skip_final_all_reduce=skip_final_all_reduce,
+                tp_size=par.tp_size,
+                ep_size=par.ep_size,
+                ep_rank=0,
+                dp_size=1,
+                pcp_size=1,
+                sp_size=1,
+                hidden_dim=hidden,
+                hidden_dim_unpadded=hidden,
+            )
+
+        @staticmethod
+        def fp8_method(moe_config):
+            qm = VllmFp8MoEMethodTPU.__new__(VllmFp8MoEMethodTPU)
+            FusedMoEMethodBase.__init__(qm, moe_config)
+            qm._tpu_activation_str = "silu"
+            return qm
+
+        @staticmethod
+        def routed_experts(moe_config, quant_method, **kw):
+            return _StandInRoutedExperts(moe_config, quant_method, **kw)
+
+        def runner(
+            self,
+            name,
+            moe_config,
+            routed_experts,
+            *,
+            gate=None,
+            shared_experts=None,
+            routed_scaling_factor=1.0,
+        ):
+            runner = MoERunner(
+                layer_name=name,
+                moe_config=moe_config,
+                router=SimpleNamespace(prepare_monolithic_logits=lambda logits: logits),
+                routed_experts=routed_experts,
+                gate=gate,
+                shared_experts=shared_experts,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+            self.layers[name] = runner
+            return runner
+
+    kit = Kit()
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    monkeypatch.setattr(moe_runner_mod, "get_current_vllm_config", lambda: None)
+    monkeypatch.setattr(
+        moe_runner_mod, "register_layer_for_moe_forward_op", lambda config, layer: None
+    )
+    monkeypatch.setattr(moe_runner_mod, "get_layer_from_name", kit.layers.__getitem__)
+    monkeypatch.setattr(
+        moe_runner_mod,
+        "get_forward_context",
+        lambda: SimpleNamespace(dp_metadata=None, all_moe_layers=None),
+    )
+    monkeypatch.setattr(moe_runner_mod, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(
+        moe_runner_mod, "tensor_model_parallel_all_reduce", kit.all_reduce
+    )
+    monkeypatch.setattr(
+        parallel_state, "get_dp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    return kit
+
+
 def pytest_collection_finish(session):
     """Fail fast if collecting the suite claimed the accelerator.
 

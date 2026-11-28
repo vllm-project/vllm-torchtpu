@@ -1204,9 +1204,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # Either reason to take the collectives from vLLM leaves the routing
         # tensors local here, still holding this rank's own tokens. (The third
         # reason, the fused EP kernel, returned above.)
-        owns_collectives = (
-            enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
-        )
+        owns_collectives = moe_owns_collectives()
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
@@ -1246,6 +1244,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
 
         return fused_moe_gmm(**kwargs)
+
+
+def moe_owns_collectives() -> bool:
+    """Whether the FP8 MoE takes its collectives from vLLM (the pipelined
+    collective-and-compute path, or the FP8 all-gather). apply_monolithic then
+    returns pipelined_fused_moe_gmm before the fused MoE decode branch, so the
+    decode kernel must not arm such a layer."""
+    return enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
