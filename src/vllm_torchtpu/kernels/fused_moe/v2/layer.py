@@ -609,6 +609,7 @@ def fused_ep_moe_v2(
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
     use_route_kernel=False,
+    shared_partial=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -688,6 +689,14 @@ def fused_ep_moe_v2(
     plan's small XLA ops and the SparseCore slab scatters. Same tables, bit
     for bit. Only the fused stage reads it, and not where the slab tables
     are built by run copy; elsewhere it is ignored.
+
+    shared_partial [tokens, hidden], sharded and typed like x, is this
+    shard's partial sum of a dense branch to add to the output, such as a
+    shared expert whose weights are split over the token replica group. It
+    is summed over each group and added to the combined rows before they
+    are restored, and the sum must finish before the expert kernel starts,
+    so it runs while the activation all-gather is in flight instead of as
+    an all-reduce after the layer. Fused stage only.
 
     hash_topk_ids [tokens, topk] i32 replaces the router's selection with
     expert ids the caller already chose -- DeepSeek-V4's bottom layers look
@@ -777,6 +786,15 @@ def fused_ep_moe_v2(
             raise ValueError(
                 "gather_positions must be a permutation of "
                 f"range({ep}) on the compute stage; got {gather_positions}"
+            )
+    has_shared = shared_partial is not None
+    if has_shared:
+        if stage != "fused":
+            raise ValueError(f"shared_partial is fused-stage only; stage is {stage!r}")
+        if shared_partial.shape != x.shape or shared_partial.dtype != x.dtype:
+            raise ValueError(
+                f"shared_partial must match x {x.dtype}{tuple(x.shape)}; got "
+                f"{shared_partial.dtype}{tuple(shared_partial.shape)}"
             )
     g_local = e_total // ep
     if T % ep or gating.shape != (T, e_total):
@@ -1097,6 +1115,7 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        shared_rows=None,
     ):
         """The fused expert kernel and the combine, over one shard's routing plan.
 
@@ -1104,8 +1123,12 @@ def fused_ep_moe_v2(
         the FFN, and pushes each result row back to the shard that owns its
         token; the combine then sums each token's topk arrivals by weight.
         `planned` is a RoutePlan from either builder: the route-plan kernel
-        (build_route_plan) or the XLA one (xla_route_plan).
+        (build_route_plan) or the XLA one (xla_route_plan). `shared_rows`,
+        this shard's rows of the reduced shared_partial, are added before the
+        rows are restored.
         """
+        if shared_rows is not None:
+            q_g, shared_rows = lax.optimization_barrier((q_g, shared_rows))
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
@@ -1140,6 +1163,8 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if shared_rows is not None:
+            combined = combined + shared_rows
         return token_layout.restore(combined, ax)
 
     def compute_local(
@@ -1156,6 +1181,7 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        shared_rows=None,
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
         planned, q_g = xla_route_plan(
@@ -1193,15 +1219,25 @@ def fused_ep_moe_v2(
             w2s_l,
             bias_it,
             out_dtype,
+            shared_rows,
         )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
+        shared_l = None
+        if has_shared:
+            *scales_gating_biases, shared_l = scales_gating_biases
         w1s_l, w2s_l, gate_l, hash_l, score_bias_l, bias_it = unpack_operands(
             scales_gating_biases
         )
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
+        shared_rows = None
+        if shared_l is not None:
+            # Not before q_l exists, so the reduction cannot hold back the
+            # activation all-gather's start.
+            shared_l, _ = lax.optimization_barrier((shared_l, q_l))
+            shared_rows = token_layout.reduce_split(shared_l, ax)
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l, me=rank_l[0, 0]
         )
@@ -1229,6 +1265,7 @@ def fused_ep_moe_v2(
                 w2s_l,
                 bias_it,
                 x_l.dtype,
+                shared_rows,
             )
         exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
             ep, layout[-1]
@@ -1247,6 +1284,7 @@ def fused_ep_moe_v2(
             w2s_l,
             bias_it,
             x_l.dtype,
+            shared_rows,
         )
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -1336,6 +1374,9 @@ def fused_ep_moe_v2(
         + score_bias_args
         + bias_args
     )
+    if has_shared:
+        args += (shared_partial,)
+        in_specs += (P(ax),)
     if routed is not None:
         args += tuple(routed)
         in_specs += (P(ax),) * len(routed)
@@ -1381,6 +1422,7 @@ def fused_ep_moe_v2(
         tables_by_run_copy,
         agq_min_local_tokens,
         route_kernel,
+        has_shared,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),

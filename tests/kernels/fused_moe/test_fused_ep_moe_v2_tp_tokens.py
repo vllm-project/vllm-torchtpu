@@ -103,6 +103,8 @@ def _run_layer(
     score_bias=None,
     routed_scaling_factor=1.0,
     renormalize=True,
+    use_route_kernel=False,
+    shared_partial=None,
 ):
     input_rows = inputs[0].shape[0] // mesh.shape[AXIS]
     # The original router accepts aligned blocks or a whole power-of-two
@@ -130,7 +132,9 @@ def _run_layer(
         )(inputs[0], inputs[-1])
         inputs = (x, *inputs[1:-1], gate)
 
-    def run(rank_arg, bias_arg, *args):
+    assert not (reference_padding and shared_partial is not None)
+
+    def run(rank_arg, bias_arg, shared_arg, *args):
         return fused_ep_moe_v2(
             *args,
             topk=4,
@@ -145,9 +149,11 @@ def _run_layer(
             scoring_fn=scoring_fn,
             score_bias=bias_arg,
             routed_scaling_factor=routed_scaling_factor,
+            use_route_kernel=use_route_kernel,
+            shared_partial=shared_arg,
         )
 
-    result = jax.jit(run)(rank, score_bias, *inputs)
+    result = jax.jit(run)(rank, score_bias, shared_partial, *inputs)
     if reference_padding:
         result = jax.shard_map(
             lambda rows: rows[:input_rows],
@@ -309,6 +315,53 @@ def test_single_host_replica_routing_options(
         assert not np.allclose(
             np.asarray(actual), np.asarray(softmax), rtol=0.01, atol=1e-6
         )
+
+
+@pytest.mark.parametrize(
+    "weight_format", [WeightFormat.FP8, WeightFormat.FP4], ids=["fp8", "fp4"]
+)
+@pytest.mark.parametrize(
+    "use_route_kernel", [False, True], ids=["xla-plan", "route-kernel"]
+)
+@pytest.mark.parametrize(
+    "groups,rows",
+    [
+        pytest.param(tuple((i,) for i in range(8)), 32, id="tp1"),
+        pytest.param(_TP2_PERMUTED, 24, id="tp2-permuted-padding"),
+        pytest.param(_TP4_PERMUTED, 7, id="tp4-permuted-tail"),
+    ],
+)
+def test_single_host_shared_partial_adds_its_group_sum(
+    single_host_mesh, groups, rows, weight_format, use_route_kernel
+):
+    mesh = single_host_mesh
+    ep = mesh.shape[AXIS]
+    rank, inputs = _make_inputs(mesh, groups, rows, weight_format)
+    partials = np.random.default_rng(5).standard_normal((ep * rows, 512)) * 0.05
+    partials = np.asarray(jnp.asarray(partials, dtype=jnp.bfloat16))
+    shared = jax.device_put(partials, NamedSharding(mesh, P(AXIS)))
+    options = dict(use_route_kernel=use_route_kernel)
+    routed = _run_layer(mesh, rank, inputs, groups, weight_format, True, **options)
+    actual = _run_layer(
+        mesh,
+        rank,
+        inputs,
+        groups,
+        weight_format,
+        True,
+        shared_partial=shared,
+        **options,
+    )
+    blocks = partials.astype(np.float32).reshape(ep, rows, 512)
+    expected = np.asarray(routed).astype(np.float32).reshape(ep, rows, 512)
+    got = np.asarray(actual).astype(np.float32).reshape(ep, rows, 512)
+    for group in groups:
+        members = list(group)
+        expected[members] += blocks[members].sum(axis=0)
+        for r in members[1:]:
+            np.testing.assert_array_equal(got[r], got[members[0]])
+    relative = np.linalg.norm(got - expected) / np.linalg.norm(expected)
+    assert relative < 0.005, relative
 
 
 @pytest.mark.parametrize(

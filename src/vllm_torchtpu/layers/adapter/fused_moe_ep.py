@@ -119,6 +119,14 @@ _RANK_BUFFER: Any = None
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
 
+# Under MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT: the op that also takes the shared
+# expert's TP-partial output, staged on the routed layer by prebuild, and the
+# shared-expert module `fold_shared_experts` hands to the quant method.
+_SHARED_FOLD_OP_ATTR = "_fused_moe_ep_shared_fold_op"
+# Why prebuild staged no fold op on the routed layer, for the fold to report.
+_SHARED_FOLD_REFUSAL_ATTR = "_fused_moe_ep_shared_fold_refusal"
+FUSED_MOE_EP_SHARED_ATTR = "_fused_moe_ep_shared_expert"
+
 
 def _squeeze_channel_scale(
     scale: torch.Tensor, experts: int, channels: int
@@ -184,14 +192,22 @@ def _build_op(
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
     agq_min_local_tokens=1024,
+    use_route_kernel=False,
+    has_shared_partial=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
     `sorted_gather` is `ep_sorted_gather_group()`'s (group, positions), or
     None for the single fused program. With it the op is a `_SortedGatherOp`.
+    `has_shared_partial` appends the kernel's `shared_partial` operand; it is
+    built for the single fused program without a score bias or hash ids only.
     """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    assert (
+        not has_shared_partial
+        or _shared_partial_refusal(has_score_bias, has_hash_ids, sorted_gather) is None
+    )
     key = (
         topk,
         renormalize,
@@ -209,6 +225,8 @@ def _build_op(
         w1_scales_expert_second_minor,
         w2_scales_expert_second_minor,
         agq_min_local_tokens,
+        use_route_kernel,
+        has_shared_partial,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -250,6 +268,7 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             agq_min_local_tokens=agq_min_local_tokens,
+            use_route_kernel=use_route_kernel,
             token_replica_groups=token_replica_groups,
             w1_scales_expert_second_minor=w1_scales_expert_second_minor,
             w2_scales_expert_second_minor=w2_scales_expert_second_minor,
@@ -312,13 +331,23 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_with_shared(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        shared: jax.Array,
+    ) -> jax.Array:
+        return call(x, w1, w2, w1_scale, w2_scale, gating, rank, shared_partial=shared)
+
     assert not (has_score_bias and has_hash_ids)
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
-    # The score-correction bias is indexed by GLOBAL expert id and read by
-    # every shard for its own tokens, so it is replicated where the other
-    # seven are sharded on axis 0. The spec tuple goes straight to shard_map,
+    # inputs are sharded on axis 0. The spec tuple goes straight to shard_map,
     # so a heterogeneous tuple is what it wants; the bias is NOT closed over
     # as a constant because it differs per layer and `_OPS` would then key one
     # exported program per MoE layer.
@@ -339,15 +368,27 @@ def _build_op(
         fn = moe_with_hash_ids
     else:
         fn = moe
-    op = jax_op(
-        name,
-        fn,
-        mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
-        # -- and the single output is sharded on axis 0 like x.
-        input_partition_specs=input_specs,
-        output_partition_specs=spec,
-    )
+    if has_shared_partial:
+        # jax_op annotates the specs as tuple[tuple[str, ...], ...]; it takes
+        # PartitionSpecs. x, w1, w2, w1_scale, w2_scale, gating, rank, shared.
+        # pyrefly: ignore[no-matching-overload]
+        op = jax_op(
+            name,
+            moe_with_shared,
+            mesh=mesh,
+            input_partition_specs=input_specs + (spec,),
+            output_partition_specs=spec,
+        )
+    else:
+        op = jax_op(
+            name,
+            fn,
+            mesh=mesh,
+            # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
+            # -- and the single output is sharded on axis 0 like x.
+            input_partition_specs=input_specs,
+            output_partition_specs=spec,
+        )
 
     # Replaces the fake jax_op installs, which resolves the output aval by
     # running a real `jax.export` every time Dynamo traces the op. This kernel
@@ -395,6 +436,21 @@ class _SortedGatherOp:
         q, router_weights, payload = self.route(*operands)
         q_g = funcol.wait_tensor(funcol.all_gather_tensor(q, 0, self.group))
         return self.compute(*operands, q_g, router_weights, payload)
+
+
+def _shared_partial_refusal(
+    has_score_bias: bool, has_hash_ids: bool, sorted_gather
+) -> str | None:
+    """Why the op cannot take the shared expert's partial, or None."""
+    if has_score_bias:
+        return "the op takes a score bias"
+    if has_hash_ids:
+        return "the op takes hash ids"
+    if sorted_gather is not None:
+        # The shared reduction overlaps the kernel's own activation
+        # all-gather, which the split route/compute stages do not have.
+        return "MOE_FUSED_EP_SORTED_GATHER splits the op into route and compute"
+    return None
 
 
 def _build_split_ops(
@@ -585,8 +641,13 @@ def fused_moe_ep(
     thing on the layer -- prebuild built the op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
+
+    On a layer `fold_shared_experts` armed, the output also carries the shared
+    expert's, summed over the TP group: the op is handed the shared expert's
+    TP-partial output for these rows.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    shared_expert = getattr(owner, FUSED_MOE_EP_SHARED_ATTR, None)
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
@@ -604,6 +665,8 @@ def fused_moe_ep(
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    if shared_expert is not None:
+        extra += (shared_expert(hidden_states),)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -999,7 +1062,7 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
-    op = _build_op(
+    build_args = (
         mesh,
         topk,
         renormalize,
@@ -1012,6 +1075,8 @@ def prebuild_fused_moe_ep(
         has_score_bias,
         routed_scale,
         has_hash_ids,
+    )
+    build_kw = dict(
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
         # Only FP4 has [E, blocks, N] scale tables.
@@ -1020,7 +1085,18 @@ def prebuild_fused_moe_ep(
         w2_scales_expert_second_minor=weight_format == "fp4"
         and _scales_expert_second_minor(w2_scale),
         agq_min_local_tokens=envs.MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS,
+        use_route_kernel=envs.MOE_FUSED_EP_V2_ROUTE_KERNEL,
     )
+    op = _build_op(*build_args, **build_kw)
+    if envs.MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT:
+        refusal = _shared_partial_refusal(has_score_bias, has_hash_ids, sorted_gather)
+        fold_op = (
+            None
+            if refusal
+            else _build_op(*build_args, **build_kw, has_shared_partial=True)
+        )
+        setattr(layer, _SHARED_FOLD_OP_ATTR, fold_op)
+        setattr(layer, _SHARED_FOLD_REFUSAL_ATTR, refusal)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
@@ -1054,6 +1130,97 @@ def prebuild_fused_moe_ep(
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
     return op
+
+
+def fold_shared_experts(
+    model: torch.nn.Module, draft_model: torch.nn.Module | None = None
+) -> int:
+    """Hand each admitted MoE runner's shared expert to its fused EP op.
+
+    The op then adds the shared expert's output, summed over the TP group, to
+    its own, and the runner neither runs nor all-reduces the shared expert.
+    Called once after weight load, before the forward is compiled. Returns how
+    many runners were folded.
+    """
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    runners = {
+        id(module): module
+        for net in (model, draft_model)
+        if net is not None
+        for module in net.modules()
+        if isinstance(module, MoERunner)
+    }
+    refused: dict[str, int] = {}
+    for runner in runners.values():
+        reason = _shared_fold_refusal(runner)
+        if reason is None:
+            _fold_shared_expert(runner)
+        else:
+            refused[reason] = refused.get(reason, 0) + 1
+    folded = len(runners) - sum(refused.values())
+    logger.info(
+        "Fused EP MoE: shared expert folded into the op on %d of %d MoE "
+        "layers; refused: %s",
+        folded,
+        len(runners),
+        refused or "none",
+    )
+    return folded
+
+
+def _shared_fold_refusal(runner) -> str | None:
+    """Why `runner`'s shared expert stays with the runner, or None."""
+    if not fused_moe_ep_supported(runner._quant_method):
+        return "the fused EP kernel is not armed"
+    if runner.shared_experts is None:
+        return "no shared expert"
+    layer = runner.routed_experts
+    if getattr(layer, _SHARED_FOLD_OP_ATTR, None) is None:
+        return getattr(layer, _SHARED_FOLD_REFUSAL_ATTR, None) or (
+            "prebuild staged no fold op"
+        )
+    if runner.shared_expert_gate is not None:
+        return "the runner applies a shared-expert gate"
+    if runner.routed_input_transform is not None:
+        return "a routed input transform feeds the experts other rows"
+    if runner.routed_output_transform is not None:
+        return "a routed output transform would apply to the shared expert"
+    if runner.routed_scaling_factor != 1.0:
+        return "routed_scaling_factor would scale the shared expert"
+    if runner.moe_config.is_sequence_parallel:
+        return "sequence-parallel MoE"
+    if runner.moe_config.skip_final_all_reduce:
+        return "skip_final_all_reduce: the model reduces the output itself"
+    return None
+
+
+def _fold_shared_expert(runner) -> None:
+    layer = runner.routed_experts
+    owner = runner._quant_method
+    shared_expert = runner.shared_experts._layer
+    setattr(owner, FUSED_MOE_EP_OP_ATTR, getattr(layer, _SHARED_FOLD_OP_ATTR))
+    setattr(owner, FUSED_MOE_EP_SHARED_ATTR, shared_expert)
+    # Keeps it in the model's module tree once the runner lets go of it.
+    layer.register_module(FUSED_MOE_EP_SHARED_ATTR, shared_expert)
+    # MoERunner has no public way to drop its shared expert, and its __init__
+    # caches a forward entry chosen by whether it has one. If a vLLM bump
+    # renames either field, the runner keeps running and all-reducing the
+    # shared expert while the op adds it too: double-counted, silently. Fail
+    # at load instead.
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    runner._shared_experts = None
+    runner._forward_entry = runner._select_forward()
+    assert runner.shared_experts is None, (
+        f"{runner.layer_name}: clearing MoERunner._shared_experts did not drop "
+        "the shared expert; update _fold_shared_expert for this vLLM version"
+    )
+    assert runner._forward_entry is moe_runner._moe_forward, (
+        f"{runner.layer_name}: MoERunner still forwards through "
+        f"{runner._forward_entry!r}; update _fold_shared_expert for this vLLM "
+        "version"
+    )
 
 
 def fused_moe_ep_unsupported_reason(

@@ -114,9 +114,11 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS: int = 1024
+    MOE_FUSED_EP_V2_ROUTE_KERNEL: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -894,6 +896,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Hand an armed layer's TP-partial shared-expert output to the fused EP
+    # program, which reduces it while the activation all-gather is in flight
+    # instead of the runner all-reducing it after the layer. Delete once it is
+    # measured on serving and made the default.
+    "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT": env_bool(
+        "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT"
+    ),
     # Keep the fused EP MoE mesh in EP-rank order and do the activation
     # all-gather outside the kernel's program, over a process group in
     # ascending device-id order, so the SparseCore gather gets its
@@ -919,6 +928,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS": env_nonnegative_int(
         "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS", 1024
     ),
+    # Run fused EP MoE v2's routing exchange and plan as one TensorCore Pallas
+    # kernel (kernels/fused_moe/v2/route_plan.py) where its shape conditions
+    # hold, instead of the XLA collective and SparseCore slab scatters. Same
+    # tables bit for bit; see use_route_kernel in kernels/fused_moe/v2/layer.py.
+    "MOE_FUSED_EP_V2_ROUTE_KERNEL": env_bool("MOE_FUSED_EP_V2_ROUTE_KERNEL"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
