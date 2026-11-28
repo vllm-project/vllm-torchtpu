@@ -307,7 +307,9 @@ def _kth_largest_key(keys: jax.Array, k: int) -> jax.Array:
 
 def _cumsum01(x: jax.Array) -> jax.Array:
     """Inclusive cumsum of 0/1 int32 [R, N] along N, as one matmul with an
-    upper-triangular ones matrix (exact: the counts are far below 2**24)."""
+    upper-triangular ones matrix (exact: the counts are far below 2**24).
+    The matrix is N x N; the selection levels have N <= 1024 at TP >= 2 for
+    vocabularies up to 262144."""
     n = x.shape[-1]
     i = lax.broadcasted_iota(jnp.int32, (n, n), 0)
     j = lax.broadcasted_iota(jnp.int32, (n, n), 1)

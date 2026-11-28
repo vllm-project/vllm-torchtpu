@@ -266,6 +266,66 @@ def test_shard_candidates_are_the_shard_top_kc(kind):
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("kind", ["uniform", "ties", "extremes"])
+def test_select_top_picks_the_k_largest_keys_in_position_order(kind):
+    """The digit search finds the k-th largest key, and the one-hot holds the
+    k largest keys (ties to the lowest positions) in position order."""
+    rng = np.random.default_rng(3)
+    for n in (7, 243, 1024):
+        if kind == "uniform":
+            keys = rng.integers(-(1 << 15), 1 << 15, (4, n))
+        elif kind == "ties":
+            keys = rng.integers(-3, 3, (4, n))
+        else:
+            keys = rng.choice([-(1 << 15), (1 << 15) - 1, 0, -1], (4, n))
+        for k in sorted({1, min(64, n), n}):
+            got = np.asarray(cs._kth_largest_key(jnp.asarray(keys, jnp.int32), k))
+            np.testing.assert_array_equal(got, -np.sort(-keys, axis=1)[:, k - 1])
+            onehot = np.asarray(cs._select_top(jnp.asarray(keys, jnp.int32), k))
+            for r in range(keys.shape[0]):
+                chosen = np.sort(np.argsort(-keys[r], kind="stable")[:k])
+                want = np.zeros((k, n), bool)
+                want[np.arange(k), chosen] = True
+                np.testing.assert_array_equal(onehot[r], want)
+
+
+@pytest.mark.cpu_test
+def test_gather_candidates_matches_one_gather_per_array():
+    tp, rows, kc = 4, 5, 8
+    rng = np.random.default_rng(5)
+    vals = jnp.asarray(rng.normal(size=(tp, rows, kc)), jnp.bfloat16)
+    vals = vals.at[0, 0, 0].set(-0.0)  # a bit pattern a float compare would miss
+    ids = jnp.asarray(rng.integers(0, 1 << 20, (tp, rows, kc)), jnp.int32)
+    boundary = jnp.asarray(rng.normal(size=(tp, rows)), jnp.bfloat16)
+    top = jnp.asarray(rng.normal(size=(tp, rows)), jnp.bfloat16)
+    first = jnp.asarray(rng.integers(0, 1 << 20, (tp, rows)), jnp.int32)
+
+    def separate(v, i, b, t, f):
+        def gather(a):
+            return jax.lax.all_gather(a, "tp", axis=1, tiled=True)
+
+        return (
+            gather(v),
+            gather(i),
+            gather(b[:, None]),
+            gather(t[:, None]),
+            gather(f[:, None]),
+        )
+
+    def packed(v, i, b, t, f):
+        return cs._gather_candidates(v, i, b, t, f, "tp")
+
+    args = (vals, ids, boundary, top, first)
+    want = jax.vmap(separate, axis_name="tp")(*args)
+    got = jax.vmap(packed, axis_name="tp")(*args)
+    for g, w in zip(got, want):
+        assert g.dtype == w.dtype and g.shape == w.shape
+        if g.dtype == jnp.bfloat16:
+            g, w = (jax.lax.bitcast_convert_type(a, jnp.int16) for a in (g, w))
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("value,enabled", [(None, False), ("1", True), ("0", False)])
 def test_candidate_sampling_is_off_unless_switched_on(monkeypatch, value, enabled):
     from vllm_torchtpu import envs
