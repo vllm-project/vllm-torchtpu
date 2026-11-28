@@ -18,7 +18,7 @@ import copy
 import dataclasses
 import functools
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -75,7 +75,7 @@ def _static_shape_args(fn):
 
     That is how `propose` used to die on its first draft step: `_forward_draft`
     runs the draft model on `positions`, marking it, and the very next line
-    passed the same object to `_draft_gather_carries`. It presented as flaky and
+    passed the same object to `_draft_gather_rows`. It presented as flaky and
     rank-dependent only because a warm compile cache short-circuits the backend
     call, so whether it fired depended on cache state rather than on shapes.
 
@@ -124,6 +124,55 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
     if target_len <= n:
         return t
     return torch.nn.functional.pad(t, (0, target_len - n))
+
+
+def _narrow_target_md(
+    target_md: dict[str, AttentionMetadata],
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    request_distribution: torch.Tensor,
+) -> dict[str, AttentionMetadata]:
+    """The target's step-0 metadata with one query per request: the three
+    per-request fields replaced, block tables kept. Layers that share one
+    metadata object keep sharing one."""
+    replaced: dict[int, AttentionMetadata] = {}
+    result = {}
+    for name, md in target_md.items():
+        if id(md) not in replaced:
+            # AttentionMetadata annotates these fields with the kernels'
+            # jax.Array; the runner fills them with torch tensors, as every
+            # builder of it does.
+            replaced[id(md)] = dataclasses.replace(
+                md,
+                # pyrefly: ignore[bad-argument-type]
+                seq_lens=seq_lens,
+                # pyrefly: ignore[bad-argument-type]
+                query_start_loc=query_start_loc,
+                # pyrefly: ignore[bad-argument-type]
+                request_distribution=request_distribution,
+            )
+        result[name] = replaced[id(md)]
+    return result
+
+
+def _step0_gather_indices(
+    last_token_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(owner_mask, safe_gather_indices)` of step 0's per-request rows.
+
+    Clamped, not raw: a PCP-localized index is -1 for a row this rank does not
+    own, and -1 would wrap to the last row; the mask drops those rows later.
+    """
+    return last_token_indices.ge(0), last_token_indices.clamp_min(0)
+
+
+class _ChunkLoopInputs(NamedTuple):
+    """A chunk's one-query-per-request attention inputs, shared by every loop
+    step."""
+
+    rejected_dev: torch.Tensor | None
+    query_start_loc: torch.Tensor
+    request_distribution: torch.Tensor
 
 
 if TYPE_CHECKING:
@@ -469,13 +518,9 @@ class Eagle3Proposer:
         # max_num_batched_tokens >= max_num_seqs to hold: if it does not, the
         # compaction store and the loop-step read both run off the end of the
         # buffer.
-        # Call the padding helper straight: `_loop_bucket`'s DP-lockstep branch
-        # needs per-step state and `_draft_has_moe`, neither valid at load time.
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
-        required_rows = _get_padded_token_len(
-            self.runner.num_tokens_paddings, self.runner.max_num_reqs
-        )
+        # The bound, not `_loop_bucket`: its DP-lockstep branch needs per-step
+        # state and `_draft_has_moe`, neither valid at load time.
+        required_rows = self._max_loop_bucket()
         for buf in self._mtp_topk_buffers:
             if buf.shape[0] < required_rows:
                 sched = self.vllm_config.scheduler_config
@@ -676,6 +721,50 @@ class Eagle3Proposer:
                 seq_lens.copy_(seq_lens_step1)
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+
+    def _max_loop_bucket(self) -> int:
+        """The largest loop bucket p `_loop_bucket` can return."""
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        return _get_padded_token_len(runner.num_tokens_paddings, runner.max_num_reqs)
+
+    def _chunk_loop_inputs(
+        self,
+        chunk: DraftChunkInputs,
+        num_rejected: np.ndarray | torch.Tensor | None,
+    ) -> _ChunkLoopInputs:
+        """A chunk's one-query-per-request inputs, built once per propose and
+        shared by its loop steps.
+
+        The rejected count is padded to kernel_num_reqs so the loop's seq_lens
+        subtraction is full-length (constant): no per-num_reqs recompile. Sync
+        pads on the host; async pads the device tensor. query_start_loc and
+        request_distribution depend only on num_reqs, not the step.
+        """
+        runner = self.runner
+        knr = (
+            runner.num_reqs_max_model_len
+            if chunk.attn_ctx.use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        assert knr is not None
+        rejected_dev = None
+        if isinstance(num_rejected, torch.Tensor):
+            # Async: the count is at the sampler's request-padding width, which
+            # can sit above the chunk's kernel_num_reqs; the rows past the
+            # chunk's requests are zeros either way.
+            rejected_dev = _maybe_pad_dim0(num_rejected[:knr], knr)
+        elif num_rejected is not None and np.any(num_rejected):
+            padded_nr = np.zeros(knr, dtype=np.int32)
+            padded_nr[: chunk.num_reqs] = num_rejected.astype(np.int32, copy=False)
+            rejected_dev = torch.from_numpy(padded_nr).to(runner.device)
+        qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), chunk.num_reqs)
+        query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
+        request_distribution = torch.tensor(
+            [chunk.num_reqs] * 3, dtype=torch.int32, device=runner.device
+        )
+        return _ChunkLoopInputs(rejected_dev, query_start_loc, request_distribution)
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -1134,27 +1223,28 @@ class Eagle3Proposer:
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _draft_gather_carries(
+    def _draft_gather_rows(
         self,
-        hidden: torch.Tensor,
+        x: torch.Tensor,
         positions: torch.Tensor,
-        last_hidden: torch.Tensor,
+        y: torch.Tensor,
         indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # First-pass per-request carries: gather the last-token hidden, position,
-        # and pre-lm-head hidden in one compiled region. Run raw (advanced
+        # The rows at `indices` of two token-major tensors and of positions,
+        # in one compiled region keyed on (T, p): step 0's per-request carries
+        # (hidden, positions, last_hidden). Run raw (advanced
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
-        # program. index_select is value-identical to hidden[indices].
-        pos_carry = (
+        # program. index_select is value-identical to x[indices].
+        pos_rows = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
             else torch.index_select(positions, 0, indices)
         )
         return (
-            torch.index_select(hidden, 0, indices),
-            pos_carry,
-            torch.index_select(last_hidden, 0, indices),
+            torch.index_select(x, 0, indices),
+            pos_rows,
+            torch.index_select(y, 0, indices),
         )
 
     @_static_shape_args
@@ -1168,7 +1258,7 @@ class Eagle3Proposer:
         # the cat into a standalone program, (b) emit a distinct cat+mm grouping
         # per live dispatch context, or (c) fuse the combine mm forward into the
         # downstream draft_input_ids seed scatter. Same pattern as
-        # _draft_propose_token / _draft_gather_carries.
+        # _draft_propose_token / _draft_gather_rows.
         assert self.draft_model is not None
         return self.draft_model.combine_hidden_states(
             torch.cat((aux0, aux1, aux2), dim=-1)
@@ -1263,7 +1353,6 @@ class Eagle3Proposer:
         rejected_np_per_chunk: list[np.ndarray | None] = []
         uses_aux_hidden_state = self._draft_uses_aux_hidden_state()
         draft_tokens_per_chunk = []
-        is_async = next_tokens_per_chunk is not None
         # IndexShare: each chunk's step-0 top-k rows, saved right after its
         # compaction (see _mtp_compact_and_save).
         saved_topk_per_chunk: list[list[torch.Tensor]] = []
@@ -1321,18 +1410,13 @@ class Eagle3Proposer:
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
-            owner_mask = last_token_indices.ge(0)
-            safe_gather_indices = last_token_indices.clamp_min(0)
+            owner_mask, safe_gather_indices = _step0_gather_indices(last_token_indices)
             if self._share_mtp_indices:
-                # Clamped, not raw: a PCP-localized index is -1 for a row this
-                # rank does not own, and -1 would wrap to the buffer's last row.
                 saved_topk_per_chunk.append(
                     self._mtp_compact_and_save(safe_gather_indices)
                 )
-            hidden_carry, positions_carry, last_hidden_carry = (
-                self._draft_gather_carries(
-                    hidden, positions, last_hidden, safe_gather_indices
-                )
+            hidden_carry, positions_carry, last_hidden_carry = self._draft_gather_rows(
+                hidden, positions, last_hidden, safe_gather_indices
             )
             last_hidden_carry = (
                 chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
@@ -1378,56 +1462,16 @@ class Eagle3Proposer:
                 else _maybe_pad_dim0(pos, p)
                 for pos, p in zip(positions_carry_per_chunk, padded_nr_per_chunk)
             ]
-            # Per-chunk rejected count padded to kernel_num_reqs so the loop's
-            # seq_lens subtraction is full-length (constant) — no per-num_reqs
-            # recompile. Sync pads on the host (free, reused across the K-1 loop
-            # steps); async pads the device tensor.
-            rejected_dev_per_chunk = []
-            for c, nr in zip(chunks, rejected_per_chunk):
-                knr = (
-                    runner.num_reqs_max_model_len
-                    if c.attn_ctx.use_max_model_len
-                    else runner.num_reqs_most_model_len
-                )
-                assert knr is not None
-                if is_async:
-                    # nr is at the sampler's request-padding width, which can
-                    # sit above a chunk's kernel_num_reqs; the rows past the
-                    # chunk's requests are zeros either way.
-                    rejected_dev_per_chunk.append(
-                        _maybe_pad_dim0(cast(torch.Tensor, nr)[:knr], knr)
-                        if nr is not None
-                        else None
-                    )
-                elif nr is not None and np.any(nr):
-                    padded_nr = np.zeros(knr, dtype=np.int32)
-                    padded_nr[: c.num_reqs] = cast(np.ndarray, nr).astype(
-                        np.int32, copy=False
-                    )
-                    rejected_dev_per_chunk.append(
-                        torch.from_numpy(padded_nr).to(runner.device)
-                    )
-                else:
-                    rejected_dev_per_chunk.append(None)
-            # Loop-step query_start_loc and request_distribution depend only on
-            # num_reqs (not the step), so build them once per chunk instead of
-            # rebuilding (with an H2D) on every one of the K-1 steps.
-            loop_qsl_per_chunk = []
-            loop_reqdist_per_chunk = []
-            for c in chunks:
-                knr = (
-                    runner.num_reqs_max_model_len
-                    if c.attn_ctx.use_max_model_len
-                    else runner.num_reqs_most_model_len
-                )
-                assert knr is not None
-                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
-                loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
-                loop_reqdist_per_chunk.append(
-                    torch.tensor(
-                        [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
-                    )
-                )
+            # Built once per chunk for all K - 1 loop steps.
+            loop_inputs_per_chunk = [
+                self._chunk_loop_inputs(c, nr)
+                for c, nr in zip(chunks, rejected_per_chunk)
+            ]
+            rejected_dev_per_chunk = [li.rejected_dev for li in loop_inputs_per_chunk]
+            loop_qsl_per_chunk = [li.query_start_loc for li in loop_inputs_per_chunk]
+            loop_reqdist_per_chunk = [
+                li.request_distribution for li in loop_inputs_per_chunk
+            ]
 
             def run_draft_step(ci: int, step: int) -> None:
                 """One separate draft step for chunk `ci`: a draft forward
@@ -1933,23 +1977,9 @@ class Eagle3Proposer:
                     loop_request_distribution=loop_request_distribution,
                 )
             )
-            replaced_target: dict[int, AttentionMetadata] = {}
-            result = {}
-            for name, md in target_md.items():
-                if id(md) not in replaced_target:
-                    # AttentionMetadata annotates these fields with the
-                    # kernels' jax.Array; the runner fills them with torch
-                    # tensors, as every builder of it does.
-                    replaced_target[id(md)] = dataclasses.replace(
-                        md,
-                        # pyrefly: ignore[bad-argument-type]
-                        seq_lens=seq_lens,
-                        # pyrefly: ignore[bad-argument-type]
-                        query_start_loc=query_start_loc,
-                        # pyrefly: ignore[bad-argument-type]
-                        request_distribution=request_distribution,
-                    )
-                result[name] = replaced_target[id(md)]
+            result = _narrow_target_md(
+                target_md, seq_lens, query_start_loc, request_distribution
+            )
             self._draft_md_cache[id(chunk)] = (result, seq_lens, seq_lens_delta)
             return result
 
@@ -2113,7 +2143,24 @@ class Eagle3Proposer:
             loop_query_start_loc=loop_query_start_loc,
             loop_request_distribution=loop_request_distribution,
         )
+        return self._run_draft_model(
+            input_ids=input_ids,
+            positions=positions,
+            target_hidden_states=target_hidden_states,
+            step_idx=step_idx,
+            attn_metadata=attn_metadata,
+        )
 
+    def _run_draft_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        step_idx: int,
+        attn_metadata: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run draft step `step_idx`'s program under `attn_metadata`; returns
+        `(last_hidden, hidden)`."""
         num_tokens = input_ids.shape[0]
 
         kwargs: dict[str, torch.Tensor | int] = {
@@ -2283,16 +2330,12 @@ class Eagle3Proposer:
                 logger.info("  -- drafter combine num_tokens: %d", num_tokens)
 
     def _precompile_draft_seed(self) -> None:
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
         runner = self.runner
         # input_ids length = first-pass token bucket; index length = p =
         # pad(num_reqs), bounded by the loop bucket pad(max_num_reqs). Mirror the
         # bucket selection in _precompile_compute_logits so every sync first-pass
         # (T, p) shape-key is a startup cache hit.
-        max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, runner.max_num_reqs
-        )
+        max_loop_bucket = self._max_loop_bucket()
         idx_sizes = sorted(
             set(runner.num_reqs_paddings)
             | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
@@ -2309,8 +2352,6 @@ class Eagle3Proposer:
                     synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
         runner = self.runner
         hidden_size = self._draft_hidden_size()
         # compute_logits is called on (a) num_reqs buckets in the first pass and
@@ -2321,9 +2362,7 @@ class Eagle3Proposer:
         # max_num_batched_tokens, compiling large [n, vocab] matmuls the loop never
         # hits.) Filtering by <= max_loop_bucket keeps every intermediate bucket
         # the loop can land on, unlike sampling only at num_reqs_paddings points.
-        max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, runner.max_num_reqs
-        )
+        max_loop_bucket = self._max_loop_bucket()
         all_sizes = set(runner.num_reqs_paddings) | {
             t for t in runner.num_tokens_paddings if t <= max_loop_bucket
         }
