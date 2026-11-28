@@ -43,15 +43,18 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 class _HeadShard(torch.nn.Module):
     """One rank's slice of a vocab-parallel LM head (rows [start, start+n))."""
 
-    def __init__(self, weight, start, tp_size, num_pad):
+    def __init__(self, weight, start, tp_size, num_pad, bias=None):
         super().__init__()
         self.weight = weight
+        self.bias = bias
         self.tp_size = tp_size
         self.shard_indices = SimpleNamespace(
             org_vocab_start_index=start, num_org_vocab_padding=num_pad
         )
         self.quant_method = SimpleNamespace(
-            apply=lambda layer, x, bias=None: x @ layer.weight.T
+            apply=lambda layer, x, bias=None: (
+                x @ layer.weight.T + bias if bias is not None else x @ layer.weight.T
+            )
         )
 
 
@@ -67,27 +70,42 @@ class _Owner(torch.nn.Module):
             self.logits_processor = LogitsProcessor(head.weight.shape[0])
 
 
-def _shards(weight, tp_size):
+def _shards(weight, tp_size, bias=None):
     """Split [vocab, H] into tp_size shards, padding the tail with rows that
     would win the argmax if the padding mask were missing."""
     vocab, hidden = weight.shape
     per_rank = math.ceil(vocab / tp_size)
-    pad_rows = torch.full((per_rank * tp_size - vocab, hidden), 1e4, dtype=weight.dtype)
+    pad_len = per_rank * tp_size - vocab
+    pad_rows = torch.full((pad_len, hidden), 1e4, dtype=weight.dtype)
     padded = torch.cat([weight, pad_rows])
+    padded_bias = (
+        torch.cat([bias, torch.full((pad_len,), 1e4, dtype=bias.dtype)])
+        if bias is not None
+        else None
+    )
     shards = []
     for rank in range(tp_size):
         start = rank * per_rank
         num_pad = max(0, start + per_rank - vocab) if start < vocab else per_rank
+        shard_bias = (
+            padded_bias[start : start + per_rank] if padded_bias is not None else None
+        )
         shards.append(
-            _HeadShard(padded[start : start + per_rank], start, tp_size, num_pad)
+            _HeadShard(
+                padded[start : start + per_rank],
+                start,
+                tp_size,
+                num_pad,
+                bias=shard_bias,
+            )
         )
     return shards
 
 
-def _vocab_parallel_top_tokens(weight, hidden_states, tp_size, monkeypatch):
+def _vocab_parallel_top_tokens(weight, hidden_states, tp_size, monkeypatch, bias=None):
     """vLLM's get_top_tokens on every rank, the all-gather played back from
     the pairs each rank contributed."""
-    shards = _shards(weight, tp_size)
+    shards = _shards(weight, tp_size, bias=bias)
     pairs = []
 
     def record(pair, dim):
@@ -105,8 +123,11 @@ def _vocab_parallel_top_tokens(weight, hidden_states, tp_size, monkeypatch):
     return greedy_top_tokens.top_tokens(_Owner(shards[0]), hidden_states)
 
 
-def _full_logits_tokens(weight, hidden_states):
-    return torch.argmax(hidden_states @ weight.T, dim=-1, keepdim=True)
+def _full_logits_tokens(weight, hidden_states, bias=None):
+    logits = hidden_states @ weight.T
+    if bias is not None:
+        logits = logits + bias
+    return torch.argmax(logits, dim=-1, keepdim=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -137,14 +158,14 @@ def test_ties_resolve_to_the_lowest_token_id(monkeypatch, tp_size):
     assert torch.equal(got, _full_logits_tokens(weight, hidden_states))
 
 
-def _lora_owner(monkeypatch):
+def _lora_owner(monkeypatch, bias=None):
     """A 64-token head whose logits processor is vLLM's LoRA wrapper, fed by
     PunicaWrapperTPU. Request 0 uses adapter 3, whose delta lifts token 7
     from 9.5 to 10.5, past token 42 at 10.0; request 1 uses no adapter."""
     vocab, hidden = 64, 4
     weight = torch.zeros(vocab, hidden)
     weight[42, 0], weight[7, 0] = 10.0, 9.5
-    owner = _Owner(_HeadShard(weight, 0, 1, 0))
+    owner = _Owner(_HeadShard(weight, 0, 1, 0, bias=bias))
 
     # A single rank, with no process group to gather over.
     monkeypatch.setattr(
@@ -179,6 +200,24 @@ def test_top_tokens_include_the_lm_head_lora_delta(monkeypatch):
 
     assert tokens.dtype == torch.int64
     assert tokens.tolist() == [[7], [42]]
+
+
+def test_top_tokens_include_lm_head_lora_delta_and_bias(monkeypatch):
+    """The LoRA branch forwards lm_head.bias; bias flips row 1 from 42 to 3."""
+    bias = torch.zeros(64)
+    bias[3] = 10.2  # beats token 42 (10.0) on row 1, loses to token 7 (10.5) on row 0
+    owner = _lora_owner(monkeypatch, bias=bias)
+    hidden_states = torch.tensor([[1.0, 0, 0, 0]] * 2)
+
+    tokens = greedy_top_tokens.top_tokens(owner, hidden_states)
+    expected = torch.argmax(
+        owner.logits_processor(owner.lm_head, hidden_states, bias),
+        dim=-1,
+        keepdim=True,
+    )
+
+    assert torch.equal(tokens, expected)
+    assert tokens.tolist() == [[7], [3]]
 
 
 def test_head_owner_resolves_through_the_lora_wrapper(monkeypatch):
@@ -243,6 +282,23 @@ def test_resolve_head_owner_finds_the_nested_language_model():
     assert greedy_top_tokens.resolve_head_owner(model, dp_lockstep=False) is owner
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_top_tokens_forward_head_bias(monkeypatch, tp_size):
+    gen = torch.Generator().manual_seed(10 + tp_size)
+    weight = torch.randn(65, 16, generator=gen)
+    hidden_states = torch.randn(9, 16, generator=gen)
+    # Large per-token bias flips the argmax relative to unbiased logits.
+    bias = torch.randn(65, generator=gen) * 20.0
+
+    got = _vocab_parallel_top_tokens(
+        weight, hidden_states, tp_size, monkeypatch, bias=bias
+    )
+
+    expected = _full_logits_tokens(weight, hidden_states, bias=bias)
+    assert torch.equal(got, expected)
+    assert not torch.equal(got, _full_logits_tokens(weight, hidden_states))
+
+
 def test_resolve_head_owner_refuses_unsupported_models():
     with pytest.raises(NotImplementedError, match="no module with an lm_head"):
         greedy_top_tokens.resolve_head_owner(torch.nn.Linear(2, 2), False)
@@ -251,15 +307,113 @@ def test_resolve_head_owner_refuses_unsupported_models():
             _Owner(_shards(torch.zeros(8, 2), 2)[0]), dp_lockstep=True
         )
 
-    class TpuLogitsModel(_Owner):
+    class CustomLogitsModel(_Owner):
         def compute_logits(self, hidden_states):
             return hidden_states
 
-    TpuLogitsModel.compute_logits.__module__ = "vllm_torchtpu.models.fake"
-    with pytest.raises(NotImplementedError, match="TPU-specific compute_logits"):
-        greedy_top_tokens.resolve_head_owner(
-            TpuLogitsModel(_shards(torch.zeros(8, 2), 1)[0]), False
-        )
+    CustomLogitsModel.compute_logits.__module__ = "vllm_torchtpu.models.fake"
+    custom = CustomLogitsModel(_shards(torch.zeros(8, 2), 1)[0])
+    orig_custom = custom.logits_processor
+    with pytest.raises(NotImplementedError, match="custom pre- or post-processing"):
+        greedy_top_tokens.resolve_head_owner(custom, False)
+    assert custom.logits_processor is orig_custom
+
+    class PostProcessedLogitsModel(_Owner):
+        def compute_logits(self, hidden_states):
+            logits = self.logits_processor(self.lm_head, hidden_states)
+            return logits + 1.0
+
+    post = PostProcessedLogitsModel(_shards(torch.zeros(8, 2), 1)[0])
+    orig_post = post.logits_processor
+    with pytest.raises(NotImplementedError, match="custom pre- or post-processing"):
+        greedy_top_tokens.resolve_head_owner(post, False)
+    assert post.logits_processor is orig_post
+
+    class PreProcessedHiddenModel(_Owner):
+        def compute_logits(self, hidden_states):
+            return self.logits_processor(self.lm_head, object())
+
+    pre = PreProcessedHiddenModel(_shards(torch.zeros(8, 2), 1)[0])
+    orig_pre = pre.logits_processor
+    with pytest.raises(NotImplementedError, match="custom pre- or post-processing"):
+        greedy_top_tokens.resolve_head_owner(pre, False)
+    assert pre.logits_processor is orig_pre
+
+    class SwappedHeadModel(_Owner):
+        def compute_logits(self, hidden_states):
+            return self.logits_processor(torch.nn.Linear(2, 8), hidden_states)
+
+    swapped = SwappedHeadModel(_shards(torch.zeros(8, 2), 1)[0])
+    orig_swapped = swapped.logits_processor
+    with pytest.raises(NotImplementedError, match="custom pre- or post-processing"):
+        greedy_top_tokens.resolve_head_owner(swapped, False)
+    assert swapped.logits_processor is orig_swapped
+
+    class RaisingLogitsModel(_Owner):
+        def compute_logits(self, hidden_states):
+            raise RuntimeError("expects tensor hidden_states")
+
+    raising = RaisingLogitsModel(_shards(torch.zeros(8, 2), 1)[0])
+    orig_raising = raising.logits_processor
+    with pytest.raises(NotImplementedError, match="custom pre- or post-processing"):
+        greedy_top_tokens.resolve_head_owner(raising, False)
+    assert raising.logits_processor is orig_raising
+
+    class DoubleCallLogitsModel(_Owner):
+        def compute_logits(self, hidden_states):
+            self.logits_processor(self.lm_head, object())
+            return self.logits_processor(self.lm_head, hidden_states)
+
+    double_call = DoubleCallLogitsModel(_shards(torch.zeros(8, 2), 1)[0])
+    orig_double = double_call.logits_processor
+    with pytest.raises(NotImplementedError, match="custom pre- or post-processing"):
+        greedy_top_tokens.resolve_head_owner(double_call, False)
+    assert double_call.logits_processor is orig_double
+
+
+def test_resolve_head_owner_accepts_passthrough_tpu_compute_logits():
+    class PassthroughTpuModel(_Owner):
+        def compute_logits(self, hidden_states):
+            return self.logits_processor(self.lm_head, hidden_states)
+
+    PassthroughTpuModel.compute_logits.__module__ = "vllm_torchtpu.models.fake"
+    model = PassthroughTpuModel(_shards(torch.zeros(8, 2), 2)[0])
+    orig_processor = model.logits_processor
+    assert greedy_top_tokens.resolve_head_owner(model, dp_lockstep=False) is model
+    assert model.logits_processor is orig_processor
+
+
+def test_resolve_head_owner_requires_exact_head_bias_match():
+    shard_with_bias = _shards(torch.zeros(8, 2), 2, bias=torch.ones(8))[0]
+
+    class ForwardBiasModel(_Owner):
+        def compute_logits(self, hidden_states):
+            return self.logits_processor(self.lm_head, hidden_states, self.lm_head.bias)
+
+    ok_model = ForwardBiasModel(shard_with_bias)
+    orig_ok = ok_model.logits_processor
+    assert greedy_top_tokens.resolve_head_owner(ok_model, dp_lockstep=False) is ok_model
+    assert ok_model.logits_processor is orig_ok
+
+    class DropBiasModel(_Owner):
+        def compute_logits(self, hidden_states):
+            return self.logits_processor(self.lm_head, hidden_states)
+
+    drop_model = DropBiasModel(shard_with_bias)
+    orig_drop = drop_model.logits_processor
+    with pytest.raises(NotImplementedError, match="custom pre- or post-processing"):
+        greedy_top_tokens.resolve_head_owner(drop_model, dp_lockstep=False)
+    assert drop_model.logits_processor is orig_drop
+
+    class ExtraBiasModel(_Owner):
+        def compute_logits(self, hidden_states):
+            return self.logits_processor(self.lm_head, hidden_states, torch.zeros(4))
+
+    extra_model = ExtraBiasModel(_shards(torch.zeros(8, 2), 2)[0])
+    orig_extra = extra_model.logits_processor
+    with pytest.raises(NotImplementedError, match="custom pre- or post-processing"):
+        greedy_top_tokens.resolve_head_owner(extra_model, dp_lockstep=False)
+    assert extra_model.logits_processor is orig_extra
 
 
 def _runner(weight, speculative_config=None):
