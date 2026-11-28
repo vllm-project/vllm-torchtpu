@@ -71,6 +71,7 @@ class RopeInGraphSpec:
     is_neox_style: bool = True
     is_mrope: bool = False
     dim_modalities: tuple[int, ...] | None = None
+    active_angles: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -198,6 +199,26 @@ def compute_mrope_dim_modalities(module: nn.Module) -> tuple[int, ...] | None:
     return _section_to_modalities(mrope_section, half, interleaved=interleaved)
 
 
+def active_rope_angles(inv_freq: tuple[float, ...], declared: int | None) -> int | None:
+    """Leading angle pairs that actually rotate, or None when all of them do.
+
+    Proportional RoPE (Gemma-4 global layers) zero-pads `inv_freq` for the pairs
+    it does not rotate, so their cos/sin rows are the identity (1, 0) at every
+    position and rotating them is a no-op in fp32 (`x * 1.0 - y * 0.0 == x`).
+    Only exact trailing zeros count. A module that declares `rope_angles`
+    (Gemma4RotaryEmbedding) must agree with the zero count, else the shortcut
+    is disabled.
+    """
+    rot = len(inv_freq)
+    while rot > 0 and inv_freq[rot - 1] == 0.0:
+        rot -= 1
+    if rot == 0 or rot == len(inv_freq):
+        return None
+    if declared is not None and int(declared) != rot:
+        return None
+    return rot
+
+
 def _one_segment_spec(
     rope: Any,
     inv_freq: torch.Tensor,
@@ -208,8 +229,15 @@ def _one_segment_spec(
     is_mrope: bool = False,
     dim_modalities: tuple[int, ...] | None = None,
 ) -> RopeInGraphSpec:
+    inv_tuple = to_f32_tuple(inv_freq)
+    # Identity shortcut (`cos == 1, sin == 0`) holds only when `mscale == 1.0`.
+    active_angles = (
+        active_rope_angles(inv_tuple, getattr(rope, "rope_angles", None))
+        if mscale == 1.0
+        else None
+    )
     return RopeInGraphSpec(
-        segments=(CosSinSegment(0, num_rows, to_f32_tuple(inv_freq), mscale),),
+        segments=(CosSinSegment(0, num_rows, inv_tuple, mscale),),
         num_rows=num_rows,
         rotary_dim=int(rope.rotary_dim),
         cache_dtype=rope.dtype,
@@ -217,6 +245,7 @@ def _one_segment_spec(
         is_neox_style=bool(rope.is_neox_style),
         is_mrope=is_mrope,
         dim_modalities=dim_modalities,
+        active_angles=active_angles,
     )
 
 
@@ -499,6 +528,7 @@ def eval_spec_cos_sin(
     target_dtype: torch.dtype,
     *,
     half: Literal["cos", "sin"] | None = None,
+    active_angles: int | None = None,
 ) -> torch.Tensor:
     """Evaluates `[cos | sin]` (or one `half`) rows for 1-D or 2-D positions."""
     dev = pos_for_freq.device
@@ -506,7 +536,10 @@ def eval_spec_cos_sin(
     out: torch.Tensor | None = None
     for seg in spec.segments:
         rel = pos_2d - seg.start if seg.start else pos_2d
-        inv = _build_device_vector_f32(seg.inv_freq, dev)
+        inv_vals = (
+            seg.inv_freq[:active_angles] if active_angles is not None else seg.inv_freq
+        )
+        inv = _build_device_vector_f32(inv_vals, dev)
         freqs = rel.to(torch.float32) * inv
         seg_rows = _trig_rows(freqs, half)
         if seg.mscale != 1.0:
@@ -538,18 +571,47 @@ def rotate_fp32(
     head_size: int,
     rotary_dim: int,
     is_neox_style: bool,
+    active_angles: int | None = None,
 ) -> torch.Tensor:
     """Rotates `x[..., :rotary_dim]` in FP32 and preserves trailing channels.
 
-    FP32 like vLLM's CUDA kernel; `cos`/`sin` arrive already rounded to the
-    cache dtype.
+    With `active_angles` set (zero-padded proportional RoPE), repeats the FP32
+    arithmetic of `ApplyRotaryEmb.forward_static(..., enable_fp32_compute=True)`
+    on the leading active pairs only, matching full-width rotation bit-for-bit
+    (identity pairs contribute `x * 1.0 - y * 0.0 == x`).
     """
     shape = x.shape
     x = x.view(num_tokens, -1, head_size)
-    x_rot = ApplyRotaryEmb.forward_static(
-        x[..., :rotary_dim], cos, sin, is_neox_style, enable_fp32_compute=True
-    )
-    return torch.cat((x_rot, x[..., rotary_dim:]), dim=-1).reshape(shape)
+    if active_angles is None:
+        # Skip the no-op slice / cat on full-RoPE heads.
+        x_rot = x if rotary_dim == head_size else x[..., :rotary_dim]
+        out = ApplyRotaryEmb.forward_static(
+            x_rot, cos, sin, is_neox_style, enable_fp32_compute=True
+        )
+        if rotary_dim < head_size:
+            out = torch.cat((out, x[..., rotary_dim:]), dim=-1)
+        return out.reshape(shape)
+
+    c = cos.unsqueeze(-2).float()
+    s = sin.unsqueeze(-2).float()
+    if is_neox_style:
+        half = rotary_dim // 2
+        x1 = x[..., :active_angles].float()
+        x2 = x[..., half : half + active_angles].float()
+        o1 = (x1 * c - x2 * s).to(x.dtype)
+        o2 = (x2 * c + x1 * s).to(x.dtype)
+        out = torch.cat(
+            (o1, x[..., active_angles:half], o2, x[..., half + active_angles :]),
+            dim=-1,
+        )
+    else:  # GPT-J: pairs (2i, 2i+1), so active channels are the leading 2*active
+        width = 2 * active_angles
+        xr = x[..., :width].float()
+        o1 = xr[..., ::2] * c - xr[..., 1::2] * s
+        o2 = xr[..., 1::2] * c + xr[..., ::2] * s
+        rot = torch.stack((o1, o2), dim=-1).flatten(-2).to(x.dtype)
+        out = torch.cat((rot, x[..., width:]), dim=-1)
+    return out.reshape(shape)
 
 
 def _prepare_in_graph_positions(
@@ -590,12 +652,17 @@ def in_graph_spec_forward(
     if offsets is not None and not spec.is_mrope:
         positions = positions + offsets
 
+    active = spec.active_angles
+    dim_modalities = spec.dim_modalities
+    if active is not None and dim_modalities is not None:
+        dim_modalities = dim_modalities[:active]
+
     pos_for_freq, num_tokens = _prepare_in_graph_positions(
-        positions, spec.dim_modalities, is_mrope=spec.is_mrope
+        positions, dim_modalities, is_mrope=spec.is_mrope
     )
 
     target_dtype = query.dtype if spec.match_query_dtype else spec.cache_dtype
-    cos_sin = eval_spec_cos_sin(spec, pos_for_freq, target_dtype)
+    cos_sin = eval_spec_cos_sin(spec, pos_for_freq, target_dtype, active_angles=active)
     cos, sin = cos_sin.chunk(2, dim=-1)
     query = rotate_fp32(
         query,
@@ -605,6 +672,7 @@ def in_graph_spec_forward(
         head_size=self.head_size,
         rotary_dim=spec.rotary_dim,
         is_neox_style=spec.is_neox_style,
+        active_angles=active,
     )
     if key is not None:
         key = rotate_fp32(
@@ -615,6 +683,7 @@ def in_graph_spec_forward(
             head_size=self.head_size,
             rotary_dim=spec.rotary_dim,
             is_neox_style=spec.is_neox_style,
+            active_angles=active,
         )
     return query, key
 

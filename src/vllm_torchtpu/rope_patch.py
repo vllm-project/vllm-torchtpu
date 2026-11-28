@@ -121,6 +121,9 @@ def _export_one_segment_spec(
         is_neox_style=bool(rope.is_neox_style),
         is_mrope=False,
         dim_modalities=rope_in_graph.compute_mrope_dim_modalities(rope),
+        active_angles=rope_in_graph.active_rope_angles(
+            inv_freq, getattr(rope, "rope_angles", None)
+        ),
     )
 
 
