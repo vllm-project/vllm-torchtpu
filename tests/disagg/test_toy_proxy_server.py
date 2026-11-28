@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 from pathlib import Path
+
+import httpx
 
 
 def _load_toy_proxy_server():
@@ -105,3 +108,64 @@ def test_replace_prompt_with_rendered_token_ids_rejects_bad_response() -> None:
         assert "token_ids" in str(exc)
     else:
         raise AssertionError("malformed render response should fail")
+
+
+def _post_through_proxy(path: str, body: dict, backend_status: int, backend_body: dict):
+    """POST `body` to the proxy's `path` with a fake prefill instance that answers
+    `backend_status` / `backend_body`. Returns the proxy's response and the
+    requests the prefill instance received."""
+    received: list[httpx.Request] = []
+
+    def prefill(request: httpx.Request) -> httpx.Response:
+        received.append(request)
+        return httpx.Response(backend_status, json=backend_body)
+
+    async def run() -> httpx.Response:
+        app = _toy_proxy_server.app
+        backend = httpx.AsyncClient(
+            transport=httpx.MockTransport(prefill), base_url="http://prefill"
+        )
+        app.state.prefill_clients = [{"client": backend, "id": 0}]
+        try:
+            # ASGITransport skips the lifespan, which needs the CLI arguments.
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+            ) as client:
+                return await client.post(path, json=body)
+        finally:
+            await backend.aclose()
+
+    return asyncio.run(run()), received
+
+
+def test_tokenize_is_forwarded_to_prefill() -> None:
+    body = {"model": "m", "prompt": "hello world", "add_special_tokens": False}
+    reply = {"count": 2, "max_model_len": 8192, "tokens": [9, 10]}
+    response, received = _post_through_proxy("/tokenize", body, 200, reply)
+
+    assert response.status_code == 200
+    assert response.json() == reply
+    (request,) = received
+    assert request.url.path == "/tokenize"
+    assert json.loads(request.content) == body
+
+
+def test_detokenize_is_forwarded_to_prefill() -> None:
+    body = {"model": "m", "tokens": [9, 10]}
+    response, received = _post_through_proxy(
+        "/detokenize", body, 200, {"prompt": "hello world"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"prompt": "hello world"}
+    (request,) = received
+    assert request.url.path == "/detokenize"
+    assert json.loads(request.content) == body
+
+
+def test_tokenize_passes_backend_errors_through() -> None:
+    error = {"error": {"message": "model not found", "code": 404}}
+    response, _ = _post_through_proxy("/tokenize", {"model": "x"}, 404, error)
+
+    assert response.status_code == 404
+    assert response.json() == error
