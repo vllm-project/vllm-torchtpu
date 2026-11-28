@@ -2874,6 +2874,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         "_record_input_staging_fence",
         "_wait_input_staging_fence",
         "_pp_take_topk_indices",
+        "_prompt_logprob_rows_per_call",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     bt = MagicMock()
@@ -4558,23 +4559,26 @@ class TestLogitsAtDpVocabRows:
         assert runner.seen[0] is indices
         assert got.shape == (8, 1)
 
-    @pytest.mark.parametrize("dp_vocab, rows", [(True, 16), (False, 4)])
+    @pytest.mark.parametrize("dp_vocab, rows", [(True, 32), (False, 16)])
     def test_idle_dummy_chunk_enters_logits_at_the_dp_vocab_rows(
         self, monkeypatch, dp_vocab, rows
     ):
         """An idle DP engine's dummy chunk must enter the logits program at the
         row count busy engines pad to (`_dp_vocab_logits_rows`, the bucket
         checked above), or the lm_head's cross-engine collectives see different
-        shapes and hang. Without the flag it keeps its own request count."""
+        shapes and hang. Without the flag it uses the precompiled request
+        bucket for the token chunk (`_prompt_logprob_rows_per_call`) rather
+        than the raw `num_reqs`."""
         seen = []
         runner = _dummy_run_stand_in(
             monkeypatch, lambda **kw: (torch.zeros((16, 8)), None)
         )
+        runner.max_num_reqs = 32
         runner.compute_selected_logits = lambda out, idx: seen.append(idx.shape[0])
         runner._dp_vocab_logits = dp_vocab
-        runner._dp_vocab_logits_rows = lambda: 16
+        runner._dp_vocab_logits_rows = lambda: 32
         TPUModelRunner._dummy_run(
-            runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=True
+            runner, num_tokens=16, num_reqs=24, num_blocks=4, dp_lockstep=True
         )
         assert seen == [rows]
 

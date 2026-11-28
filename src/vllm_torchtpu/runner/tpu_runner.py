@@ -7029,6 +7029,10 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens, zeros=not profiling, random=profiling
             )
             self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        # Populate DPMetadata on warmup/profile dummy runs too (dp_lockstep=False)
+        # so set_forward_context skips coordinate_batch_across_dp(0) and matches
+        # serving's active DP forward context (unconditional num_tokens matches
+        # execute_model for dp_size=1 sequence-parallel MoE as well).
         with (
             self.maybe_select_dummy_loras(
                 self.lora_config, np.array([num_tokens], dtype=np.int32)
@@ -7036,10 +7040,8 @@ class TPUModelRunner(GPUModelRunner):
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=num_tokens if dp_lockstep else 0,
-                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
-                if dp_lockstep
-                else None,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens),
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,
@@ -7083,12 +7085,21 @@ class TPUModelRunner(GPUModelRunner):
                 self._pp_handoff.end_forward(None, num_tokens)
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
-                # busy engines before the next DP synchronization.
-                _idx = torch.zeros(
-                    self._dp_vocab_logits_rows() if self._dp_vocab_logits else num_reqs,
-                    dtype=torch.int32,
-                    device=out.device,
+                # busy engines before the next DP synchronization. Reuse the
+                # precompiled request-bucket rule so idle logits shapes stay
+                # in-grid with _precompile_compute_selected_logits.
+                logits_num_reqs = (
+                    self._dp_vocab_logits_rows()
+                    if self._dp_vocab_logits
+                    else self._prompt_logprob_rows_per_call(num_tokens)
                 )
+                # Build on CPU and transfer via .to(out.device), matching
+                # _precompile_compute_selected_logits, so the first idle step
+                # does not compile an eager device-side zeros XLA graph.
+                _idx = torch.zeros(
+                    logits_num_reqs,
+                    dtype=torch.int32,
+                ).to(out.device)
                 _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
