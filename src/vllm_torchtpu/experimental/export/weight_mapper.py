@@ -21,24 +21,62 @@ from typing import Any
 
 from vllm_torchtpu import envs
 
+# Attributes set by `vllm_torchtpu.layers.adapter.linear_common` on linear and
+# embedding layers after weight loading (defined here so CPU export paths do
+# not import `torch_tpu`).
+KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
+WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+# Attribute on a loaded target model holding its MTP draft module, if any.
+MTP_DRAFT_ATTR = "_export_mtp_draft"
+
 
 def _resolve_submod_and_param(
     weight_name: str, model: Any = None
 ) -> tuple[Any, Any, str, str]:
     """Resolves `(submod, param_or_buf, mod_path, attr)` from `model`."""
+    wrapper = model
+    if model is not None and not callable(getattr(model, "get_submodule", None)):
+        model = getattr(model, "model", None)
     if model is None or not weight_name:
         return None, None, "", weight_name
     mod_path, attr = (
         weight_name.rsplit(".", 1) if "." in weight_name else ("", weight_name)
     )
     submod = None
-    if mod_path:
-        for cand_mod_path in (mod_path, mod_path.removeprefix("model.")):
-            with contextlib.suppress(Exception):
-                submod = model.get_submodule(cand_mod_path)
-                if submod is not None:
-                    break
-    else:
+    inner_model = getattr(model, "model", None)
+    candidate_roots = [
+        root
+        for root in (model, inner_model)
+        if root is not None and callable(getattr(root, "get_submodule", None))
+    ]
+    if mod_path and candidate_roots:
+        for root in candidate_roots:
+            for candidate_path in (mod_path, mod_path.removeprefix("model.")):
+                with contextlib.suppress(Exception):
+                    submod = root.get_submodule(candidate_path)
+                    if submod is not None:
+                        break
+            if submod is not None:
+                break
+        if submod is None and (mod_path == "mtp" or mod_path.startswith("mtp.")):
+            draft = (
+                getattr(model, MTP_DRAFT_ATTR, None)
+                or getattr(inner_model, MTP_DRAFT_ATTR, None)
+                or getattr(wrapper, MTP_DRAFT_ATTR, None)
+                or getattr(wrapper, "_mtp_draft", None)
+            )
+            draft_get_submodule = getattr(draft, "get_submodule", None)
+            if callable(draft_get_submodule):
+                suffix = mod_path.removeprefix("mtp").lstrip(".")
+                draft_candidates = (
+                    (f"model.{suffix}", suffix) if suffix else ("model", "")
+                )
+                for candidate_path in draft_candidates:
+                    with contextlib.suppress(Exception):
+                        submod = draft_get_submodule(candidate_path)
+                        if submod is not None:
+                            break
+    elif not mod_path:
         submod = model
     param_obj = getattr(submod, attr, None) if submod is not None else None
     return submod, param_obj, mod_path, attr
@@ -73,8 +111,19 @@ def infer_weight_sharding(
 
     rank = len(shape)
     submod, param_obj, _, attr = _resolve_submod_and_param(weight_name, model)
+    keep_vllm_layout = bool(getattr(submod, KEEP_VLLM_LAYOUT_ATTR, False))
+    weight_flipped = bool(getattr(submod, WEIGHT_FLIPPED_ATTR, False))
+    submodule_class_names = (
+        {cls.__name__ for cls in type(submod).__mro__} if submod is not None else set()
+    )
+    is_tp_replicated_submodule = submod is not None and (
+        bool(getattr(submod, "disable_tp", False))
+        or "ReplicatedLinear" in submodule_class_names
+    )
     submod_tp = int(getattr(submod, "tp_size", 0) or 0) if submod is not None else 0
-    tp_size = max(submod_tp, int(tp_size_hint or 1))
+    tp_size = (
+        1 if is_tp_replicated_submodule else max(submod_tp, int(tp_size_hint or 1))
+    )
 
     if rank == 0:
         if any(
@@ -99,21 +148,41 @@ def infer_weight_sharding(
             ("output_dim", "tp"),
             ("input_dim", "tp"),
         ):
+            if (
+                shard_attr == "output_dim"
+                and "RowParallelLinear" in submodule_class_names
+                and not (attr == "weight_scale" and rank in (1, 2))
+            ):
+                continue
+            if (
+                shard_attr == "input_dim"
+                and "ColumnParallelLinear" in submodule_class_names
+            ):
+                continue
             dim_val = getattr(param_obj, shard_attr, None)
             if isinstance(dim_val, int) and 0 <= dim_val < rank:
                 if axis_name == "tp" and tp_size <= 1:
                     continue
                 sharding_dims: list[str | None] = [None] * rank
                 if shard_attr == "output_dim" and rank == 2 and attr == "weight":
-                    is_emb = hasattr(submod, "num_embeddings") or (
+                    is_embedding_or_lm_head = hasattr(submod, "num_embeddings") or (
                         submod is not None
                         and "embedding" in type(submod).__name__.lower()
                     )
-                    target_dim = 0 if is_emb else (1 - dim_val)
+                    if is_embedding_or_lm_head:
+                        target_dim = 1 if weight_flipped else 0
+                    else:
+                        target_dim = dim_val if keep_vllm_layout else (1 - dim_val)
                     sharding_dims[target_dim] = "tp"
                 elif shard_attr == "input_dim" and rank == 2 and attr == "weight":
-                    target_dim = 1 - dim_val
+                    target_dim = dim_val if keep_vllm_layout else (1 - dim_val)
                     sharding_dims[target_dim] = "tp"
+                elif (
+                    shard_attr == "output_dim" and rank == 4 and attr == "weight_scale"
+                ):
+                    sharding_dims[3] = "tp"
+                elif shard_attr == "input_dim" and rank == 4 and attr == "weight_scale":
+                    sharding_dims[1] = "tp"
                 else:
                     sharding_dims[dim_val] = axis_name
                 return sharding_dims
@@ -127,17 +196,45 @@ def infer_weight_sharding(
     if tp_size <= 1:
         return [None] * rank
 
-    # FP8 requantization replaces a layer's parameters, dropping their shard
-    # attributes. A row-parallel layer's scales are computed over the rank's own
-    # input slice, so they differ per rank and must not be declared replicated.
+    if "ColumnParallelLinear" in submodule_class_names:
+        if attr == "weight" and rank == 2:
+            return ["tp", None] if keep_vllm_layout else [None, "tp"]
+        if attr == "bias" and rank == 1:
+            return ["tp"]
+        if attr == "weight_scale":
+            if rank == 4:
+                return [None, None, None, "tp"]
+            return ["tp"] + [None] * (rank - 1)
+        if attr == "weight_scale_inv" and rank == 2:
+            return ["tp", None]
+
+    if "RowParallelLinear" in submodule_class_names:
+        if attr == "weight" and rank == 2:
+            return [None, "tp"] if keep_vllm_layout else ["tp", None]
+        if attr == "bias" and rank == 1:
+            return [None]
+        if attr == "weight_scale":
+            if rank == 4:
+                return [None, "tp", None, None]
+            return ["tp"] + [None] * (rank - 1)
+        if attr == "weight_scale_inv" and rank == 2:
+            return [None, "tp"]
+
+    # FP8 requantization replaces or reshapes a layer's scale parameters. A
+    # row-parallel layer's scales are computed over the rank's own input slice,
+    # so they differ per rank: rank-4 block scales `[1, n_in_blocks, 1, n_out]`
+    # shard axis 1, while rank-1/2 per-channel scales shard axis 0.
     if weight_name.endswith(
         (
             "o_proj.weight_scale",
             "down_proj.weight_scale",
             "out_proj.weight_scale",
             "wo_b.weight_scale",
+            "post_expert_proj.weight_scale",
         )
     ):
+        if rank == 4:
+            return [None, "tp", None, None]
         return ["tp"] + [None] * (rank - 1)
 
     if rank == 1:
@@ -174,17 +271,28 @@ def infer_weight_sharding(
         return [None]
 
     if rank == 2:
-        if ".in_proj_qkvz." in weight_name and envs.TPU_GDN_QKVZ_KERNEL_LAYOUT:
-            # TODO: shard dim 1 once this reads the layer's layout marker
-            # (`exporter.py` calls this without the model).
-            raise NotImplementedError(
-                "The AOT export shards in_proj_qkvz in vLLM's [n_out, n_in] "
-                "layout; unset TPU_GDN_QKVZ_KERNEL_LAYOUT to export at TP > 1."
-            )
+        is_qkvz_weight = weight_name == "in_proj_qkvz.weight" or weight_name.endswith(
+            ".in_proj_qkvz.weight"
+        )
+        if is_qkvz_weight:
+            if submod is not None:
+                return ["tp", None] if keep_vllm_layout else [None, "tp"]
+            if envs.TPU_GDN_QKVZ_KERNEL_LAYOUT:
+                raise NotImplementedError(
+                    "infer_weight_sharding needs `model` to tell whether "
+                    "in_proj_qkvz kept vLLM's [n_out, n_in] layout (e.g. under "
+                    "prefill context parallelism) or flipped to (k, n) with "
+                    "TPU_GDN_QKVZ_KERNEL_LAYOUT."
+                )
+            return ["tp", None]
+        is_lm_head_weight = weight_name == "lm_head.weight" or weight_name.endswith(
+            ".lm_head.weight"
+        )
+        if is_lm_head_weight and weight_flipped:
+            return [None, "tp"]
         if (
             weight_name.endswith("embed_tokens.weight")
-            or weight_name == "lm_head.weight"
-            or weight_name.endswith(".lm_head.weight")
+            or is_lm_head_weight
             or weight_name.endswith(".o_proj.weight")
             or weight_name.endswith(".down_proj.weight")
             or weight_name.endswith(".out_proj.weight")
@@ -237,6 +345,36 @@ def infer_weight_sharding(
     if rank == 4:
         if ".conv_weight_fused" in weight_name:
             return [None, None, "tp", None]
+        if weight_name.endswith(".weight_scale") and (
+            weight_name == "lm_head.weight_scale"
+            or weight_name.endswith(".lm_head.weight_scale")
+            or any(
+                column_parallel_key in weight_name
+                for column_parallel_key in (
+                    "qkv_proj",
+                    "gate_up_proj",
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "wq_b",
+                    "q_b_proj",
+                    "kv_b_proj",
+                    "wo_a",
+                    "in_proj_qkvz",
+                    "in_proj_ba",
+                    "fused_qkvb_proj",
+                    "fused_fa_ga_proj",
+                    "f_b_proj",
+                    "g_b_proj",
+                    "compressor.fused_wkv_wgate",
+                    ".fc.",
+                    ".pre_expert_proj.",
+                )
+            )
+        ):
+            return [None, None, None, "tp"]
         return [None, None, None, None]
 
     return [None] * rank

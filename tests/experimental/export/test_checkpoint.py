@@ -182,10 +182,10 @@ def test_muse_expert_projections_are_sharded_like_their_parallel_layers(
     assert sharding == expected
 
 
-def test_qkvz_kernel_layout_is_rejected_when_tensor_parallel(
+def test_qkvz_kernel_layout_is_rejected_without_model_when_tensor_parallel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The mapper shards in_proj_qkvz as [n_out, n_in], which the flag flips."""
+    """Without `model`, the mapper cannot tell whether PCP kept [n_out, n_in]."""
     from vllm_torchtpu.experimental.export import weight_mapper
 
     name = "model.layers.0.linear_attn.in_proj_qkvz.weight"
@@ -197,8 +197,206 @@ def test_qkvz_kernel_layout_is_rejected_when_tensor_parallel(
     # Nothing is sharded at TP = 1, so the layout does not matter.
     sharding = weight_mapper.infer_weight_sharding(name, [2048, 18432])
     assert sharding == [None, None]
+    # Rank-2 scale tensors stay [n_out_blocks, n_in_blocks] regardless of weight flip.
+    scale_name = "model.layers.0.linear_attn.in_proj_qkvz.weight_scale_inv"
+    assert weight_mapper.infer_weight_sharding(
+        scale_name, [36, 16], tp_size_hint=4
+    ) == ["tp", None]
     with pytest.raises(NotImplementedError, match="TPU_GDN_QKVZ_KERNEL_LAYOUT"):
         weight_mapper.infer_weight_sharding(name, [2048, 4608], tp_size_hint=4)
+
+
+@pytest.mark.parametrize("has_param_attr", [False, True])
+def test_qkvz_sharding_reads_layer_layout_marker(
+    monkeypatch: pytest.MonkeyPatch, has_param_attr: bool
+) -> None:
+    """With `model`, sharding follows KEEP_VLLM_LAYOUT_ATTR on both BF16 and FP8."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.experimental.export import api, exporter, weight_mapper
+
+    class ColumnParallelLinear(nn.Module):
+        tp_size = 4
+
+    def _build_gdn_tree(keep_layout: bool, local_shape: tuple[int, int]) -> nn.Module:
+        root = nn.Module()
+        root.model = nn.Module()
+        layer0 = nn.Module()
+        layer0.linear_attn = nn.Module()
+        proj = ColumnParallelLinear()
+        param = nn.Parameter(torch.empty(local_shape), requires_grad=False)
+        if has_param_attr:
+            param.output_dim = 0  # type: ignore[attr-defined]
+            param.input_dim = 1  # type: ignore[attr-defined]
+        proj.register_parameter("weight", param)
+        if keep_layout:
+            setattr(proj, weight_mapper.KEEP_VLLM_LAYOUT_ATTR, True)
+        layer0.linear_attn.in_proj_qkvz = proj
+        root.model.layers = nn.ModuleList([layer0])
+        return root
+
+    name = "model.layers.0.linear_attn.in_proj_qkvz.weight"
+    monkeypatch.setenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", "1")
+
+    # Flipped to (k, n): TP shards dim 1.
+    flipped = _build_gdn_tree(keep_layout=False, local_shape=(2048, 4608))
+    assert weight_mapper.infer_weight_sharding(
+        name, [2048, 4608], model=flipped, tp_size_hint=4
+    ) == [None, "tp"]
+
+    # Kept as [n_out, n_in] (default or PCP override): TP shards dim 0.
+    kept = _build_gdn_tree(keep_layout=True, local_shape=(4608, 2048))
+    assert weight_mapper.infer_weight_sharding(
+        name, [4608, 2048], model=kept, tp_size_hint=4
+    ) == ["tp", None]
+
+    # Exporter `_tensor_layouts` unwraps `ExportableTextOnlyLLM.model` and
+    # resolves `_export_mtp_draft` when `spec.sharding` is omitted.
+    object.__setattr__(flipped, weight_mapper.MTP_DRAFT_ATTR, kept)
+    wrapper: Any = SimpleNamespace(model=flipped)
+    mtp_name = "mtp.layers.0.linear_attn.in_proj_qkvz.weight"
+    params = {
+        name: api.ShapeDtypeStruct((2048, 4608), "f8E4M3FN"),
+        mtp_name: api.ShapeDtypeStruct((4608, 2048), "bf16"),
+    }
+    layouts = exporter._tensor_layouts(
+        wrapper, params, frozenset(), {"data": 1, "model": 4}
+    )
+    assert layouts[name] == exporter._TensorLayout(
+        shape=[2048, 18432], sharding=[None, "model"], lowered_shape=(2048, 4608)
+    )
+    assert layouts[mtp_name] == exporter._TensorLayout(
+        shape=[18432, 2048], sharding=["model", None], lowered_shape=(4608, 2048)
+    )
+
+
+@pytest.mark.parametrize("has_param_attr", [False, True])
+def test_vllm_dual_attr_parameters_and_block_scales_sharding(
+    has_param_attr: bool,
+) -> None:
+    """vLLM v0.33.0 keeps (output_dim=0, input_dim=1) on linears and 4-D scales."""
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    class ColumnParallelLinear(nn.Module):
+        tp_size = 4
+
+    class RowParallelLinear(nn.Module):
+        tp_size = 4
+
+    class ReplicatedLinear(nn.Module):
+        tp_size = 4
+
+    class ParallelLMHead(nn.Module):
+        tp_size = 4
+        num_embeddings = 151936
+
+    def _dual_param(shape: tuple[int, ...]) -> nn.Parameter:
+        param = nn.Parameter(torch.empty(shape), requires_grad=False)
+        if has_param_attr:
+            param.output_dim = 0  # type: ignore[attr-defined]
+            param.input_dim = 1  # type: ignore[attr-defined]
+        return param
+
+    root = nn.Module()
+    root.language_model = nn.Module()
+    root.language_model.model = nn.Module()
+    layer0 = nn.Module()
+    layer0.linear_attn = nn.Module()
+
+    qkvz = ColumnParallelLinear()
+    qkvz.register_parameter("weight", _dual_param((2048, 4608)))
+    qkvz.register_parameter("weight_scale", _dual_param((1, 16, 1, 4608)))
+    layer0.linear_attn.in_proj_qkvz = qkvz
+
+    out_proj = RowParallelLinear()
+    out_proj.register_parameter("weight", _dual_param((2048, 4096)))
+    out_proj.register_parameter("weight_scale", _dual_param((1, 16, 1, 4096)))
+    layer0.linear_attn.out_proj = out_proj
+
+    o_proj_per_channel = RowParallelLinear()
+    o_proj_per_channel.register_parameter("weight", _dual_param((2048, 4096)))
+    o_proj_per_channel.register_parameter("weight_scale", _dual_param((4096,)))
+    layer0.o_proj = o_proj_per_channel
+
+    gate = ReplicatedLinear()
+    gate.register_parameter("weight", _dual_param((2048, 256)))
+    layer0.gate = gate
+
+    disabled_tp = RowParallelLinear()
+    disabled_tp.tp_size = 1
+    disabled_tp.disable_tp = True  # type: ignore[attr-defined]
+    disabled_tp.register_parameter("weight", _dual_param((2048, 4096)))
+    layer0.disabled_tp = disabled_tp
+
+    root.language_model.model.layers = nn.ModuleList([layer0])
+
+    lm_head = ParallelLMHead()
+    lm_head.register_parameter("weight", _dual_param((2048, 37984)))
+    setattr(lm_head, weight_mapper.WEIGHT_FLIPPED_ATTR, True)
+    root.language_model.lm_head = lm_head
+
+    # `nn.Module` wrapper holding `self.model` + root `mtp.*` resolution.
+    draft_root = ColumnParallelLinear()
+    draft_root.register_parameter("weight", _dual_param((2048, 1024)))
+    object.__setattr__(root, weight_mapper.MTP_DRAFT_ATTR, draft_root)
+    module_wrapper = nn.Module()
+    module_wrapper.model = root
+
+    prefix = "language_model.model.layers.0"
+    assert weight_mapper.infer_weight_sharding(
+        f"{prefix}.linear_attn.in_proj_qkvz.weight",
+        [2048, 4608],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == [None, "tp"]
+    assert weight_mapper.infer_weight_sharding(
+        f"{prefix}.linear_attn.in_proj_qkvz.weight_scale",
+        [1, 16, 1, 4608],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == [None, None, None, "tp"]
+    assert weight_mapper.infer_weight_sharding(
+        f"{prefix}.linear_attn.out_proj.weight",
+        [2048, 4096],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == ["tp", None]
+    assert weight_mapper.infer_weight_sharding(
+        f"{prefix}.linear_attn.out_proj.weight_scale",
+        [1, 16, 1, 4096],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == [None, "tp", None, None]
+    assert weight_mapper.infer_weight_sharding(
+        f"{prefix}.o_proj.weight_scale",
+        [4096],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == ["tp"]
+    assert weight_mapper.infer_weight_sharding(
+        f"{prefix}.gate.weight",
+        [2048, 256],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == [None, None]
+    assert weight_mapper.infer_weight_sharding(
+        f"{prefix}.disabled_tp.weight",
+        [2048, 4096],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == [None, None]
+    assert weight_mapper.infer_weight_sharding(
+        "language_model.lm_head.weight",
+        [2048, 37984],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == [None, "tp"]
+    assert weight_mapper.infer_weight_sharding(
+        "mtp.weight",
+        [2048, 1024],
+        model=module_wrapper,
+        tp_size_hint=4,
+    ) == [None, "tp"]
 
 
 def _ocdbt(data_dir: Path) -> dict[str, Any]:
