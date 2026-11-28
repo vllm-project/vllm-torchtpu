@@ -32,6 +32,8 @@ from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.eagle3 import (
     DraftChunkInputs,
     Eagle3Proposer,
+    _draft_checkpoint_name_map,
+    _draft_head_modules,
     _force_draft_tp1,
     _maybe_pad_dim0,
     _static_shape_args,
@@ -3058,3 +3060,44 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+def _tiny_mtp_draft(tied: bool) -> torch.nn.Module:
+    draft = torch.nn.Module()
+    draft.model = torch.nn.Module()
+    draft.model.embed_tokens = torch.nn.Embedding(8, 4)
+    draft.lm_head = torch.nn.Linear(4, 8, bias=False)
+    if tied:
+        draft.lm_head.weight = draft.model.embed_tokens.weight
+    return draft
+
+
+def test_draft_name_map_loads_tied_head_from_replaced_embedding():
+    """Gemma-4 MTP: the kept head is tied to the embedding sharing replaced."""
+    draft = _tiny_mtp_draft(tied=True)
+    before = _draft_head_modules(draft)
+    draft.model.embed_tokens = torch.nn.Embedding(8, 6)  # the target's
+    name_map = _draft_checkpoint_name_map(draft, before, _draft_head_modules(draft))
+    assert name_map("model.embed_tokens.weight") == "lm_head.weight"
+    assert name_map("model.layers.0.self_attn.q_proj.weight") == (
+        "model.layers.0.self_attn.q_proj.weight"
+    )
+
+
+def test_draft_name_map_drops_replaced_embedding_of_untied_head():
+    draft = _tiny_mtp_draft(tied=False)
+    before = _draft_head_modules(draft)
+    draft.model.embed_tokens = torch.nn.Embedding(8, 6)
+    name_map = _draft_checkpoint_name_map(draft, before, _draft_head_modules(draft))
+    assert name_map("model.embed_tokens.weight") is None
+    assert name_map("lm_head.weight") == "lm_head.weight"
+
+
+def test_draft_name_map_drops_both_when_head_is_shared_too():
+    draft = _tiny_mtp_draft(tied=True)
+    before = _draft_head_modules(draft)
+    draft.model.embed_tokens = torch.nn.Embedding(8, 6)
+    draft.lm_head = torch.nn.Linear(6, 8, bias=False)
+    name_map = _draft_checkpoint_name_map(draft, before, _draft_head_modules(draft))
+    assert name_map("model.embed_tokens.weight") is None
+    assert name_map("lm_head.weight") is None
