@@ -4298,7 +4298,21 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
     )
 
 
-def test_precompile_timed_and_sample_tokens_share_dynamo_trace():
+@pytest.fixture
+def serving_threads(monkeypatch):
+    """Run at the torch thread count serving runs with (the worker sets it
+    once warmup is done): Dynamo guards graphs on it, and the precompile
+    passes trace under it."""
+    from vllm.utils.torch_utils import set_torch_threads_for_runtime
+
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    before = torch.get_num_threads()
+    set_torch_threads_for_runtime()
+    yield
+    torch.set_num_threads(before)
+
+
+def test_precompile_timed_and_sample_tokens_share_dynamo_trace(serving_threads):
     """A graph traced inside _precompile_timed is reused by sample_tokens.
 
     Both run under no_grad even when the caller has grad enabled, so Dynamo's
@@ -4329,7 +4343,9 @@ def test_precompile_timed_and_sample_tokens_share_dynamo_trace():
     assert counter.frame_count == 1
 
 
-def test_precompile_substitute_placeholder_token_matches_2d_sampled_tokens(monkeypatch):
+def test_precompile_substitute_placeholder_token_matches_2d_sampled_tokens(
+    monkeypatch, serving_threads
+):
     """_precompile_substitute_placeholder_token warms [num_reqs, 1] int64
     next_tokens matching selected_token_ids parked by non-spec sample_tokens,
     so _apply_async_token_substitution reuses the trace with no view or recompile.
@@ -4584,3 +4600,33 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+def test_precompile_runs_under_the_serving_global_state(monkeypatch):
+    """Dynamo guards each graph on grad mode and the torch thread count;
+    a serving run retraced compute_selected_logits and the substitution at
+    every serving bucket because their precompile ran with grad on and
+    before the worker dropped to its serving thread count."""
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    before = torch.get_num_threads()
+    torch.set_num_threads(4)
+    try:
+        runner = SimpleNamespace(
+            check_recompilation=False, _update_num_xla_graphs=lambda name: None
+        )
+        assert torch.is_grad_enabled()
+        with TPUModelRunner._precompile_timed(runner, "x"):
+            assert not torch.is_grad_enabled()
+            assert torch.get_num_threads() == 1
+        assert torch.is_grad_enabled()
+        assert torch.get_num_threads() == 4
+    finally:
+        torch.set_num_threads(before)
+
+
+def test_sample_tokens_runs_without_grad():
+    """The sampling graphs are precompiled without grad; dynamo guards on
+    grad mode, so serving must sample without it too (a serving run retraced
+    the rejection sampler at every bucket)."""
+    src = inspect.getsource(TPUModelRunner.sample_tokens)
+    assert "@torch.no_grad()" in src.split("def sample_tokens")[0]

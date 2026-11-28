@@ -69,7 +69,7 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.utils.torch_utils import PIN_MEMORY, set_torch_threads_for_runtime
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -523,6 +523,28 @@ def _spec_warmup_all_token_ids(
         req_id: [0] * (num_computed + 1)
         for req_id, num_computed in zip(req_ids, num_computed_tokens)
     }
+
+
+@contextmanager
+def _serving_compile_state() -> Iterator[None]:
+    """Compile under the global state serving runs with: grad off and the
+    serving torch thread count.
+
+    Dynamo guards every compiled graph on both (`GLOBAL_STATE changed:
+    grad_mode num_threads`), so a program precompiled with grad on, or
+    before the worker drops to its serving thread count, never matches a
+    serving call: every bucket is traced again mid-serving, and the retrace
+    compiles the small view programs around it (tt_jit_export_..._as_strided).
+    The thread count is restored on exit; the worker sets it for good once
+    warmup is done.
+    """
+    num_threads = torch.get_num_threads()
+    set_torch_threads_for_runtime()
+    try:
+        with torch.no_grad():
+            yield
+    finally:
+        torch.set_num_threads(num_threads)
 
 
 @contextmanager
@@ -7390,14 +7412,14 @@ class TPUModelRunner(GPUModelRunner):
 
     @contextlib.contextmanager
     def _precompile_timed(self, name: str):
-        """Times one AOT bucket precompile pass and runs it under no_grad.
-
-        Serving runs under no_grad and Dynamo guards on grad mode. A pass that
-        traces with grad enabled is traced again at the first request.
+        """Times one AOT bucket precompile pass and runs it under the global
+        state serving runs with (`_serving_compile_state`): Dynamo guards on it,
+        so a pass traced under another state is traced again at the first
+        request.
         """
         logger.info("Compiling %s with different input shapes.", name)
         start = time.perf_counter()
-        with torch.no_grad():
+        with _serving_compile_state():
             yield
         logger.info("Compilation finished in %.2f [secs].", time.perf_counter() - start)
         self._update_num_xla_graphs(name)
@@ -8079,6 +8101,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
+        with _serving_compile_state():
+            self._capture_model()
+
+    def _capture_model(self) -> None:
         self._add_pipeline_chunk_buckets()
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_handoff is None:
             self._pp_intermediate_tensors(1, zeros=True)
