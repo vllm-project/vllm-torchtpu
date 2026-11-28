@@ -51,11 +51,12 @@ def _stub_tpu_model_runner(monkeypatch: pytest.MonkeyPatch) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.speculative_config = vllm_config.speculative_config
+        self.enforce_eager = bool(getattr(self.model_config, "enforce_eager", False))
 
     monkeypatch.setattr(TPUModelRunner, "__init__", _fake_init)
     monkeypatch.setattr(
         "vllm_torchtpu.omni.worker.tpu_ar_model_runner.maybe_patch_qwen3_omni_thinker",
-        lambda *_: False,
+        lambda *_, **__: False,
     )
 
 
@@ -185,6 +186,41 @@ def test_load_model_checks_per_step_hook_capabilities(
     else:
         with pytest.raises(NotImplementedError, match=error_match):
             tpu_ar_model_runner.load_model()
+
+
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_load_model_forwards_enforce_eager_to_thinker_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    enforce_eager: bool,
+) -> None:
+    seen: list[tuple[Any, bool]] = []
+
+    def _record_patch(archs: Any, *, enforce_eager: bool = False) -> bool:
+        seen.append((archs, enforce_eager))
+        return False
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.worker.tpu_ar_model_runner.maybe_patch_qwen3_omni_thinker",
+        _record_patch,
+    )
+    model = _StageModel(torch.zeros(1, 4))
+    monkeypatch.setattr(
+        TPUModelRunner,
+        "load_model",
+        lambda self: setattr(self, "model", model),
+    )
+    vllm_config = SimpleNamespace(
+        model_config=_stage_config(enforce_eager=enforce_eager),
+        speculative_config=None,
+    )
+    runner = TPUARModelRunner(
+        vllm_config,
+        torch.device("tpu"),
+        profiler_rank=0,
+        profiler_world_size=1,
+    )
+    runner.load_model()
+    assert seen == [(["Qwen3OmniMoeForConditionalGeneration"], enforce_eager)]
 
 
 _HIDDEN = torch.arange(8.0).reshape(2, 4)

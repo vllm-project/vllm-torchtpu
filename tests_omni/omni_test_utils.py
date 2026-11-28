@@ -11,10 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Numerical-parity and image-metric helpers shared by the Omni tests."""
+"""Numerical-parity, image-metric, and patch-isolation helpers for Omni tests."""
+
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 
 import numpy as np
 import torch
+
+_MISSING = object()
+
+
+@contextmanager
+def restore_class_attrs(cls: type, attrs: Sequence[str]) -> Generator[None]:
+    """Snapshot and restore direct attributes on ``cls`` across a test or fixture."""
+    saved = {attr: cls.__dict__.get(attr, _MISSING) for attr in attrs}
+    try:
+        yield
+    finally:
+        for attr, val in saved.items():
+            if val is _MISSING:
+                if attr in cls.__dict__:
+                    delattr(cls, attr)
+            else:
+                setattr(cls, attr, val)
 
 
 def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:

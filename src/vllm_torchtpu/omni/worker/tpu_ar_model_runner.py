@@ -74,7 +74,10 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def load_model(self) -> None:
         """Load the stage model, then refuse one whose hooks nobody would call."""
-        maybe_patch_qwen3_omni_thinker(self.model_config.architectures)
+        maybe_patch_qwen3_omni_thinker(
+            self.model_config.architectures,
+            enforce_eager=self.enforce_eager,
+        )
         super().load_model()
         model = self.get_model()
         has_unsupported_flags = [
