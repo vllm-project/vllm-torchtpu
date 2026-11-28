@@ -210,6 +210,32 @@ def main_kernel_v2(
     )(indices_hbm_ref)
 
 
+def choose_num_row_subchunks(
+    out_size: int, base_block_size: int, *, generation: int
+) -> int:
+    """Return the number of SIMD-lane row subchunks gathered per subcore.
+
+    The output is padded to a multiple of ``base_block_size * subchunks``.
+    On TPU v7/v7x (``generation == 7``), outputs of at most 8 base blocks use a
+    single subchunk so EP decode gathers avoid padding past the next base block
+    and avoid over-gathering past ``end``; larger exact-block multiples pick the
+    largest divisor in ``(4, 3, 2, 1)`` so ``out_pad_size == 0`` while keeping
+    multi-subchunk pipelining (e.g. ``3`` for 9 or 15 blocks, ``2`` for 10,
+    ``4`` for 12/16); non-multiples above 8 base blocks keep 4 subchunks. Other
+    SparseCore generations keep ``max(1, min(4, num_base_blocks))``.
+    """
+    num_base_blocks = max(1, (out_size + base_block_size - 1) // base_block_size)
+    if generation != 7:
+        return min(4, num_base_blocks)
+    if num_base_blocks <= 8:
+        return 1
+    if out_size % base_block_size == 0:
+        for candidate in (4, 3, 2, 1):
+            if num_base_blocks % candidate == 0:
+                return candidate
+    return min(4, num_base_blocks)
+
+
 @jax.jit
 def ragged_gather_v2(
     x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
@@ -232,6 +258,8 @@ def ragged_gather_v2(
     if sc_info is None:
         return x[indices]
 
+    tpu_info = pltpu.get_tpu_info()
+
     hidden_size = x.shape[-1]
     out_size = indices.size
 
@@ -245,9 +273,8 @@ def ragged_gather_v2(
     num_cores = sc_info.num_cores * sc_info.num_subcores
     base_block_size = num_simd_lanes * num_cores
 
-    # Calculate ideal num_row_subchunks to avoid too much padding overhead.
-    num_row_subchunks = max(
-        1, min(4, (out_size + base_block_size - 1) // base_block_size)
+    num_row_subchunks = choose_num_row_subchunks(
+        out_size, base_block_size, generation=tpu_info.generation
     )
 
     row_subchunk_size = num_simd_lanes
@@ -255,7 +282,8 @@ def ragged_gather_v2(
     block_size = row_chunk_size * num_cores
 
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if out_pad_size > 0:
+        indices = jnp.pad(indices, ((0, out_pad_size)))
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -263,7 +291,7 @@ def ragged_gather_v2(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return core_map_helper.kernel(
+    out = core_map_helper.kernel(
         functools.partial(
             main_kernel_v2,
             core_axis_name=vector_mesh.core_axis_name,
@@ -285,4 +313,5 @@ def ragged_gather_v2(
         ],
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
-    )(start, end, x, indices)[:out_size, :hidden_size]
+    )(start, end, x, indices)
+    return out[:out_size, :hidden_size]
