@@ -147,7 +147,7 @@ def token_requests(
     """Each token's request and its offset within that request's chunk.
 
     Marks the interior request starts and takes a cumsum, the form
-    kda_attention_op._token_sequence_ids measured as cheaper on TPU than a
+    layers/core/mamba_utils.token_sequence_ids measured as cheaper on TPU than a
     [num_tokens, num_reqs] comparison. Starts at or past ``num_tokens`` land
     in a dropped overflow slot, and batch padding maps to the last request.
     """
