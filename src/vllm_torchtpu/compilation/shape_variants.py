@@ -482,6 +482,7 @@ def retrace(
     decoder layer, and the wrappers are what hold the bytecode hooks that have
     to be dropped before they are replaced.
     """
+    from vllm.compilation import backends as vllm_backends
     from vllm.compilation.wrapper import (
         TorchCompileWithNoGuardsWrapper,
         reset_compile_wrapper,
@@ -504,8 +505,13 @@ def retrace(
         wrapper.cleanup()  # drop its bytecode hook before replacing it
         if prefix_suffix or wrapper in _base_compile_prefixes:
             wrapper_any = cast(Any, wrapper)
+            # Match VllmBackend.__init__ (`self.prefix = prefix or model_tag`):
+            # when `_compile_prefix` is empty, suffixing `""` directly would
+            # yield `"_decode_only"` while restoring `""` yields `model_tag`,
+            # breaking prefix matching between variant and base passes.
             base_prefix = _base_compile_prefixes.setdefault(
-                wrapper, cast(str, wrapper_any._compile_prefix)
+                wrapper,
+                cast(str, wrapper_any._compile_prefix) or vllm_backends.model_tag,
             )
             wrapper_any._compile_prefix = (
                 f"{base_prefix}{prefix_suffix}" if prefix_suffix else base_prefix
