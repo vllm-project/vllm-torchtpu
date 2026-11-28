@@ -16,7 +16,6 @@
 import os
 
 import torch
-from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
@@ -184,13 +183,9 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        hbm = hardware.get_hbm_bytes_per_device()
-        if hbm is not None:
-            return hbm
-        raise ValueError(
-            "Could not determine HBM memory for attached TPU device: "
-            f"{hardware.get_tpu_device_name()}"
-        )
+        from torch.tpu import get_device_properties
+
+        return get_device_properties().total_memory
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

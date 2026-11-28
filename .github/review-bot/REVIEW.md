@@ -132,7 +132,7 @@ Order findings blocking first, then should-fix, most severe first within each. B
 
 ### Omni: `src/vllm_torchtpu/omni/**`
 
-- [B] **Orchestrator off the TPU**. Code that can run in the vLLM-Omni orchestrator never opens the TPU: no TPU tensors, TPU-backed generators, or memory queries through JAX or `torch.accelerator`. Never suggest `hbm_usage_bytes()` or `compute_hbm_budget()` there; HBM size comes from torch_tpu's `hardware.get_hbm_bytes_per_device()`. Move tensors to CPU before IPC.
+- [B] **Orchestrator off the TPU**. Code that can run in the vLLM-Omni orchestrator never opens the TPU: no TPU tensors, TPU-backed generators, or memory queries through JAX or `torch.accelerator`. Never suggest `hbm_usage_bytes()` or `compute_hbm_budget()` there; HBM size comes from `torch.tpu.get_device_properties().total_memory`. Move tensors to CPU before IPC.
 - [B] **Worker setup**. `OmniTpuPlatform` reuses `TpuPlatform` methods. Read `WORLD_SIZE` only in `set_device`. Rebuild `TORCH_TPU_SLICEBUILDER_ADDRESSES` from the worker's own `MASTER_PORT`, never keep an inherited value, and raise for layouts known not to work.
 - [S] **Patch scope**. Patch a shared class for every user, with a fallback to the original, unless measurements show it loses elsewhere; never gate it on a hand-copied list of pipeline names. A needed list gets a `tests_omni/` test against the real vllm-omni registry in both directions, and an INFO log when no model patch applies.
 

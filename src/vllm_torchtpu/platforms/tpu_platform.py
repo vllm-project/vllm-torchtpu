@@ -156,7 +156,7 @@ TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
 _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
 
 # 3D Torus generations that expose two devices per chip. The device name
-# surfaces as "TPU v7" from get_tpu_device_name() and as "TPU7x" from the
+# surfaces as "TPU v7" from torch.tpu.get_device_name() and as "TPU7x" from the
 # device-kind path, so both spellings have to match.
 _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 
@@ -848,7 +848,9 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        return hardware.get_tpu_device_name()
+        from torch.tpu import get_device_name
+
+        return get_device_name()
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
