@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CLI entrypoint for plan and explain subcommands."""
+"""CLI entrypoint for solve, plan, and explain subcommands."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import asdict, replace
 
@@ -28,6 +29,9 @@ from .chips import (
     override_chip_ici_bw,
 )
 from .constants import (
+    DEFAULT_HBM_RESERVE_GB,
+    EXAMPLE_CONCURRENCIES,
+    EXAMPLE_SLO_TIERS,
     EXPERT_DTYPE_BYTES,
     KV_DTYPE_BYTES,
     STATE_DTYPE_BYTES,
@@ -37,10 +41,20 @@ from .constants import (
     UNIT_MICRO,
     WEIGHT_DTYPE_BYTES,
 )
-from .geometry import ModelGeometry, UnsupportedArchitectureError, from_hf_config
+from .geometry import UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
 from .modules import Dtypes, Parallel, StepShape
 from .serving import ServingRequest, plan
+from .solver import (
+    EXAMPLE_SCENARIOS,
+    PoolMeshPlan,
+    ScenarioOverrides,
+    ServingPlan,
+    SolveOptions,
+    TrafficScenario,
+    build_example_scenario,
+    solve_serving_plan,
+)
 from .step import FloorOptions, SpecShape, spec_cycle_floor, step_floor
 
 
@@ -64,17 +78,21 @@ def _add_model_source(parser: argparse.ArgumentParser) -> None:
 def _add_dtype_override_args(parser: argparse.ArgumentParser) -> None:
     """Add optional dtype overrides (default None = derived from HF config)."""
     parser.add_argument(
-        "--weight-dtype", default=None, choices=sorted(WEIGHT_DTYPE_BYTES)
+        "--weight-dtype", default=None, choices=tuple(sorted(WEIGHT_DTYPE_BYTES))
     )
     parser.add_argument(
         "--expert-weight-dtype",
         default=None,
-        choices=sorted(EXPERT_DTYPE_BYTES),
+        choices=tuple(sorted(EXPERT_DTYPE_BYTES)),
     )
-    parser.add_argument("--aux-dtype", default=None, choices=sorted(WEIGHT_DTYPE_BYTES))
-    parser.add_argument("--kv-dtype", default=None, choices=sorted(KV_DTYPE_BYTES))
     parser.add_argument(
-        "--state-dtype", default=None, choices=sorted(STATE_DTYPE_BYTES)
+        "--aux-dtype", default=None, choices=tuple(sorted(WEIGHT_DTYPE_BYTES))
+    )
+    parser.add_argument(
+        "--kv-dtype", default=None, choices=tuple(sorted(KV_DTYPE_BYTES))
+    )
+    parser.add_argument(
+        "--state-dtype", default=None, choices=tuple(sorted(STATE_DTYPE_BYTES))
     )
     parser.add_argument(
         "--act",
@@ -85,13 +103,11 @@ def _add_dtype_override_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_common_args(
-    parser: argparse.ArgumentParser, *, tp_required: bool = True
-) -> None:
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add common serving and parallel execution flags to parser."""
     _add_model_source(parser)
     parser.add_argument("--chip", default="tpu7x", choices=sorted(CHIPS))
-    parser.add_argument("--tp", type=int, required=tp_required, default=None)
+    parser.add_argument("--tp", type=int, required=True, default=None)
     parser.add_argument("--context", type=int, default=0)
     parser.add_argument("--kv-split", type=int, default=1)
     parser.add_argument("--kv-merge", default="ag_rs", choices=("ag_rs", "exchange"))
@@ -115,32 +131,286 @@ def _add_common_args(
     parser.add_argument("--json", action="store_true")
 
 
+def _add_scenario_args(parser: argparse.ArgumentParser) -> None:
+    """Add traffic scenario, SLO, and instance constraint flags."""
+    _add_model_source(parser)
+    parser.add_argument("--chip", default="tpu7x", choices=sorted(CHIPS))
+    parser.add_argument(
+        "--example-scenario", default=None, choices=sorted(EXAMPLE_SCENARIOS)
+    )
+    parser.add_argument("--mode", default="auto", choices=("auto", "mixed", "disagg"))
+    parser.add_argument("--max-chips", type=int, default=None)
+    parser.add_argument("--max-instances", type=int, default=None)
+    parser.add_argument(
+        "--example-slo-tier", default="none", choices=sorted(EXAMPLE_SLO_TIERS)
+    )
+    parser.add_argument("--ttft-slo-ms", type=float, default=None)
+    parser.add_argument("--tpot-slo-ms", type=float, default=None)
+    parser.add_argument("--isl", type=int, default=None)
+    parser.add_argument("--osl", type=int, default=None)
+    parser.add_argument("--concurrency", default=None)
+    parser.add_argument("--prefix-hit-rate", type=float, default=None)
+    parser.add_argument("--accept-len", type=float, default=None)
+    parser.add_argument("--think-time-s", type=float, default=None)
+    _add_dtype_override_args(parser)
+    parser.add_argument("--ici-bw-gbps", type=float, default=None)
+    parser.add_argument(
+        "--hbm-reserve-gb",
+        type=float,
+        default=DEFAULT_HBM_RESERVE_GB,
+    )
+    parser.add_argument(
+        "--sort-by",
+        default="throughput",
+        choices=("throughput", "interactivity"),
+    )
+    parser.add_argument("--pairs", action="store_true")
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--json", action="store_true")
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    """Build argument parser for plan and explain subcommands."""
+    """Build argument parser for solve, plan, and explain subcommands."""
     parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_plan = sub.add_parser("plan")
-    _add_common_args(p_plan)
-    p_plan.add_argument("--concurrency", default="1,4,16,64")
-    p_plan.add_argument("--spec-window", type=int, default=0)
-    p_plan.add_argument("--accept-len", type=float, default=None)
+    solve_parser = sub.add_parser("solve")
+    _add_scenario_args(solve_parser)
 
-    p_exp = sub.add_parser("explain")
-    _add_common_args(p_exp)
-    p_exp.add_argument("--batch", type=int, default=1)
-    p_exp.add_argument("--rows-per-seq", type=int, default=1)
-    p_exp.add_argument("--spec-window", type=int, default=0)
+    plan_parser = sub.add_parser("plan")
+    _add_common_args(plan_parser)
+    plan_parser.add_argument("--concurrency", default="1,4,16,64")
+    plan_parser.add_argument("--spec-window", type=int, default=0)
+    plan_parser.add_argument("--accept-len", type=float, default=None)
+
+    explain_parser = sub.add_parser("explain")
+    _add_common_args(explain_parser)
+    explain_parser.add_argument("--batch", type=int, default=1)
+    explain_parser.add_argument("--rows-per-seq", type=int, default=1)
+    explain_parser.add_argument("--spec-window", type=int, default=0)
     return parser
 
 
-def _resolve_chip_spec(
+def _require_positive_finite(name: str, value: float | None) -> None:
+    """Raise ValueError when an optional float flag is non-positive or non-finite."""
+    if value is not None and (not math.isfinite(value) or value <= 0.0):
+        msg = f"{name} must be finite and > 0, got {value}"
+        raise ValueError(msg)
+
+
+def _require_non_negative_finite(name: str, value: float | None) -> None:
+    """Raise ValueError when an optional float flag is negative or non-finite."""
+    if value is not None and (not math.isfinite(value) or value < 0.0):
+        msg = f"{name} must be finite and >= 0, got {value}"
+        raise ValueError(msg)
+
+
+def _require_positive_int(name: str, value: int | None) -> None:
+    """Raise ValueError when an optional integer flag is < 1."""
+    if value is not None and value < 1:
+        msg = f"{name} must be >= 1, got {value}"
+        raise ValueError(msg)
+
+
+def _parse_concurrencies(raw: str) -> tuple[int, ...]:
+    """Parse a non-empty comma-separated list of positive concurrency ints."""
+    values = tuple(int(item) for item in raw.split(",") if item.strip())
+    if not values or any(val < 1 for val in values):
+        msg = f"--concurrency must contain positive integers (>= 1), got {raw!r}"
+        raise ValueError(msg)
+    return values
+
+
+def _resolve_scenario(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> TrafficScenario:
+    """Validate CLI flags and build the target TrafficScenario."""
+    _require_positive_finite("--ttft-slo-ms", args.ttft_slo_ms)
+    _require_positive_finite("--tpot-slo-ms", args.tpot_slo_ms)
+    _require_non_negative_finite("--think-time-s", args.think_time_s)
+    if args.example_scenario is None and args.example_slo_tier != "none":
+        msg = "--example-slo-tier requires --example-scenario"
+        raise ValueError(msg)
+    concurrencies = _parse_concurrencies(args.concurrency) if args.concurrency else None
+    if args.example_scenario is not None:
+        return build_example_scenario(
+            args.example_scenario,
+            slo_tier=args.example_slo_tier,
+            overrides=ScenarioOverrides(
+                isl=args.isl,
+                osl=args.osl,
+                concurrencies=concurrencies,
+                prefix_hit_rate=args.prefix_hit_rate,
+                accept_len=args.accept_len,
+                think_time_s=args.think_time_s,
+                ttft_slo_ms=args.ttft_slo_ms,
+                tpot_slo_ms=args.tpot_slo_ms,
+            ),
+        )
+    if (
+        args.isl is None
+        or args.osl is None
+        or args.prefix_hit_rate is None
+        or args.accept_len is None
+        or args.think_time_s is None
+    ):
+        parser.error(
+            "Either --example-scenario or all of --isl, --osl, "
+            "--prefix-hit-rate, --accept-len, and --think-time-s "
+            "are required."
+        )
+    return TrafficScenario(
+        name="custom",
+        isl=args.isl,
+        osl=args.osl,
+        prefix_hit_rate=args.prefix_hit_rate,
+        accept_len=args.accept_len,
+        think_time_s=args.think_time_s,
+        concurrencies=(
+            concurrencies if concurrencies is not None else EXAMPLE_CONCURRENCIES
+        ),
+        kv_working_set_turns=1.0,
+        ttft_slo_ms=args.ttft_slo_ms,
+        tpot_slo_ms=args.tpot_slo_ms,
+    )
+
+
+def _format_pool_axes(pool: PoolMeshPlan) -> str:
+    """Format non-trivial parallelism axes for a pool summary label."""
+    axes: list[str] = []
+    if pool.tp > 1:
+        axes.append(f"TP{pool.tp}")
+    if pool.dp > 1:
+        axes.append(f"DP{pool.dp}")
+    if pool.ep > 1:
+        axes.append(f"EP{pool.ep}")
+    if pool.pp > 1:
+        axes.append(f"PP{pool.pp}")
+    if pool.pcp > 1:
+        axes.append(f"PCP{pool.pcp}")
+    if pool.kv_split > 1:
+        axes.append(f"DCP{pool.kv_split}")
+    return " x ".join(axes) if axes else "TP1"
+
+
+def _write_solve_text_output(serving_plan: ServingPlan) -> int:
+    """Write solve warnings to stderr and formatted table rows to stdout."""
+    for warning in serving_plan.warnings:
+        sys.stderr.write(f"WARNING: {warning}\n")
+    if serving_plan.candidates:
+        sys.stdout.write(
+            f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pareto':>6}  {'pools':<32}  "
+            f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'est_ttft_ms':>11}  "
+            f"{'est_tpot_ms':>11}\n"
+        )
+        for point in serving_plan.candidates:
+            if point.prefill_pool is not None:
+                pools = (
+                    f"{point.prefill_pool.instances}x{point.prefill_pool.topology}"
+                    f"({_format_pool_axes(point.prefill_pool)})P+"
+                    f"{point.decode_pool.instances}x{point.decode_pool.topology}"
+                    f"({_format_pool_axes(point.decode_pool)})D"
+                )
+            else:
+                pools = (
+                    f"1x{point.decode_pool.topology}"
+                    f"({_format_pool_axes(point.decode_pool)})"
+                )
+            mark = "*" if point.is_pareto else ""
+            sys.stdout.write(
+                f"{point.mode:<7}  {point.concurrency:>5}  {point.total_chips:>5}  "
+                f"{mark:>6}  {pools:<32}  {point.est_interactivity_tok_s:>13.2f}  "
+                f"{point.token_throughput_per_chip:>13.1f}  "
+                f"{point.est_ttft_ms:>11.1f}  {point.est_tpot_ms:>11.2f}\n"
+            )
+    else:
+        sys.stdout.write(
+            f"{'role':<8}  {'c':>5}  {'chips':>5}  {'pareto':>6}  {'pool':<28}  "
+            f"{'tok_tput_chip':>13}  {'ttft_ms':>10}  {'tpot_ms':>10}\n"
+        )
+        for record in (*serving_plan.prefill_pools, *serving_plan.decode_pools):
+            mark = "*" if record.is_pareto else ""
+            pool_lbl = f"{record.pool.topology}({_format_pool_axes(record.pool)})"
+            ttft_text = (
+                f"{record.ttft_ms:>10.1f}"
+                if record.ttft_ms is not None
+                else f"{'-':>10}"
+            )
+            tpot_text = (
+                f"{record.tpot_ms:>10.2f}"
+                if record.tpot_ms is not None
+                else f"{'-':>10}"
+            )
+            sys.stdout.write(
+                f"{record.role:<8}  {record.concurrency:>5}  "
+                f"{record.pool.chips_per_instance:>5}  {mark:>6}  {pool_lbl:<28}  "
+                f"{record.token_throughput_per_chip:>13.1f}  "
+                f"{ttft_text}  {tpot_text}\n"
+            )
+    return 0
+
+
+def _dispatch_solve(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    config: dict[str, object],
+    *,
+    model_ref: str | None = None,
+) -> int:
+    """Execute the solve subcommand and write JSON or table output."""
+    scenario = _resolve_scenario(args, parser)
+    if args.max_chips is None and args.max_instances is None:
+        parser.error("Either --max-chips or --max-instances is required.")
+    _require_positive_int("--max-chips", args.max_chips)
+    _require_positive_int("--max-instances", args.max_instances)
+    _require_positive_int("--top-k", args.top_k)
+    _require_non_negative_finite("--hbm-reserve-gb", args.hbm_reserve_gb)
+    resolved_dtypes = resolve_dtypes_from_args(args, config)
+    chip, custom_topos = _resolve_chip_and_topos(args)
+    chip = _apply_chip_overrides(chip, args)
+    serving_plan = solve_serving_plan(
+        from_hf_config(config, model_ref=model_ref),
+        resolved_dtypes,
+        chip,
+        scenario,
+        SolveOptions(
+            mode=args.mode,
+            max_chips=args.max_chips,
+            max_instances=args.max_instances,
+            hbm_reserve_gb=args.hbm_reserve_gb,
+            topologies=tuple(custom_topos.values()) if custom_topos else None,
+            sort_by=args.sort_by,
+            include_pairs=args.pairs,
+            top_k=args.top_k,
+        ),
+    )
+    if args.json:
+        sys.stdout.write(json.dumps(asdict(serving_plan), allow_nan=False) + "\n")
+        return 0
+    return _write_solve_text_output(serving_plan)
+
+
+def _apply_chip_overrides(chip: ChipSpec, args: argparse.Namespace) -> ChipSpec:
+    """Apply explicit CLI bandwidth overrides to a ChipSpec."""
+    if args.ici_bw_gbps is not None:
+        return override_chip_ici_bw(chip, args.ici_bw_gbps * UNIT_GIGA)
+    return chip
+
+
+def _resolve_chip_and_topos(
     args: argparse.Namespace,
 ) -> tuple[ChipSpec, dict[str, SliceTopology] | None]:
-    """Resolve ChipSpec and optional custom topologies from CLI arguments."""
+    """Resolve (ChipSpec, optional topologies) from --chip-spec or --chip."""
     if args.chip_spec is not None:
-        return load_chip_spec(args.chip_spec)
+        chip, topos = load_chip_spec(args.chip_spec)
+        return chip, topos
     return CHIPS[args.chip], None
+
+
+def _resolve_chip_spec(args: argparse.Namespace) -> ChipSpec:
+    """Resolve ChipSpec from --chip-spec JSON path or built-in --chip name."""
+    chip, _ = _resolve_chip_and_topos(args)
+    return chip
 
 
 def _parse_hf_overrides(raw: str | None) -> dict[str, object] | None:
@@ -195,9 +465,19 @@ def resolve_dtypes_from_args(
     return dtypes
 
 
-def _build_parallel(args: argparse.Namespace) -> Parallel:
-    """Construct a Parallel config from parsed CLI arguments."""
-    return Parallel(
+def _build_common_plan_inputs(
+    args: argparse.Namespace,
+    config: dict[str, object] | None = None,
+) -> tuple[Parallel, Dtypes, float]:
+    """Build Parallel, Dtypes, and latency override from common CLI flags."""
+    _require_non_negative_finite("--collective-latency-us", args.collective_latency_us)
+    if args.context < 0:
+        msg = f"--context must be >= 0, got {args.context}"
+        raise ValueError(msg)
+    if args.spec_window < 0:
+        msg = f"--spec-window must be >= 0, got {args.spec_window}"
+        raise ValueError(msg)
+    parallel = Parallel(
         tp=args.tp,
         kv_split=args.kv_split,
         kv_merge=args.kv_merge,
@@ -206,29 +486,33 @@ def _build_parallel(args: argparse.Namespace) -> Parallel:
         residual=args.residual,
         ar_algo=args.ar_algo,
     )
+    dtypes = resolve_dtypes_from_args(args, config)
+    latency_s = (args.collective_latency_us or 0.0) * UNIT_MICRO
+    return parallel, dtypes, latency_s
 
 
-def _run_plan_cmd(
+def _dispatch_plan(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
-    geometry: ModelGeometry,
-    chip: ChipSpec,
-    dtypes: Dtypes,
+    config: dict[str, object],
     *,
-    topologies: dict[str, SliceTopology] | None = None,
+    model_ref: str | None = None,
 ) -> int:
-    """Run the plan subcommand and write table or JSON output."""
+    """Execute the plan subcommand across target concurrencies."""
     if args.spec_window > 0 and args.accept_len is None:
         parser.error("--accept-len is required when --spec-window > 0")
-    concs_list = [int(x) for x in args.concurrency.split(",") if x.strip()]
+    chip, topologies = _resolve_chip_and_topos(args)
+    chip = _apply_chip_overrides(chip, args)
+    parallel, dtypes, _ = _build_common_plan_inputs(args, config)
+    concurrencies_list = list(_parse_concurrencies(args.concurrency))
     rows = plan(
-        geometry=geometry,
+        geometry=from_hf_config(config, model_ref=model_ref),
         chip=chip,
-        parallel=_build_parallel(args),
+        parallel=parallel,
         dtypes=dtypes,
         request=ServingRequest(
             context=args.context,
-            concurrencies=concs_list,
+            concurrencies=concurrencies_list,
             spec_window=args.spec_window,
             acceptance_length=args.accept_len,
             collective_latency_us=args.collective_latency_us,
@@ -240,42 +524,45 @@ def _run_plan_cmd(
         return 0
     header = (
         f"{'c':>4}  {'rows':>6}  {'binding':<7}  "
-        f"{'hard_floor_ms':>13}  {'serial_estimate_ms':>15}  "
+        f"{'hard_floor_ms':>13}  {'serial_estimate_ms':>18}  "
         f"{'tpot_floor_ms':>13}  {'interactivity_ceil_tok_s':>24}  "
         f"{'output_tput_ceil_per_chip':>25}  {'flag':<7}\n"
     )
     sys.stdout.write(header)
     for row in rows:
-        line = (
+        sys.stdout.write(
             f"{row.concurrency:>4}  {row.rows:>6}  {row.binding:<7}  "
-            f"{row.hard_floor_ms:>13.3f}  {row.serial_estimate_ms:>15.3f}  "
+            f"{row.hard_floor_ms:>13.3f}  {row.serial_estimate_ms:>18.3f}  "
             f"{row.tpot_floor_ms:>13.3f}  {row.interactivity_ceil_tok_s:>24.1f}  "
             f"{row.output_tput_ceil_per_chip:>25.1f}  {row.flag:<7}\n"
         )
-        sys.stdout.write(line)
     return 0
 
 
-def _run_explain_cmd(
+def _dispatch_explain(
     args: argparse.Namespace,
-    geometry: ModelGeometry,
-    chip: ChipSpec,
-    dtypes: Dtypes,
+    config: dict[str, object],
+    *,
+    model_ref: str | None = None,
 ) -> int:
-    """Run the explain subcommand and write module costs."""
-    lat_s = (args.collective_latency_us or 0.0) * UNIT_MICRO
-    parallel = _build_parallel(args)
-    opts = FloorOptions(dtypes=dtypes, collective_latency_s=lat_s)
-    if args.spec_window > 0:
-        floor_result = spec_cycle_floor(
+    """Execute the explain subcommand for per-module step breakdowns."""
+    _require_positive_int("--batch", args.batch)
+    _require_positive_int("--rows-per-seq", args.rows_per_seq)
+    geometry = from_hf_config(config, model_ref=model_ref)
+    chip = _resolve_chip_spec(args)
+    chip = _apply_chip_overrides(chip, args)
+    parallel, dtypes, latency_s = _build_common_plan_inputs(args, config)
+    opts = FloorOptions(dtypes=dtypes, collective_latency_s=latency_s)
+    floor_result = (
+        spec_cycle_floor(
             geometry,
             chip,
             parallel,
             SpecShape(batch=args.batch, context=args.context, spec_k=args.spec_window),
             opts,
         )
-    else:
-        floor_result = step_floor(
+        if args.spec_window > 0
+        else step_floor(
             geometry=geometry,
             chip=chip,
             parallel=parallel,
@@ -286,21 +573,18 @@ def _run_explain_cmd(
             ),
             options=opts,
         )
+    )
     if args.json:
-        sys.stdout.write(
-            json.dumps(
-                [
-                    {
-                        **asdict(module_item),
-                        "ici_bytes": module_item.ici_bytes,
-                        "n_collectives": module_item.n_collectives,
-                        "chain_hops": module_item.chain_hops,
-                    }
-                    for module_item in floor_result.modules
-                ]
-            )
-            + "\n"
-        )
+        payload = [
+            {
+                **asdict(module_item),
+                "ici_bytes": module_item.ici_bytes,
+                "n_collectives": module_item.n_collectives,
+                "chain_hops": module_item.chain_hops,
+            }
+            for module_item in floor_result.modules
+        ]
+        sys.stdout.write(json.dumps(payload) + "\n")
         return 0
     sys.stdout.write(
         f"{'module':<10}  {'hbm_mb':>10}  {'fp8_gflops':>10}  "
@@ -336,11 +620,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         overrides = _parse_hf_overrides(args.hf_overrides)
         config, identity = load_hf_config_with_identity(src, hf_overrides=overrides)
-        geometry = from_hf_config(config, model_ref=identity.hf_repo)
-        chip, topologies = _resolve_chip_spec(args)
-        if args.ici_bw_gbps is not None:
-            chip = override_chip_ici_bw(chip, args.ici_bw_gbps * UNIT_GIGA)
-        dtypes = resolve_dtypes_from_args(args, config)
+        model_ref = identity.hf_repo
+        if args.cmd == "solve":
+            return _dispatch_solve(args, parser, config, model_ref=model_ref)
+        if args.cmd == "plan":
+            return _dispatch_plan(args, parser, config, model_ref=model_ref)
+        return _dispatch_explain(args, config, model_ref=model_ref)
     except (
         UnsupportedArchitectureError,
         FileNotFoundError,
@@ -350,12 +635,6 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
         return 2
-
-    if args.cmd == "plan":
-        return _run_plan_cmd(
-            args, parser, geometry, chip, dtypes, topologies=topologies
-        )
-    return _run_explain_cmd(args, geometry, chip, dtypes)
 
 
 if __name__ == "__main__":

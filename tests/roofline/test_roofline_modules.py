@@ -39,9 +39,11 @@ from vllm_torchtpu.roofline import (
     FloorOptions,
     ModelGeometry,
     Parallel,
+    SeqKvLayout,
     StepShape,
     dtypes_from_hf_config,
     from_hf_config,
+    hbm_breakdown_per_core_bytes,
     pass_costs,
     step_floor,
 )
@@ -1498,6 +1500,13 @@ def test_nope_mla_zero_rope_dim_and_compress_ratios() -> None:
     kv_traffic_uncomp = mods_uncomp["mla"].hbm_bytes - mods_ctx0["mla"].hbm_bytes
     kv_traffic_comp = mods_comp["mla"].hbm_bytes - mods_ctx0["mla"].hbm_bytes
     assert kv_traffic_comp == pytest.approx(kv_traffic_uncomp * (2.75 / 4.0), rel=1e-09)
+    bd_uncomp = hbm_breakdown_per_core_bytes(
+        geom_uncomp, dtypes, parallel, SeqKvLayout(4, 4096)
+    )
+    bd_comp = hbm_breakdown_per_core_bytes(
+        geom_comp, dtypes, parallel, SeqKvLayout(4, 4096)
+    )
+    assert bd_comp.kv == pytest.approx(bd_uncomp.kv * (2.75 / 4.0), rel=1e-09)
     with pytest.raises(ValueError, match="compress_ratios"):
         _from_hf_config_dry_run({**nope_mla_cfg, "compress_ratios": [2.0, 2.0]})
     with pytest.raises(ValueError, match="compress_ratios"):
@@ -1510,6 +1519,13 @@ def test_nope_mla_zero_rope_dim_and_compress_ratios() -> None:
             parallel,
             shape,
             dtypes,
+        )
+    with pytest.raises(ValueError, match="qk_rope_head_dim"):
+        hbm_breakdown_per_core_bytes(
+            _from_hf_config_dry_run({**nope_mla_cfg, "qk_rope_head_dim": -1}),
+            dtypes,
+            parallel,
+            SeqKvLayout(1, 1024),
         )
 
 

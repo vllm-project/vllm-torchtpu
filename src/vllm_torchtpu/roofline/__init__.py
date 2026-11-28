@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU roofline serving, memory, collective, and execution modeling."""
+"""Analytical TPU serving roofline, step floor, and physics mesh solver."""
 
 from __future__ import annotations
 
@@ -58,10 +58,22 @@ from .geometry import (
     resolve_model_identity,
 )
 from .hf_loader import (
+    ConfigAudit,
     apply_hf_overrides,
+    audit_hf_config,
     dtypes_from_hf_config,
     load_hf_config,
     load_hf_config_with_identity,
+)
+from .memory import (
+    HbmBreakdown,
+    KvFitInput,
+    ParamBreakdown,
+    SeqKvLayout,
+    hbm_breakdown_per_core_bytes,
+    hbm_footprint_per_core_bytes,
+    param_counts,
+    pp_stage_layer_scale,
 )
 from .modules import (
     Dtypes,
@@ -82,6 +94,18 @@ from .occupancy import (
     parse_activation_spec,
 )
 from .serving import ConcurrencyRow, ServingRequest, plan
+from .solver import (
+    EXAMPLE_SCENARIOS,
+    ParetoPoint,
+    PoolFloorRecord,
+    PoolMeshPlan,
+    ScenarioOverrides,
+    ServingPlan,
+    SolveOptions,
+    TrafficScenario,
+    build_example_scenario,
+    solve_serving_plan,
+)
 from .step import (
     FloorOptions,
     SpecShape,
@@ -95,6 +119,7 @@ __all__ = [
     "BENIGN_HF_METADATA_KEYS",
     "CHIPS",
     "CHIP_TOPOLOGIES",
+    "EXAMPLE_SCENARIOS",
     "HF_REPO_TO_CANONICAL_ID",
     "SUPPORTED_CHIPS",
     "SUPPORTED_MODELS",
@@ -106,12 +131,15 @@ __all__ = [
     "Collective",
     "CollectiveConfig",
     "ConcurrencyRow",
+    "ConfigAudit",
     "CutPlacementOptions",
     "Dtypes",
     "ExpertActivationModel",
     "ExpertDispatch",
     "FloorOptions",
+    "HbmBreakdown",
     "KeyTracker",
+    "KvFitInput",
     "LayerCounts",
     "LinkCutLoad",
     "ModelGeometry",
@@ -119,14 +147,25 @@ __all__ = [
     "ModelSpec",
     "ModuleCost",
     "Parallel",
+    "ParamBreakdown",
+    "ParetoPoint",
+    "PoolFloorRecord",
+    "PoolMeshPlan",
+    "ScenarioOverrides",
+    "SeqKvLayout",
+    "ServingPlan",
     "ServingRequest",
     "SliceTopology",
+    "SolveOptions",
     "SpecShape",
     "StepFloor",
     "StepShape",
+    "TrafficScenario",
     "active_experts_envelope",
     "apply_hf_overrides",
+    "audit_hf_config",
     "bernoulli_expected_experts",
+    "build_example_scenario",
     "collective_axis_cut_bytes",
     "collective_cut_bound_s",
     "count_layer_types",
@@ -134,6 +173,8 @@ __all__ = [
     "dtypes_from_hf_config",
     "eval_link_subset_bound_s",
     "from_hf_config",
+    "hbm_breakdown_per_core_bytes",
+    "hbm_footprint_per_core_bytes",
     "load_activation_hull",
     "load_chip_spec",
     "load_hf_config",
@@ -142,11 +183,14 @@ __all__ = [
     "min_experts_per_ep_shard",
     "outer_submesh_for_group",
     "override_chip_ici_bw",
+    "param_counts",
     "parse_activation_spec",
     "pass_costs",
     "plan",
+    "pp_stage_layer_scale",
     "register_chip",
     "resolve_model_identity",
+    "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
     "topologies_for_chip",

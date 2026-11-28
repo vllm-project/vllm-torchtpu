@@ -85,6 +85,7 @@ class SpecShape:
     batch: int
     context: int = 0
     spec_k: int = 0
+    shared_prefix_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -944,6 +945,7 @@ def spec_cycle_floor(
         rows_per_seq=spec.spec_k + 1,
         context=spec.context,
         state_writes=1,
+        shared_prefix_tokens=spec.shared_prefix_tokens,
     )
     verify_mods = list(
         pass_costs(
@@ -970,7 +972,11 @@ def spec_cycle_floor(
 
     draft_geom = _draft_geom_for_spec(geometry)
     draft_shape = StepShape(
-        batch=spec.batch, rows_per_seq=1, context=spec.context, state_writes=1
+        batch=spec.batch,
+        rows_per_seq=1,
+        context=spec.context,
+        state_writes=1,
+        shared_prefix_tokens=spec.shared_prefix_tokens,
     )
     draft_parallel = replace(parallel, pp=1)
     one_draft = pass_costs(

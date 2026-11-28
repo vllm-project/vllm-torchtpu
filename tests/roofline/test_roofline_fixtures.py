@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 
 import pytest
@@ -31,6 +32,7 @@ from vllm_torchtpu.roofline import (
     resolve_model_identity,
 )
 from vllm_torchtpu.roofline.geometry import UnsupportedArchitectureError, supports
+from vllm_torchtpu.roofline.hf_loader import audit_hf_config
 
 SUPPORTED_FIXTURES: tuple[tuple[str, str, str], ...] = (
     ("qwen3_5_397b_fp8.json", "qwen3_5_moe", "Qwen/Qwen3.5-397B-A17B-FP8"),
@@ -385,3 +387,83 @@ def test_spoofed_sliding_window_and_kda_under_listed_model_type_fail_closed() ->
         UnsupportedArchitectureError, match="does not allow layer kinds"
     ):
         from_hf_config(spoofed_mla)
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "expected_id", "hf_repo"),
+    SUPPORTED_FIXTURES,
+)
+def test_supported_authentic_fixtures_audit_tier0_zero_unmapped_keys(
+    fixture_name: str,
+    expected_id: str,
+    hf_repo: str,
+) -> None:
+    """Verify audit_hf_config reports tier0_ready and zero unmapped structural keys."""
+    config = load_locked_config(fixture_name)
+    audit = audit_hf_config(config, model_ref=hf_repo)
+    assert audit.onboarding_tier == "tier0_ready"
+    assert audit.model_type_status == "listed"
+    assert audit.blocking_reasons == ()
+    assert audit.unmapped_structural_keys == ()
+    assert audit.geometry is not None
+    assert audit.geometry.model_id == expected_id
+    assert audit.dtypes is not None
+    assert audit.param_counts is not None
+    assert audit.param_counts.total_params > 0.0
+
+
+@pytest.mark.parametrize(("config", "match_text"), SYNTHETIC_NEGATIVE_CONTROLS)
+def test_negative_control_fixtures_audit_blocked(
+    config: dict[str, object],
+    match_text: str,
+) -> None:
+    """Verify audit_hf_config blocks unsupported negative-control configs."""
+    audit = audit_hf_config(config)
+    assert audit.onboarding_tier != "tier0_ready"
+    assert audit.geometry is None
+    assert any(
+        re.search(match_text, reason, re.IGNORECASE)
+        for reason in audit.blocking_reasons
+    )
+
+
+def test_audit_hf_config_blocks_unmapped_structural_key() -> None:
+    """Verify audit_hf_config blocks configs with unmapped structural keys."""
+    qwen_config = load_locked_config("qwen3_5_397b_fp8.json")
+    raw_text = qwen_config["text_config"]
+    assert isinstance(raw_text, Mapping)
+    mutated: dict[str, object] = {
+        **qwen_config,
+        "text_config": {**dict(raw_text), "moe_expert_bias_new_field": 1},
+    }
+    audit = audit_hf_config(mutated, model_ref="Qwen/Qwen3.5-397B-A17B-FP8")
+    assert audit.onboarding_tier == "tier1_config_needed"
+    assert audit.geometry is None
+    assert "moe_expert_bias_new_field" in audit.unmapped_structural_keys
+    assert audit.blocking_reasons
+
+
+def test_audit_hf_config_blocks_spoofed_sliding_window_on_listed_family() -> None:
+    """Verify audit_hf_config rejects spoofed SWA layers labelled as qwen3_5_moe."""
+    qwen_config = load_locked_config("qwen3_5_397b_fp8.json")
+    raw_text = qwen_config["text_config"]
+    assert isinstance(raw_text, Mapping)
+    num_layers = int(raw_text["num_hidden_layers"])
+    spoofed_swa: dict[str, object] = {
+        **qwen_config,
+        "text_config": {
+            **dict(raw_text),
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ]
+            * (num_layers // 4),
+            "sliding_window": 256,
+        },
+    }
+    audit = audit_hf_config(spoofed_swa)
+    assert audit.onboarding_tier == "tier2_primitive_needed"
+    assert audit.geometry is None
+    assert any("does not allow layer kinds" in r for r in audit.blocking_reasons)
