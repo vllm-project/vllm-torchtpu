@@ -442,6 +442,13 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     from vllm_torchtpu.tpu_info import get_libtpu_cache_key
 
     cache_config = vllm_config.cache_config
+    model_config = vllm_config.model_config
+    mm_config = model_config.multimodal_config if model_config is not None else None
+    mm_encoder_attn_backend = (
+        mm_config.mm_encoder_attn_backend.name
+        if mm_config is not None and mm_config.mm_encoder_attn_backend is not None
+        else None
+    )
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
     factors = {
@@ -450,6 +457,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "jax": importlib_metadata.version("jax"),
         "jaxlib": importlib_metadata.version("jaxlib"),
         "libtpu": get_libtpu_cache_key(),
+        "mm_encoder_attn_backend": mm_encoder_attn_backend,
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {

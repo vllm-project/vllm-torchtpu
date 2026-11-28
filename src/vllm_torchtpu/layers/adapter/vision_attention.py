@@ -11,30 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU flash-attention for vision encoders (ViT) as an out-of-tree CustomOp.
+"""TPU pluggable attention backends for multimodal encoders (ViT).
 
-vLLM's ``MMEncoderAttention`` is a ``CustomOp``. vllm-torchtpu registers its TPU
-platform as an out-of-tree plugin, so ``CustomOp.dispatch_forward`` routes to
-``forward_oot`` (vllm/model_executor/custom_op.py). Following the vLLM
-device-extension design (docs/design/custom_op.md), we register an out-of-tree
-subclass via ``CustomOp.register_oot`` whose ``forward_oot`` routes packed
-variable-length vision attention to the Pallas ``flash_attention`` kernel
-with ``segment_ids`` derived from ``cu_seqlens`` -- instead of the default SDPA
-(``forward_native``), which torch_tpu lowers to the slow SHLO/MATH path. This
-replaces MMEncoderAttention everywhere vLLM instantiates it (e.g. inside
-Qwen2_5_VisionAttention), with no monkeypatching of vLLM internals.
+vLLM's ``MMEncoderAttention`` is a ``CustomOp``. ``vllm-torchtpu`` registers
+``TpuPlatform`` as an out-of-tree plugin, so ``CustomOp.dispatch_forward``
+routes to ``forward_oot`` (``vllm/model_executor/custom_op.py``).
+``TpuMMEncoderAttention`` dispatches by ``self.attn_backend`` (selected via
+``--mm-encoder-attn-backend`` and ``TpuPlatform.get_vit_attn_backend``):
 
-GQA / head-count-mismatch encoders (e.g. Whisper/ASR) that the flash kernel
-cannot serve fall back to ``forward_native``.
+- ``FLASH_ATTN`` (default): routes packed variable-length vision attention to
+  the in-tree Pallas ``flash_attention`` kernel with ``SegmentIds`` derived from
+  ``cu_seqlens`` instead of SDPA (``forward_native``), which ``torch_tpu``
+  lowers to the slower SHLO/MATH path. GQA / head-count-mismatch encoders (e.g.
+  Whisper/ASR) that the flash kernel cannot serve fall back to
+  ``forward_native``.
+- ``TORCH_SDPA``: upstream ``forward_native`` fallback.
 
-The path is safe under ``torch.compile`` (so the ViT can be compiled via the
-native ``@support_torch_compile(is_encoder=True)`` path, see
-``vit_native_compile.py``): the jax op is built eagerly in ``__init__`` (never
-inside a compiled region), ``sm_scale`` is folded into ``q`` so one static op
-serves every layer, and ``segment_ids`` are built with tensor ops only --
-``seg[t] = #{cu_seqlens[i] <= t}`` via a broadcast compare, so each image (and
-the flash padding) gets a distinct, equality-masked segment.
+The flash path is safe under ``torch.compile`` (e.g.
+``@support_torch_compile(is_encoder=True)`` in ``vit_native_compile.py``): the
+jax op is built eagerly in ``__init__`` (never inside a compiled region),
+``sm_scale`` is folded into ``q`` so one
+static op serves every layer, and ``segment_ids`` are built with tensor ops only
+(``seg[t] = #{cu_seqlens[i] <= t}`` via a broadcast compare, giving each image
+and the flash padding a distinct equality-masked segment).
 """
+
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import torch
@@ -42,6 +45,7 @@ import torch.nn.functional as F
 from torch_tpu._internal import pallas
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_torchtpu.kernels.flash_attention.kernel import SegmentIds, flash_attention
 from vllm_torchtpu.logger import init_logger
@@ -71,15 +75,21 @@ def _vision_flash_core(
 
 @CustomOp.register_oot(name="MMEncoderAttention")
 class TpuMMEncoderAttention(MMEncoderAttention):
-    """MMEncoderAttention whose TPU path uses the Pallas flash kernel."""
+    """MMEncoderAttention with pluggable TPU backends (FLASH_ATTN, TORCH_SDPA)."""
+
+    # Default for unit tests constructing instances via __new__.
+    attn_backend: AttentionBackendEnum = AttentionBackendEnum.FLASH_ATTN
 
     # One shared jax op (sm_scale folded into q -> scale-agnostic), built once,
     # eagerly -- never inside a compiled region.
-    _vision_op = None
+    _vision_op: Callable[..., Any] | None = None
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        if TpuMMEncoderAttention._vision_op is None:
+        if (
+            self.attn_backend == AttentionBackendEnum.FLASH_ATTN
+            and TpuMMEncoderAttention._vision_op is None
+        ):
             op = pallas.jax_op("pallas::vision_flash_attention", _vision_flash_core)
             op.register_fake(lambda q, k, v, q_seg, kv_seg: torch.empty_like(q))
             TpuMMEncoderAttention._vision_op = op
@@ -93,15 +103,20 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         max_seqlen: torch.Tensor | None = None,
         sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # The flash kernel requires equal q/kv head counts; GQA encoders fall
-        # back to the default SDPA path.
-        if self.num_heads != self.num_kv_heads:
-            return self.forward_native(
-                query, key, value, cu_seqlens, max_seqlen, sequence_lengths
-            )
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
         if q_len != kv_len:
+            return self.forward_native(
+                query, key, value, cu_seqlens, max_seqlen, sequence_lengths
+            )
+
+        if self.attn_backend == AttentionBackendEnum.TORCH_SDPA:
+            return self.forward_native(
+                query, key, value, cu_seqlens, max_seqlen, sequence_lengths
+            )
+
+        # Default TPU ViT backend: in-tree Pallas flash kernel (MHA only).
+        if self.num_heads != self.num_kv_heads:
             return self.forward_native(
                 query, key, value, cu_seqlens, max_seqlen, sequence_lengths
             )
@@ -130,7 +145,7 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         # real tokens attend only within their image and never to padding.
         positions = torch.arange(padded, device=q.device)
         if cu_seqlens is not None:
-            cu = cu_seqlens.to(positions.dtype)
+            cu = cu_seqlens.to(device=q.device, dtype=positions.dtype)
             seg = (positions[None, :] >= cu[:, None]).sum(dim=0).to(torch.int32)
             seg = seg.unsqueeze(0).expand(bsz, padded).contiguous()
         else:
