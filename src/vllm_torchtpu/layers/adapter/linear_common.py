@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 from collections.abc import Callable
 from threading import Lock
 
@@ -23,6 +24,10 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul.attn_out_fp8 import (
+    quantize_attn_out,
+    select_row_tile,
+)
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.logger import init_logger
 
@@ -52,6 +57,12 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
+# Set on an attention block's `o_proj` after attention kernel init
+# (`layers/adapter/attn_out_fp8.py:tag_attn_out_projections`) to the per-rank
+# `(num_kv_heads, q_per_kv, head_dim)` of the attention whose output feeds it,
+# so FP8 `apply` can quantize that output in its native head-major layout.
+ATTN_OUT_HEAD_LAYOUT_ATTR = "_tpu_attn_out_head_layout"
+
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     """Return the activation quant dtype paired with a given weight dtype.
@@ -66,11 +77,22 @@ def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     raise ValueError(f"Unsupported quantized dtype: {w_q_dtype}")
 
 
+def _uses_w8a16(rows: int, w_q_dtype: jnp.dtype, w8a16_max_rows: int) -> bool:
+    """Whether a token bucket keeps bf16 activations against FP8 weights.
+
+    W8A16 is only measured with FP8 weights; int8 weights keep W8A8.
+    """
+    return 0 < rows <= w8a16_max_rows and jnp.issubdtype(w_q_dtype, jnp.floating)
+
+
 def _quantized_matmul_jax(
     x: jax.Array,
     w_q: jax.Array,
     w_s: jax.Array,
     w8a16_max_rows: int = 0,
+    num_kv_heads: int = 0,
+    q_per_kv: int = 0,
+    head_dim: int = 0,
 ) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
@@ -78,7 +100,10 @@ def _quantized_matmul_jax(
     rather than the `(m, k) @ (n, k).T` the N-major layout forced. The
     blockwise path routes through `gmm_v2` (single group), which consumes a
     K-major rhs natively; the per-channel path uses the shared
-    `xla_quantized_matmul`, which takes the same (k, n) layout.
+    `xla_quantized_matmul`, which takes the same (k, n) layout. When optional
+    attention head-layout dimensions are supplied (`num_kv_heads > 0`) for an
+    eligible per-channel FP8 bucket, `quantize_attn_out` quantizes `x` directly
+    from its head-major attention output layout.
     """
     if x.shape[1] != w_q.shape[0]:
         raise ValueError(
@@ -113,9 +138,8 @@ def _quantized_matmul_jax(
             zero_initialize=True,
         )
     # Rows is static at trace time, so each token bucket picks one path.
-    # W8A16 is only measured with FP8 weights; int8 weights keep W8A8.
     rows = x.shape[0]
-    use_w8a16 = 0 < rows <= w8a16_max_rows and jnp.issubdtype(w_q.dtype, jnp.floating)
+    use_w8a16 = _uses_w8a16(rows, w_q.dtype, w8a16_max_rows)
     if use_w8a16:
         # Logged at trace time, so absent when executables load from the
         # compile cache.
@@ -124,6 +148,32 @@ def _quantized_matmul_jax(
             "token bucket (TPU_FP8_LINEAR_W8A16_MAX_ROWS=%d).",
             rows,
             w8a16_max_rows,
+        )
+    elif (
+        num_kv_heads > 0
+        and w_s.ndim == 1
+        and jnp.issubdtype(w_q.dtype, jnp.floating)
+        and select_row_tile(
+            rows,
+            num_kv_heads,
+            q_per_kv,
+            head_dim,
+            act_dtype=x.dtype,
+            quant_dtype=w_q.dtype,
+        )
+        is not None
+    ):
+        return xla_quantized_matmul(
+            x,
+            w_q,
+            w_s,
+            quantize_activation=True,
+            quantize_activation_fn=functools.partial(
+                quantize_attn_out,
+                num_kv_heads=num_kv_heads,
+                q_per_kv=q_per_kv,
+                head_dim=head_dim,
+            ),
         )
     return xla_quantized_matmul(x, w_q, w_s, quantize_activation=not use_w8a16)
 
@@ -148,8 +198,11 @@ def _get_quantized_matmul_op() -> Callable:
             w_q: torch.Tensor,
             w_s: torch.Tensor,
             w8a16_max_rows: int = 0,
+            num_kv_heads: int = 0,
+            q_per_kv: int = 0,
+            head_dim: int = 0,
         ):
-            del w_s, w8a16_max_rows
+            del w_s, w8a16_max_rows, num_kv_heads, q_per_kv, head_dim
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -164,6 +217,7 @@ def quantized_matmul(
     w_q: torch.Tensor,
     w_s: torch.Tensor,
     w8a16_max_rows: int = 0,
+    attn_out_head_layout: tuple[int, int, int] | None = None,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -171,7 +225,9 @@ def quantized_matmul(
     reshapes the output back. `w_q` is the canonical (k, n) layout
     `[n_in, n_out]`. The underlying JAX function picks `gmm_v2` when `w_s` is
     rank-4 `[1, n_in_blocks, 1, n_out]`, and the per-channel dot_general path
-    when `w_s` is 1-D `[n_out]`.
+    when `w_s` is 1-D `[n_out]`. When `attn_out_head_layout` is supplied as
+    `(num_kv_heads, q_per_kv, head_dim)`, eligible per-channel FP8 buckets
+    quantize `x` directly from its head-major attention output layout.
     """
     if x.shape[-1] != w_q.shape[0]:
         raise ValueError(
@@ -181,7 +237,13 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
+    if attn_out_head_layout is None:
+        out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
+    else:
+        num_kv_heads, q_per_kv, head_dim = attn_out_head_layout
+        out_2d = _get_quantized_matmul_op()(
+            x_2d, w_q, w_s, w8a16_max_rows, num_kv_heads, q_per_kv, head_dim
+        )
     return out_2d.reshape(orig_out_shape)
 
 

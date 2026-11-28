@@ -298,6 +298,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # with a `subpage_split`, which scales its block tables. The packed and
     # padded layouts can share pool and block-table shapes.
     "vllm_torchtpu/kv_cache_spec_normalizer.py",
+    "vllm_torchtpu/layers/adapter/attn_out_fp8.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",

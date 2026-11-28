@@ -6799,6 +6799,11 @@ class TPUModelRunner(GPUModelRunner):
             self.reorder_batch_threshold,
         )
         self._attention_kernels_initialized = True
+        from vllm_torchtpu.layers.adapter.attn_out_fp8 import (
+            arm_runner_models as arm_attn_out_fp8_models,
+        )
+
+        arm_attn_out_fp8_models(self)
 
     @torch.no_grad()
     def _dummy_run(
@@ -9350,11 +9355,6 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         from vllm.compilation.wrapper import reset_compile_wrapper
 
-        from vllm_torchtpu.layers.adapter.linear_common import (
-            _get_quantized_matmul_fp4_op,
-            _get_quantized_matmul_op,
-        )
-
         # set_current_vllm_config is required for the post-reset compile
         # path: reset_compile_wrapper restores the wrapper's original
         # forward code, so the next trace re-instantiates CustomOps that
@@ -9367,10 +9367,7 @@ class TPUModelRunner(GPUModelRunner):
         # determine_available_memory() reaches this profile run.
         with set_current_vllm_config(self.vllm_config):
             self._initialize_attention_kernels()
-            # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
-            _get_quantized_matmul_op()
-            # Same for the NVFP4 W4A16 matmul op.
-            _get_quantized_matmul_fp4_op()
+            self._initialize_quantization_kernels()
 
             # Compile backbone here so XLA materializes the FP8 activation
             # slab; vLLM's post-probe sees the real HBM. Cache writes are

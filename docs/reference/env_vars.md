@@ -104,6 +104,10 @@ RL and distillation workloads that compare TPU rollouts with an unfused `bfloat1
 
 Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_float32": true, "tpu_moe_silu_bf16": true}'`) to reproduce the unfused `bfloat16` MoE's rounding.
 
+### Fused attention-output FP8 quantization
+
+- `"tpu_fused_attn_out_fp8": true` (off by default, via `--additional-config '{"tpu_fused_attn_out_fp8": true}'`) fuses the batched-RPA head-major attention-output relayout with dynamic per-row FP8 activation quantization in a Pallas kernel (`kernels/quantized_matmul/attn_out_fp8.py`) ahead of eligible per-channel FP8 `o_proj` layers on allowlisted direct-output attention classes; unsupported token buckets fall back to the unfused path. Validated on Gemma 4 31B FP8 on TPU v7x and enabled in `scripts/vllm/benchmarking/configs/gemma-4-31b-fp8-dp4-tp2-multimodal.sh`.
+
 ---
 
 ## 4. Attention & KV Cache Layouts

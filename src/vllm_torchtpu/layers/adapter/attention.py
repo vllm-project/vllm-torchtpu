@@ -1534,6 +1534,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
     def runs_batched_rpa_schedule(self) -> bool:
         return False
 
+    def emits_head_major_batched_rpa_output(self) -> bool:
+        """Whether `forward` returns the batched-RPA head-major `swapaxes` view.
+
+        Only true when `PallasBatchedRPAAttentionBackendImpl` runs its own
+        `_pallas_rpa_kernel_batched` entry (`head_size != 64`) without PCP
+        streaming or DCP, both of which produce token-major `[T, H, D]` outputs.
+        Must be queried after `initialize_kernel`.
+        """
+        return False
+
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required
         by RPA kernel."""
@@ -1796,6 +1806,14 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
+
+    def emits_head_major_batched_rpa_output(self) -> bool:
+        return (
+            self.head_size != 64
+            and not self._pcp_streaming
+            and self.dcp_world_size == 1
+            and self._kernel_entry is PallasBatchedRPAAttentionBackendImpl._kernel_entry
+        )
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

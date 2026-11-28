@@ -986,6 +986,12 @@ class TpuPlatform(Platform):
         get_moe_reference_parity(vllm_config)
         # Likewise for a non-bool in-graph RoPE value.
         rope_in_graph_flag.in_graph_enabled(vllm_config)
+        from vllm_torchtpu.layers.adapter.attn_out_fp8 import (
+            fused_attn_out_fp8_enabled,
+        )
+
+        # Rejects non-bool fused attention-output FP8 values before workers start.
+        fused_attn_out_fp8_enabled(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )

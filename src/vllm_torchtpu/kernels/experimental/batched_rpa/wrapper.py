@@ -172,6 +172,47 @@ def prepare_outputs(out: jax.Array) -> jax.Array:
     return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
 
 
+def finalize_outputs(
+    out: jax.Array,
+    num_q_heads_per_kv_head: int,
+    head_dim: int,
+    out_shape: tuple[int, ...],
+) -> jax.Array:
+    """Convert head-major kernel output to token-major ``out_shape``."""
+    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
+    o_hbm = prepare_outputs(out)
+    # after: [kv_heads, max_tokens, q_per_kv, d]
+    # slice back to original shape if padded
+    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
+    return o_hbm.swapaxes(1, 0).reshape(out_shape)
+
+
+def unprepare_outputs_to_head_major(
+    x: jax.Array,
+    num_kv_heads: int,
+    q_per_kv: int,
+    head_dim: int,
+) -> jax.Array:
+    """Inverse of ``finalize_outputs`` for an unpadded ``[M, K]`` output.
+
+    Reconstructs ``[num_kv_heads, M, q_per_kv // q_packing, q_packing, head_dim]``
+    in reverse order of ``finalize_outputs`` so XLA cancels the swapaxes and
+    reshapes without emitting a relayout copy.
+    """
+    m = x.shape[0]
+    q_packing = utils.get_dtype_packing(x.dtype)
+    if q_packing <= 0 or q_per_kv % q_packing != 0:
+        raise ValueError(
+            f"q_per_kv={q_per_kv} must be divisible by packing={q_packing} "
+            f"for dtype={x.dtype}"
+        )
+    return (
+        x.reshape(m, num_kv_heads, q_per_kv, head_dim)
+        .swapaxes(1, 0)
+        .reshape(num_kv_heads, m, q_per_kv // q_packing, q_packing, head_dim)
+    )
+
+
 def get_kv_cache_shape(
     total_num_pages,
     page_size,
@@ -914,13 +955,12 @@ def ragged_paged_attention(
     if return_raw_output:
         o_hbm = o_hbm_alias_q_hbm
     else:
-        # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
-        o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
-        # after: [kv_heads, max_tokens, q_per_kv, d]
-
-        # slice back to original shape if padded
-        o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-        o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+        o_hbm = finalize_outputs(
+            o_hbm_alias_q_hbm,
+            num_q_heads_per_kv_head,
+            head_dim,
+            queries.shape,
+        )
 
     if not return_lse:
         return o_hbm, kv_cache
