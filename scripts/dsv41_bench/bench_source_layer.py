@@ -83,7 +83,9 @@ records_total = 81920
 words, scales = encode_csa2_kv(
     jnp.asarray(rng.standard_normal((records_total, 512)) * 0.2, jnp.bfloat16)
 )
-pages = rng.permutation(records_total // MPAGE).astype(np.int32)[None, :]
+# The server's table: 8 request slots (MIN_NUM_SEQS) x 4,096 pages, request 0 live.
+pages = np.zeros((8, 4096), np.int32)
+pages[0, : records_total // MPAGE] = rng.permutation(records_total // MPAGE)
 
 # SWA word pool: finite BF16 halves; one request's window pages.
 swa_pages = 64
