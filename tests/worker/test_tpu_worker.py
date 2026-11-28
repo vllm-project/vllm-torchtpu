@@ -33,6 +33,8 @@ from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
+from vllm_torchtpu.runner import model_runner_registry
+from vllm_torchtpu.runner.model_runner_registry import register_model_runner
 from vllm_torchtpu.runner.routed_experts import RoutedExpertsCapture
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import (
@@ -1059,3 +1061,81 @@ def _run_spawn_probes():
 
 if __name__ == "__main__":
     _run_spawn_probes()
+
+
+_RUNNER_ARCH = "ToyRunnerForCausalLM"
+
+
+class _OwnedRunner(TPUModelRunner):
+    """A model-owned runner class; built in place of TPUModelRunner."""
+
+
+def _init_device_worker(monkeypatch, architecture):
+    """A `_build_worker` worker whose `init_device` runs on CPU: distributed
+    init stubbed as in tests_omni/worker/test_tpu_ar_worker.py and the runner
+    constructor recording its arguments."""
+    vllm_config = _make_vllm_config()
+    vllm_config.parallel_config = ParallelConfig()
+    vllm_config.model_config.architecture = architecture
+    worker = _build_worker(vllm_config)
+    # Set by the WorkerBase.__init__ that _build_worker skips.
+    worker.distributed_init_method = "tcp://127.0.0.1:29500"
+    worker.is_driver_worker = True
+    worker.devices = [torch.device("cpu")]
+    for name, stub in (
+        ("init_distributed_environment", lambda **_: None),
+        ("ensure_model_parallel_initialized", lambda **_: None),
+        (
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        ),
+        ("vllm_utils.report_usage_stats", lambda *_: None),
+    ):
+        monkeypatch.setattr(f"vllm_torchtpu.worker.tpu_worker.{name}", stub)
+
+    def record_init(self, vllm_config, device, *, profiler_rank, profiler_world_size):
+        self.init_args = (vllm_config, device, profiler_rank, profiler_world_size)
+
+    monkeypatch.setattr(TPUModelRunner, "__init__", record_init)
+    return worker
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_init_device_builds_the_registered_runner_for_its_architecture(
+    monkeypatch, registered
+):
+    """init_device builds the runner class registered for the model's
+    architecture, else the worker's model_runner_cls, with the same args."""
+    monkeypatch.setattr(model_runner_registry, "_RUNNERS", {})
+    if registered:
+        register_model_runner(_OwnedRunner, _RUNNER_ARCH)
+    worker = _init_device_worker(monkeypatch, _RUNNER_ARCH)
+    with patch.dict(os.environ):
+        worker.init_device()
+    runner = worker.model_runner
+    assert type(runner) is (_OwnedRunner if registered else TPUModelRunner)
+    assert runner.init_args == (
+        worker.vllm_config,
+        torch.device("cpu"),
+        worker.profile_rank,
+        worker.profile_world_size,
+    )
+
+
+def test_init_device_keeps_the_default_runner_for_other_architectures(monkeypatch):
+    monkeypatch.setattr(model_runner_registry, "_RUNNERS", {})
+    register_model_runner(_OwnedRunner, _RUNNER_ARCH)
+    worker = _init_device_worker(monkeypatch, "OtherForCausalLM")
+    with patch.dict(os.environ):
+        worker.init_device()
+    assert type(worker.model_runner) is TPUModelRunner
+
+
+def test_init_device_rejects_a_registered_runner_of_another_class(monkeypatch):
+    """A registered class that does not subclass model_runner_cls fails in
+    init_device, before anything is built."""
+    monkeypatch.setattr(model_runner_registry, "_RUNNERS", {})
+    register_model_runner(SimpleNamespace, _RUNNER_ARCH)
+    worker = _init_device_worker(monkeypatch, _RUNNER_ARCH)
+    with patch.dict(os.environ), pytest.raises(TypeError, match="does not subclass"):
+        worker.init_device()
