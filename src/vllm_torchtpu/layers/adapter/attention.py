@@ -101,6 +101,7 @@ from vllm_torchtpu.layers.core.attention_interface import (
     uses_seq_along_lane_kv_page,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.model_kv_cache_dtypes import TPU_KV_CACHE_DTYPES
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -141,23 +142,16 @@ _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS = (
     P(DCP_AXIS_NAME),  # partial lse
 )
 
-# Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
-# from to fp32 directly. That's why it has a dtype mapping different from GPU
-TPU_STR_DTYPE_TO_TORCH_DTYPE = {
-    "half": torch.half,
-    "bfloat16": torch.bfloat16,
-    "float": torch.float,
-    "fp8": torch.float8_e4m3fn,
-    "fp8_e4m3": torch.float8_e4m3fn,
-    "fp8_e5m2": torch.float8_e5m2,
-    "fp8_ds_mla": torch.uint8,
-    "int8": torch.int8,
-    "uint8": torch.uint8,
-}
+# One name -> dtype map, including names that model directories register.
+TPU_STR_DTYPE_TO_TORCH_DTYPE = TPU_KV_CACHE_DTYPES
+
+_FP8_KV_CACHE_DTYPES = frozenset((torch.float8_e4m3fn, torch.float8_e5m2))
 
 
 def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
-    return cache_dtype_str.lower().strip() in frozenset(("fp8", "fp8_e4m3", "fp8_e5m2"))
+    # By resolved dtype, so a registered name stored as fp8 quantizes too.
+    dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(cache_dtype_str.lower().strip())
+    return dtype in _FP8_KV_CACHE_DTYPES
 
 
 def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
