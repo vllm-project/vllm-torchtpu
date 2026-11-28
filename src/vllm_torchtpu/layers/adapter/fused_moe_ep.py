@@ -184,6 +184,9 @@ def _build_op(
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
     agq_min_local_tokens=1024,
+    moonep_slots=0,
+    moonep_min_mig_frac=0.05,
+    moonep_min_local_tokens=256,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -209,6 +212,9 @@ def _build_op(
         w1_scales_expert_second_minor,
         w2_scales_expert_second_minor,
         agq_min_local_tokens,
+        moonep_slots,
+        float(moonep_min_mig_frac),
+        moonep_min_local_tokens,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -253,6 +259,9 @@ def _build_op(
             token_replica_groups=token_replica_groups,
             w1_scales_expert_second_minor=w1_scales_expert_second_minor,
             w2_scales_expert_second_minor=w2_scales_expert_second_minor,
+            moonep_slots=moonep_slots,
+            moonep_min_mig_frac=moonep_min_mig_frac,
+            moonep_min_local_tokens=moonep_min_local_tokens,
             **bias_kw,
             **routing_kw,
         )
@@ -897,8 +906,11 @@ def prebuild_fused_moe_ep(
     ep = mesh.shape[EP_AXIS_NAME]
     # Collective over the world, so before any refusal that could differ by
     # rank; cached after the first layer.
+    moonep_slots = envs.MOE_FUSED_EP_V2_MOONEP_SLOTS
     sorted_gather = (
-        ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
+        ep_sorted_gather_group()
+        if (envs.MOE_FUSED_EP_SORTED_GATHER and moonep_slots <= 0)
+        else None
     )
 
     gather_bytes = token_gather_smem_bytes(_TILE_M)
@@ -1020,12 +1032,15 @@ def prebuild_fused_moe_ep(
         w2_scales_expert_second_minor=weight_format == "fp4"
         and _scales_expert_second_minor(w2_scale),
         agq_min_local_tokens=envs.MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS,
+        moonep_slots=moonep_slots,
+        moonep_min_mig_frac=envs.MOE_FUSED_EP_V2_MOONEP_MIN_MIG_FRAC,
+        moonep_min_local_tokens=envs.MOE_FUSED_EP_V2_MOONEP_MIN_LOCAL_TOKENS,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s",
+        "token_replica_groups=%s moonep_slots=%d",
         hidden,
         inter,
         local_experts,
@@ -1042,6 +1057,7 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         routed_scale,
         token_replica_groups,
+        moonep_slots,
     )
     # Chunked collection stops applying the moment this arms: the fused call
     # returns before `apply_monolithic` reaches the chunked path, and the

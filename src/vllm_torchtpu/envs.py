@@ -117,6 +117,9 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS: int = 1024
+    MOE_FUSED_EP_V2_MOONEP_SLOTS: int = 0
+    MOE_FUSED_EP_V2_MOONEP_MIN_MIG_FRAC: float = 0.05
+    MOE_FUSED_EP_V2_MOONEP_MIN_LOCAL_TOKENS: int = 256
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -899,6 +902,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # Number of dynamic migrated expert slots per EP rank for TPU-MoonEP
+    # (0 disables MoonEP; 4 enables Chip-Aware 2-Round Overlapped RDMA).
+    "MOE_FUSED_EP_V2_MOONEP_SLOTS": lambda: int(
+        os.getenv("MOE_FUSED_EP_V2_MOONEP_SLOTS", "0")
+    ),
+    # Minimum per-expert overload fraction (of cap = t_local * topk) to trigger
+    # dynamic hot-expert migration in TPU-MoonEP.
+    "MOE_FUSED_EP_V2_MOONEP_MIN_MIG_FRAC": lambda: float(
+        os.getenv("MOE_FUSED_EP_V2_MOONEP_MIN_MIG_FRAC", "0.05")
+    ),
+    # Minimum local tokens per rank at which TPU-MoonEP activates inside
+    # fused_ep_moe_v2 (smaller decode buckets stay on stock fused_ep_moe_v2).
+    "MOE_FUSED_EP_V2_MOONEP_MIN_LOCAL_TOKENS": lambda: int(
+        os.getenv("MOE_FUSED_EP_V2_MOONEP_MIN_LOCAL_TOKENS", "256")
+    ),
     # A static expert placement for expert parallelism: a JSON table naming,
     # per MoE layer, which global experts each EP rank holds and in what slot
     # order -- a permutation, experts / ranks to a rank
