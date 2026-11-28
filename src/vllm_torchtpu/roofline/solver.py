@@ -18,10 +18,14 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypedDict, Unpack
 
 from .chips import TOPOLOGIES, ChipSpec, SliceTopology, topologies_for_chip
-from .collectives import submesh_for_group
+from .collectives import (
+    LinkCutLoad,
+    eval_link_subset_bound_s,
+    submesh_for_group,
+)
 from .constants import (
     CAUSAL_MIDPOINT_HALF,
     DEFAULT_HBM_RESERVE_GB,
@@ -33,7 +37,10 @@ from .constants import (
     MIN_DISAGG_INSTANCES,
     NO_FEASIBLE_LAYOUT_WARNING,
     SLO_VERDICT_ESTIMATE_MEETS,
+    SLO_VERDICT_RANK,
     SLO_VERDICT_RULED_OUT,
+    SLO_VERDICT_UNDECIDED,
+    UNDECIDED_SLO_WARNING,
     UNIT_GIGA,
     UNIT_MILLIS_PER_SECOND,
     UNKNOWN_THINK_TIME_WARNING,
@@ -48,6 +55,7 @@ from .memory import (
     kv_capacity_and_hit_rate,
 )
 from .modules import Dtypes, Parallel, StepShape
+from .occupancy import ExpertActivationModel
 from .schema import (
     FloorTimes,
     ParetoPoint,
@@ -59,12 +67,22 @@ from .schema import (
     SortBy,
     TrafficScenario,
     candidate_sort_key,
+    effective_slo_verdict,
 )
-from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_floor
+from .step import (
+    FloorOptions,
+    SpecShape,
+    StepFloor,
+    UnpaddedFloorOptions,
+    spec_cycle_floor,
+    step_floor,
+    unpadded_strict_resource_buckets,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from .constants import SloVerdict
     from .geometry import ModelGeometry
 
 EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
@@ -96,6 +114,18 @@ EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
         osl=1024,
         concurrencies=(1, 4, 8, 16, 32, 64, 128),
         prefix_hit_rate=0.92,
+        accept_len=3.0,
+        think_time_s=0.0,
+        kv_working_set_turns=1.0,
+        prefill_chunk=2048,
+        spec_tokens=3,
+    ),
+    "agentic-64k": TrafficScenario(
+        name="example:agentic-64k",
+        isl=65536,
+        osl=1024,
+        concurrencies=EXAMPLE_CONCURRENCIES,
+        prefix_hit_rate=0.88,
         accept_len=3.0,
         think_time_s=0.0,
         kv_working_set_turns=1.0,
@@ -196,6 +226,15 @@ class SolveOptions:
     prefill_topology: str | None = None
     decode_topology: str | None = None
     pd_ratio: tuple[int, int] | None = None
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
+
+    def __post_init__(self) -> None:
+        """Validate non-negative physical constraint overrides."""
+        if self.hbm_reserve_gb < 0.0:
+            msg = f"hbm_reserve_gb must be >= 0, got {self.hbm_reserve_gb}"
+            raise ValueError(msg)
 
 
 def _divisors(n: int) -> tuple[int, ...]:
@@ -419,8 +458,8 @@ def _pool_tie_key(pool: PoolMeshPlan | None) -> tuple[object, ...]:
 
 def _candidate_sort_key(
     point: ParetoPoint, sort_by: SortBy
-) -> tuple[bool, bool, float, float, int, str]:
-    """Delegate per-concurrency candidate ordering to shared schema sort key."""
+) -> tuple[int, float, float, float, int, str]:
+    """Delegate candidate ordering to the unified schema sort key."""
     return candidate_sort_key(point, sort_by)
 
 
@@ -715,6 +754,9 @@ class _SolveContext:
     prefill_topology: str | None = None
     decode_topology: str | None = None
     pd_ratio: tuple[int, int] | None = None
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
     enumerated: int = 0
     hbm_fit: int = 0
     decode_cache: dict[tuple[object, ...], StepFloor] = field(
@@ -726,6 +768,24 @@ class _SolveContext:
     step_cache: dict[tuple[object, ...], StepFloor] = field(
         default_factory=dict, compare=False, hash=False
     )
+    clamp_cache: dict[tuple[Parallel, int], tuple[int, HbmBreakdown] | None] = field(
+        default_factory=dict, compare=False, hash=False
+    )
+    kv_fit_cache: dict[tuple[Parallel, int, int, float], tuple[float, float]] = field(
+        default_factory=dict, compare=False, hash=False
+    )
+    prefill_unit_cap_cache: dict[tuple[str, Parallel], float] = field(
+        default_factory=dict, compare=False, hash=False
+    )
+    decode_unit_cap_cache: dict[tuple[str, Parallel, int], float] = field(
+        default_factory=dict, compare=False, hash=False
+    )
+    bound_decode_cache: dict[tuple[str, Parallel, int], StepFloor] = field(
+        default_factory=dict, compare=False, hash=False
+    )
+    pool_plan_cache: dict[tuple[str, int, str, Parallel, int | None], PoolMeshPlan] = (
+        field(default_factory=dict, compare=False, hash=False)
+    )
 
 
 @dataclass(frozen=True)
@@ -736,6 +796,7 @@ class _PrefillOption:
     parallel: Parallel
     ttft_ms: float
     floor_ttft_ms: float
+    envelope_ttft_ms: float
     rate_p: float
     hbm_bd: HbmBreakdown
     binding: str
@@ -743,6 +804,7 @@ class _PrefillOption:
     kv_bytes_per_tok: float = 0.0
     fixed_kv_per_seq_b: float = 0.0
     offload_b_per_core: float = 0.0
+    alt_sp: _PrefillOption | None = None
 
 
 @dataclass(frozen=True)
@@ -754,6 +816,7 @@ class _DisaggDecodeState:
     w_base_b: float
     b_hbm_max: int
     kv_bytes_per_tok: float
+    physical_batch_cap: int
     offload_b_per_core: float
     fixed_kv_per_seq_b: float = 0.0
     alt_sp: _DisaggDecodeState | None = None
@@ -766,6 +829,7 @@ class _MixedPointBounds:
     w_base_b: float
     kv_bytes_per_tok: float
     b_hbm_max: int
+    physical_batch_cap: int
     sf_ttft: StepFloor
     fixed_kv_per_seq_b: float = 0.0
 
@@ -840,9 +904,11 @@ def _is_strictly_better_point(
     incumbent: ParetoPoint,
     sort_by: SortBy,
 ) -> bool:
-    """Return True iff candidate strictly beats incumbent on SLO + primary metric."""
-    if candidate.slo_met != incumbent.slo_met:
-        return candidate.slo_met
+    """Return True if candidate strictly beats incumbent on verdict + primary metric."""
+    cand_rank = SLO_VERDICT_RANK[effective_slo_verdict(candidate)]
+    inc_rank = SLO_VERDICT_RANK[effective_slo_verdict(incumbent)]
+    if cand_rank != inc_rank:
+        return cand_rank > inc_rank
     cand_pri, cand_sec = (
         (candidate.est_interactivity_tok_s, candidate.token_throughput_per_chip)
         if sort_by == "interactivity"
@@ -856,6 +922,50 @@ def _is_strictly_better_point(
     if abs(cand_pri - inc_pri) > 1e-12 * max(1.0, abs(inc_pri)):
         return cand_pri > inc_pri
     return cand_sec > inc_sec + 1e-12 * max(1.0, abs(inc_sec))
+
+
+def _merge_collapsed_point_bounds(
+    chosen: ParetoPoint,
+    other: ParetoPoint,
+    scenario: TrafficScenario,
+    *,
+    use_envelope: bool,
+) -> ParetoPoint:
+    """Merge per-field strict bounds across HBM-fitting residual modes."""
+    merged_bound_tpot = min(chosen.bound_tpot_ms, other.bound_tpot_ms)
+    merged_bound_ttft = min(chosen.bound_ttft_ms, other.bound_ttft_ms)
+    merged_env_tpot = min(chosen.envelope_tpot_ms, other.envelope_tpot_ms)
+    merged_env_ttft = min(chosen.envelope_ttft_ms, other.envelope_ttft_ms)
+    merged_floor_tput = max(
+        chosen.floor_throughput_per_chip, other.floor_throughput_per_chip
+    )
+    merged_min_seqs = min(chosen.min_decode_seqs, other.min_decode_seqs)
+    merged_env_seqs = min(chosen.envelope_decode_seqs, other.envelope_decode_seqs)
+    merged_verdict = _resolve_slo_verdict(
+        scenario,
+        chosen.est_ttft_ms,
+        chosen.est_tpot_ms,
+        merged_env_ttft if use_envelope else merged_bound_ttft,
+        merged_env_tpot if use_envelope else merged_bound_tpot,
+    )
+    if (
+        effective_slo_verdict(chosen) == SLO_VERDICT_RULED_OUT
+        and effective_slo_verdict(other) == SLO_VERDICT_RULED_OUT
+    ):
+        merged_verdict = SLO_VERDICT_RULED_OUT
+    return replace(
+        chosen,
+        slo_met=merged_verdict == SLO_VERDICT_ESTIMATE_MEETS,
+        slo_verdict=merged_verdict,
+        bound_tpot_ms=merged_bound_tpot,
+        bound_ttft_ms=merged_bound_ttft,
+        envelope_tpot_ms=merged_env_tpot,
+        envelope_ttft_ms=merged_env_ttft,
+        floor_throughput_per_chip=merged_floor_tput,
+        min_decode_seqs=merged_min_seqs,
+        envelope_decode_seqs=merged_env_seqs,
+        decode_floor=_merge_floor_times_min(chosen.decode_floor, other.decode_floor),
+    )
 
 
 def _is_strictly_better_decode_record(
@@ -883,6 +993,775 @@ def _is_strictly_better_decode_record(
     return cand_sec > inc_sec + 1e-12 * max(1.0, abs(inc_sec))
 
 
+_FIXED_POINT_MAX_ITERS: Final[int] = 12
+_FIXED_POINT_TOL: Final[float] = 1e-6
+_RATE_FLOOR_EPS: Final[float] = 1e-9
+_CAP_DENOM_EPS: Final[float] = 1e-12
+
+
+def _within_slo_bounds(
+    scenario: TrafficScenario,
+    ttft_ms: float,
+    tpot_ms: float,
+) -> bool:
+    """Return True when both TTFT and TPOT stay within any configured SLOs."""
+    ttft_ok = scenario.ttft_slo_ms is None or ttft_ms <= scenario.ttft_slo_ms
+    tpot_ok = scenario.tpot_slo_ms is None or tpot_ms <= scenario.tpot_slo_ms
+    return ttft_ok and tpot_ok
+
+
+def _resolve_slo_verdict(
+    scenario: TrafficScenario,
+    est_ttft_ms: float,
+    est_tpot_ms: float,
+    bound_ttft_ms: float,
+    bound_tpot_ms: float,
+) -> SloVerdict:
+    """Classify lower-bound vs modeled-estimate SLO feasibility verdict."""
+    if not _within_slo_bounds(scenario, bound_ttft_ms, bound_tpot_ms):
+        return SLO_VERDICT_RULED_OUT
+    return (
+        SLO_VERDICT_ESTIMATE_MEETS
+        if _within_slo_bounds(scenario, est_ttft_ms, est_tpot_ms)
+        else SLO_VERDICT_UNDECIDED
+    )
+
+
+def _apply_capacity_ceiling_verdict(
+    scenario: TrafficScenario,
+    verdict: SloVerdict,
+    *,
+    concurrency: int = 0,
+    pool_capacity_req_s: float | None = None,
+) -> SloVerdict:
+    """Rule out closed-loop dual-SLO workloads exceeding pool capacity ceiling."""
+    if (
+        verdict == SLO_VERDICT_RULED_OUT
+        or pool_capacity_req_s is None
+        or concurrency <= 0
+        or scenario.think_time_s is None
+        or scenario.ttft_slo_ms is None
+        or scenario.tpot_slo_ms is None
+    ):
+        return verdict
+    x_min = float(concurrency) / max(
+        _RATE_FLOOR_EPS,
+        scenario.ttft_slo_ms / UNIT_MILLIS_PER_SECOND
+        + float(_decode_tokens(scenario.osl))
+        * (scenario.tpot_slo_ms / UNIT_MILLIS_PER_SECOND)
+        + scenario.think_time_s,
+    )
+    return SLO_VERDICT_RULED_OUT if pool_capacity_req_s < x_min else verdict
+
+
+class _BoundOpts(TypedDict, total=False):
+    """Keyword options for analytical physical bound entry points."""
+
+    prefill_par: Parallel | None
+    prefill_topo: SliceTopology | None
+    decode_par: Parallel | None
+    decode_topo: SliceTopology | None
+    replica_batch_cap: int
+    concurrency: int
+    prefill_instances: int
+    decode_instances: int
+    spec_k: int | None
+    activation_model: ExpertActivationModel | None
+    total_chips: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundDecodeInput:
+    """Pure physical parameters for evaluating decode step/spec floors."""
+
+    geometry: ModelGeometry
+    dtypes: Dtypes
+    chip: ChipSpec
+    scenario: TrafficScenario
+    decode_par: Parallel
+    decode_topo: SliceTopology
+    spec_k: int
+    activation_model: ExpertActivationModel
+    ctx_mid: int
+    effective_accept_len: float
+    shared_prefix_tokens: int = 0
+
+
+def _shared_prefix_tokens(scenario: TrafficScenario) -> int:
+    """Return rounded shared-prefix token count for one scenario."""
+    return round(scenario.prefix_hit_rate * scenario.isl)
+
+
+def _resolve_spec_k(
+    geometry: ModelGeometry,
+    scenario: TrafficScenario,
+    spec_k: int | None = None,
+) -> int:
+    """Resolve effective speculative draft step count without touching estimates."""
+    if spec_k is not None:
+        return spec_k
+    if scenario.spec_tokens is not None:
+        return scenario.spec_tokens
+    effective_accept_len = max(1.0, scenario.accept_len)
+    if effective_accept_len > 1.0:
+        return max(geometry.mtp_layers, math.ceil(effective_accept_len) - 1)
+    return 0
+
+
+def _steady_state_batch_cap_phys(
+    eval_context: _SolveContext,
+    parallel: Parallel,
+) -> int:
+    """Compute unrounded steady-state physical HBM batch cap with shared prefix."""
+    geometry = eval_context.geometry
+    dtypes = eval_context.dtypes
+    chip = eval_context.chip
+    scenario = eval_context.scenario
+    w_base_phys = hbm_breakdown_per_core_bytes(
+        geometry, dtypes, parallel, SeqKvLayout(0, 0), chip=chip
+    ).weights
+    state_phys = hbm_breakdown_per_core_bytes(
+        geometry, dtypes, parallel, SeqKvLayout(1, 0), chip=chip
+    ).state
+    h_rate = scenario.prefix_hit_rate
+    shared_toks = h_rate * float(scenario.isl)
+    avg_priv_toks = (1.0 - h_rate) * float(scenario.isl) + (
+        float(_decode_tokens(scenario.osl)) / 2.0
+    )
+    full_kv_per_tok, _ = kv_bytes_per_core_parts(
+        geometry, dtypes, parallel, 0, physical=False, chip=chip
+    )
+    if geometry.sliding_window > 0:
+        _, swa_per_tok = kv_bytes_per_core_parts(
+            geometry, dtypes, parallel, 1, physical=False, chip=chip
+        )
+        swa_win = float(geometry.sliding_window)
+        priv_swa = min(avg_priv_toks, swa_win)
+        shared_swa = max(0.0, min(shared_toks, swa_win - priv_swa))
+        shared_kv = shared_toks * full_kv_per_tok + shared_swa * swa_per_tok
+        avg_priv_kv = avg_priv_toks * full_kv_per_tok + priv_swa * swa_per_tok
+    else:
+        shared_kv = shared_toks * full_kv_per_tok
+        avg_priv_kv = avg_priv_toks * full_kv_per_tok
+    avail = eval_context.hbm_limit_b - w_base_phys - shared_kv
+    if avail < 0.0:
+        return 0
+    denom = state_phys + avg_priv_kv
+    if denom <= 0.0:
+        return max(1, eval_context.c_max)
+    return math.floor(avail / denom)
+
+
+def _eval_bound_decode_floor(bound_in: _BoundDecodeInput, batch: int) -> StepFloor:
+    """Evaluate a pure physical decode step floor without latency calibration."""
+    opts = FloorOptions(
+        dtypes=bound_in.dtypes,
+        topology=bound_in.decode_topo,
+        activation_model=bound_in.activation_model,
+    )
+    if bound_in.spec_k > 0:
+        return spec_cycle_floor(
+            bound_in.geometry,
+            bound_in.chip,
+            bound_in.decode_par,
+            SpecShape(
+                batch=batch,
+                context=bound_in.ctx_mid,
+                spec_k=bound_in.spec_k,
+                shared_prefix_tokens=bound_in.shared_prefix_tokens,
+            ),
+            opts,
+        )
+    return step_floor(
+        bound_in.geometry,
+        bound_in.chip,
+        bound_in.decode_par,
+        StepShape(
+            batch=batch,
+            context=bound_in.ctx_mid,
+            shared_prefix_tokens=bound_in.shared_prefix_tokens,
+        ),
+        opts,
+    )
+
+
+def _eval_pp_bound_decode_cycle(
+    bound_in: _BoundDecodeInput,
+    batch: int,
+) -> StepFloor:
+    """Evaluate PP-aware decode step floor: max(T_full(max(1, B//pp)), T_full(B)/pp)."""
+    eff_batch = max(1, batch)
+    pp = bound_in.decode_par.pp
+    if pp <= 1:
+        return _eval_bound_decode_floor(bound_in, eff_batch)
+    bound_pp1 = replace(bound_in, decode_par=replace(bound_in.decode_par, pp=1))
+    floor_mb = max(1, eff_batch // pp)
+    sf_mb = _eval_bound_decode_floor(bound_pp1, floor_mb)
+    sf_full = (
+        sf_mb
+        if floor_mb == eff_batch
+        else _eval_bound_decode_floor(bound_pp1, eff_batch)
+    )
+    pp_f = float(pp)
+    hbm_b = max(sf_mb.hbm_bound_s, sf_full.hbm_bound_s / pp_f)
+    mm_b = max(sf_mb.matmul_bound_s, sf_full.matmul_bound_s / pp_f)
+    vec_b = max(sf_mb.vector_bound_s, sf_full.vector_bound_s / pp_f)
+    coll_b = max(sf_mb.coll_bound_s, sf_full.coll_bound_s / pp_f)
+    hard_s = max(
+        sf_mb.hard_floor_s, sf_full.hard_floor_s / pp_f, hbm_b, mm_b, vec_b, coll_b
+    )
+    env_s = max(sf_mb.envelope_floor_s, sf_full.envelope_floor_s / pp_f)
+    return replace(
+        sf_mb,
+        hard_floor_s=hard_s,
+        envelope_floor_s=env_s,
+        hbm_bound_s=hbm_b,
+        matmul_bound_s=mm_b,
+        vector_bound_s=vec_b,
+        coll_bound_s=coll_b,
+    )
+
+
+def _eval_bound_prefill_floor(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    opts: _BoundOpts,
+) -> StepFloor:
+    """Evaluate a pure physical prefill step floor at scenario prefix_hit_rate."""
+    pref_par = opts.get("prefill_par")
+    pref_topo = opts.get("prefill_topo")
+    if pref_par is None or pref_topo is None:
+        msg = "prefill_par and prefill_topo are required for TTFT bounds"
+        raise ValueError(msg)
+    act_model = opts.get("activation_model") or ExpertActivationModel()
+    return step_floor(
+        geometry,
+        chip,
+        pref_par,
+        StepShape(
+            batch=0,
+            rows_per_seq=0,
+            context=0,
+            state_writes=0,
+            prefill_tokens=scenario.isl,
+            prefix_hit_rate=scenario.prefix_hit_rate,
+        ),
+        FloorOptions(
+            dtypes=dtypes,
+            topology=pref_topo,
+            activation_model=act_model,
+        ),
+    )
+
+
+def bound_ttft_ms(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    **opts: Unpack[_BoundOpts],
+) -> float:
+    """Return physical TTFT lower bound (ms) strictly at scenario prefix_hit_rate."""
+    floor_result = _eval_bound_prefill_floor(geometry, dtypes, chip, scenario, opts)
+    return floor_result.hard_floor_s * UNIT_MILLIS_PER_SECOND
+
+
+def envelope_ttft_ms(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    **opts: Unpack[_BoundOpts],
+) -> float:
+    """Return activation-envelope TTFT bound (ms) at scenario prefix_hit_rate."""
+    floor_result = _eval_bound_prefill_floor(geometry, dtypes, chip, scenario, opts)
+    return floor_result.envelope_floor_s * UNIT_MILLIS_PER_SECOND
+
+
+def _eval_unpadded_prefill_buckets(
+    bound_in: _BoundDecodeInput,
+    pref_par: Parallel,
+    pref_topo: SliceTopology,
+    *,
+    zero_weights: bool,
+) -> tuple[float, float, float, LinkCutLoad]:
+    """Return unpadded prefill (hbm, matmul, vector, LinkCutLoad) buckets."""
+    scenario = bound_in.scenario
+    if scenario.isl <= 0:
+        return (0.0, 0.0, 0.0, LinkCutLoad())
+    eff_isl_floor = max(
+        max(1, pref_par.pcp),
+        math.floor((1.0 - scenario.prefix_hit_rate) * float(scenario.isl)),
+    )
+    eff_hit_rate = (
+        max(0.0, float(scenario.isl - eff_isl_floor) / float(scenario.isl) - 1e-12)
+        if eff_isl_floor < scenario.isl
+        else 0.0
+    )
+    eval_par = replace(pref_par, pp=1) if pref_par.pp > 1 else pref_par
+    hbm_s, mm_s, vec_s, load = unpadded_strict_resource_buckets(
+        bound_in.geometry,
+        bound_in.chip,
+        eval_par,
+        StepShape(
+            batch=0,
+            rows_per_seq=1,
+            context=0,
+            prefill_tokens=scenario.isl,
+            prefix_hit_rate=eff_hit_rate,
+        ),
+        UnpaddedFloorOptions(
+            dtypes=bound_in.dtypes,
+            topology=pref_topo,
+            zero_weights=zero_weights,
+        ),
+    )
+    if pref_par.pp > 1:
+        inv_pp = 1.0 / float(pref_par.pp)
+        return (hbm_s * inv_pp, mm_s * inv_pp, vec_s * inv_pp, load.scaled(inv_pp))
+    return (hbm_s, mm_s, vec_s, load)
+
+
+def _eval_unpadded_decode_buckets(
+    bound_in: _BoundDecodeInput,
+    replica_batch_cap: int,
+) -> tuple[float, float, float, LinkCutLoad]:
+    """Return PP-aware unpadded decode (hbm, matmul, vector, LinkCutLoad) buckets."""
+    eff_batch = max(1, replica_batch_cap)
+    pp = bound_in.decode_par.pp
+    if pp <= 1:
+        return unpadded_strict_resource_buckets(
+            bound_in.geometry,
+            bound_in.chip,
+            bound_in.decode_par,
+            StepShape(
+                batch=eff_batch,
+                rows_per_seq=bound_in.spec_k + 1,
+                context=bound_in.ctx_mid,
+                state_writes=1,
+                shared_prefix_tokens=bound_in.shared_prefix_tokens,
+            ),
+            UnpaddedFloorOptions(
+                dtypes=bound_in.dtypes,
+                topology=bound_in.decode_topo,
+                spec_k=bound_in.spec_k,
+                zero_weights=False,
+            ),
+        )
+    par_pp1 = replace(bound_in.decode_par, pp=1)
+    floor_mb = max(1, eff_batch // pp)
+    opts = UnpaddedFloorOptions(
+        dtypes=bound_in.dtypes,
+        topology=bound_in.decode_topo,
+        spec_k=bound_in.spec_k,
+        zero_weights=False,
+    )
+    hbm_mb, mm_mb, vec_mb, load_mb = unpadded_strict_resource_buckets(
+        bound_in.geometry,
+        bound_in.chip,
+        par_pp1,
+        StepShape(
+            batch=floor_mb,
+            rows_per_seq=bound_in.spec_k + 1,
+            context=bound_in.ctx_mid,
+            state_writes=1,
+            shared_prefix_tokens=bound_in.shared_prefix_tokens,
+        ),
+        opts,
+    )
+    if floor_mb == eff_batch:
+        return (hbm_mb, mm_mb, vec_mb, load_mb)
+    hbm_f, mm_f, vec_f, load_f = unpadded_strict_resource_buckets(
+        bound_in.geometry,
+        bound_in.chip,
+        par_pp1,
+        StepShape(
+            batch=eff_batch,
+            rows_per_seq=bound_in.spec_k + 1,
+            context=bound_in.ctx_mid,
+            state_writes=1,
+            shared_prefix_tokens=bound_in.shared_prefix_tokens,
+        ),
+        opts,
+    )
+    inv_pp = 1.0 / float(pp)
+    scaled_load_f = load_f.scaled(inv_pp)
+    coll_mb = eval_link_subset_bound_s(load_mb, bound_in.chip, bound_in.decode_topo)
+    coll_f = eval_link_subset_bound_s(
+        scaled_load_f, bound_in.chip, bound_in.decode_topo
+    )
+    return (
+        max(hbm_mb, hbm_f * inv_pp),
+        max(mm_mb, mm_f * inv_pp),
+        max(vec_mb, vec_f * inv_pp),
+        scaled_load_f if coll_f > coll_mb else load_mb,
+    )
+
+
+def _mixed_capacity_work_bound(
+    bound_in: _BoundDecodeInput,
+    replica_batch_cap: int,
+) -> float:
+    """Return mixed-pool capacity ceiling (req/s) with link-axis cuts."""
+    dec_steps = _decode_steps_per_req(
+        bound_in.scenario.osl, bound_in.effective_accept_len
+    )
+    pre_hbm, pre_mm, pre_vec, pre_load = _eval_unpadded_prefill_buckets(
+        bound_in,
+        bound_in.decode_par,
+        bound_in.decode_topo,
+        zero_weights=True,
+    )
+    if dec_steps <= 0.0:
+        pre_coll = eval_link_subset_bound_s(
+            pre_load, bound_in.chip, bound_in.decode_topo
+        )
+        req_time_s = max(pre_hbm, pre_mm, pre_vec, pre_coll)
+        if req_time_s <= 0.0:
+            return math.inf
+        return float(max(1, bound_in.decode_par.dp)) / max(_CAP_DENOM_EPS, req_time_s)
+    dec_hbm, dec_mm, dec_vec, dec_load = _eval_unpadded_decode_buckets(
+        bound_in, replica_batch_cap
+    )
+    dec_scale = dec_steps / float(max(1, replica_batch_cap))
+    comb_load = pre_load.add(dec_load.scaled(dec_scale))
+    coll_req_s = eval_link_subset_bound_s(
+        comb_load, bound_in.chip, bound_in.decode_topo
+    )
+    req_time_s = max(
+        pre_hbm + dec_scale * dec_hbm,
+        pre_mm + dec_scale * dec_mm,
+        pre_vec + dec_scale * dec_vec,
+        coll_req_s,
+    )
+    return float(max(1, bound_in.decode_par.dp)) / max(_CAP_DENOM_EPS, req_time_s)
+
+
+def _disagg_capacity_work_bound(
+    bound_in: _BoundDecodeInput,
+    pref_par: Parallel,
+    pref_topo: SliceTopology,
+    ratio_cap: tuple[int, int, int],
+) -> float:
+    """Return disagg-pool capacity ceiling (req/s) across P and D pools."""
+    prefill_instances, decode_instances, replica_batch_cap = ratio_cap
+    dec_steps = _decode_steps_per_req(
+        bound_in.scenario.osl, bound_in.effective_accept_len
+    )
+    pre_hbm, pre_mm, pre_vec, pre_load = _eval_unpadded_prefill_buckets(
+        bound_in, pref_par, pref_topo, zero_weights=True
+    )
+    pre_coll = eval_link_subset_bound_s(pre_load, bound_in.chip, pref_topo)
+    pre_time = max(pre_hbm, pre_mm, pre_vec, pre_coll)
+    prefill_capacity_rate = (
+        float(max(1, prefill_instances * pref_par.dp)) / max(_CAP_DENOM_EPS, pre_time)
+        if pre_time > 0.0
+        else math.inf
+    )
+    if dec_steps <= 0.0:
+        return prefill_capacity_rate
+    dec_hbm, dec_mm, dec_vec, dec_load = _eval_unpadded_decode_buckets(
+        bound_in, replica_batch_cap
+    )
+    dec_coll = eval_link_subset_bound_s(dec_load, bound_in.chip, bound_in.decode_topo)
+    dec_scale = dec_steps / float(max(1, replica_batch_cap))
+    dec_time = dec_scale * max(dec_hbm, dec_mm, dec_vec, dec_coll)
+    decode_capacity_rate = float(
+        max(1, decode_instances * bound_in.decode_par.dp)
+    ) / max(_CAP_DENOM_EPS, dec_time)
+    return min(prefill_capacity_rate, decode_capacity_rate)
+
+
+def _context_to_bound_input(
+    eval_context: _SolveContext,
+    topology: SliceTopology,
+    parallel: Parallel,
+) -> _BoundDecodeInput:
+    """Extract pure physical bound input from a solver evaluation context."""
+    return _BoundDecodeInput(
+        geometry=eval_context.geometry,
+        dtypes=eval_context.dtypes,
+        chip=eval_context.chip,
+        scenario=eval_context.scenario,
+        decode_par=parallel,
+        decode_topo=topology,
+        spec_k=eval_context.spec_k,
+        activation_model=eval_context.activation_model,
+        ctx_mid=eval_context.ctx_mid,
+        effective_accept_len=eval_context.effective_accept_len,
+        shared_prefix_tokens=eval_context.shared_prefix_tokens,
+    )
+
+
+def _solve_fixed_point_residency(
+    bound_in: _BoundDecodeInput,
+    concurrency: int,
+    replica_batch_cap: int,
+    idp_val: int,
+    x_cap_eff: float,
+) -> tuple[float, StepFloor]:
+    """Run bottom-up fixed-point pure-decode hard_floor residency fixed-point loop."""
+    scenario = bound_in.scenario
+    ttft_slo_ms = scenario.ttft_slo_ms
+    think = scenario.think_time_s
+    dec_toks = float(_decode_tokens(scenario.osl))
+    if ttft_slo_ms is None or think is None or dec_toks <= 0.0:
+        return (1.0, _eval_pp_bound_decode_cycle(bound_in, 1))
+    ttft_upper_s = ttft_slo_ms / UNIT_MILLIS_PER_SECOND
+    max_cap_seqs = float(min(concurrency, replica_batch_cap * idp_val))
+    b_dec = 1.0
+    for _ in range(_FIXED_POINT_MAX_ITERS):
+        b_rep = max(1, min(replica_batch_cap, math.floor(b_dec / float(idp_val))))
+        decode_floor = _eval_pp_bound_decode_cycle(bound_in, b_rep)
+        t_dec_s = dec_toks * (decode_floor.hard_floor_s / bound_in.effective_accept_len)
+        x_rate = min(
+            x_cap_eff,
+            float(concurrency) / max(_RATE_FLOOR_EPS, ttft_upper_s + t_dec_s + think),
+        )
+        b_next = max(1.0, min(max_cap_seqs, x_rate * t_dec_s))
+        if abs(b_next - b_dec) <= _FIXED_POINT_TOL:
+            b_dec = b_next
+            break
+        b_dec = b_next
+    floor_b_replica = max(1, min(replica_batch_cap, math.floor(b_dec / float(idp_val))))
+    return (b_dec, _eval_pp_bound_decode_cycle(bound_in, floor_b_replica))
+
+
+def _build_bound_decode_input(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    opts: _BoundOpts,
+) -> tuple[_BoundDecodeInput, int]:
+    """Validate and construct physical decode input + effective b_cap_single."""
+    decode_par = opts.get("decode_par")
+    decode_topo = opts.get("decode_topo")
+    if decode_par is None or decode_topo is None:
+        msg = "decode_par and decode_topo are required for physical decode bounds"
+        raise ValueError(msg)
+    replica_batch_cap = max(1, opts.get("replica_batch_cap", 1))
+    spec_k = _resolve_spec_k(geometry, scenario, opts.get("spec_k"))
+    act_model = opts.get("activation_model") or ExpertActivationModel()
+    effective_accept_len = max(1.0, scenario.accept_len)
+    ctx_mid = scenario.isl + scenario.osl // 2
+    bound_in = _BoundDecodeInput(
+        geometry=geometry,
+        dtypes=dtypes,
+        chip=chip,
+        scenario=scenario,
+        decode_par=decode_par,
+        decode_topo=decode_topo,
+        spec_k=spec_k,
+        activation_model=act_model,
+        ctx_mid=ctx_mid,
+        effective_accept_len=effective_accept_len,
+        shared_prefix_tokens=_shared_prefix_tokens(scenario),
+    )
+    return (bound_in, replica_batch_cap)
+
+
+def _resolve_pool_capacity_context(
+    bound_in: _BoundDecodeInput,
+    replica_batch_cap: int,
+    opts: _BoundOpts,
+) -> tuple[float, Parallel, SliceTopology, int, int]:
+    """Return pool capacity bound, prefill pool, and instance counts."""
+    pref_par = opts.get("prefill_par")
+    pref_topo = opts.get("prefill_topo")
+    if pref_par is not None and pref_topo is not None:
+        prefill_instances = max(1, opts.get("prefill_instances", 1))
+        decode_instances = max(1, opts.get("decode_instances", 1))
+        capacity_rate_bound = _disagg_capacity_work_bound(
+            bound_in,
+            pref_par,
+            pref_topo,
+            (prefill_instances, decode_instances, replica_batch_cap),
+        )
+        return (
+            capacity_rate_bound,
+            pref_par,
+            pref_topo,
+            prefill_instances,
+            decode_instances,
+        )
+    return (
+        _mixed_capacity_work_bound(bound_in, replica_batch_cap),
+        bound_in.decode_par,
+        bound_in.decode_topo,
+        1,
+        1,
+    )
+
+
+def pool_capacity_bound(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    **opts: Unpack[_BoundOpts],
+) -> float:
+    """Return isolated unpadded physical pool request capacity ceiling (req/s)."""
+    bound_in, replica_batch_cap = _build_bound_decode_input(
+        geometry, dtypes, chip, scenario, opts
+    )
+    return _resolve_pool_capacity_context(bound_in, replica_batch_cap, opts)[0]
+
+
+def _resolve_residency_floor(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    opts: _BoundOpts,
+) -> tuple[_BoundDecodeInput, StepFloor]:
+    """Compute physical fixed-point decode step floor for mixed or disagg bounds."""
+    bound_in, replica_batch_cap = _build_bound_decode_input(
+        geometry, dtypes, chip, scenario, opts
+    )
+    concurrency = max(1, opts.get("concurrency", 1))
+    capacity_rate_bound, ttft_par, ttft_topo, prefill_instances, decode_instances = (
+        _resolve_pool_capacity_context(bound_in, replica_batch_cap, opts)
+    )
+    if opts.get("prefill_par") is not None and opts.get("prefill_topo") is not None:
+        b_ttft_ms = bound_ttft_ms(
+            geometry,
+            dtypes,
+            chip,
+            scenario,
+            prefill_par=ttft_par,
+            prefill_topo=ttft_topo,
+            activation_model=bound_in.activation_model,
+        )
+        rate_p_floor = float(max(1, prefill_instances * ttft_par.dp)) / max(
+            _RATE_FLOOR_EPS, b_ttft_ms / UNIT_MILLIS_PER_SECOND
+        )
+        capacity_rate_bound = min(capacity_rate_bound, rate_p_floor)
+    _, floor_result = _solve_fixed_point_residency(
+        bound_in,
+        concurrency,
+        replica_batch_cap,
+        max(1, decode_instances * bound_in.decode_par.dp),
+        capacity_rate_bound,
+    )
+    return (bound_in, floor_result)
+
+
+def bound_tpot_ms(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    **opts: Unpack[_BoundOpts],
+) -> float:
+    """Return physical TPOT lower bound (ms) under fixed-point residency."""
+    bound_in, floor_result = _resolve_residency_floor(
+        geometry, dtypes, chip, scenario, opts
+    )
+    return (
+        floor_result.hard_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / bound_in.effective_accept_len
+
+
+def envelope_tpot_ms(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    **opts: Unpack[_BoundOpts],
+) -> float:
+    """Return TTFT-SLO-conditional activation-envelope TPOT bound (ms).
+
+    The fixed-point residency lower bound assumes TTFT stays within
+    ``scenario.ttft_slo_ms``; modeled estimates that violate ``ttft_slo_ms``
+    can have lower residency and therefore lower ``est_tpot_ms``.
+    """
+    bound_in, floor_result = _resolve_residency_floor(
+        geometry, dtypes, chip, scenario, opts
+    )
+    return (
+        floor_result.envelope_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / bound_in.effective_accept_len
+
+
+def request_rate_bound(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    **opts: Unpack[_BoundOpts],
+) -> float:
+    """Return isolated physical request rate upper bound (req/s)."""
+    bound_in, replica_batch_cap = _build_bound_decode_input(
+        geometry, dtypes, chip, scenario, opts
+    )
+    concurrency = max(1, opts.get("concurrency", 1))
+    capacity_rate_bound, ttft_par, ttft_topo, _, _ = _resolve_pool_capacity_context(
+        bound_in, replica_batch_cap, opts
+    )
+    if scenario.think_time_s is None:
+        return capacity_rate_bound
+    b_ttft_s = (
+        bound_ttft_ms(
+            geometry,
+            dtypes,
+            chip,
+            scenario,
+            prefill_par=ttft_par,
+            prefill_topo=ttft_topo,
+            activation_model=bound_in.activation_model,
+        )
+        / UNIT_MILLIS_PER_SECOND
+    )
+    dec_toks = float(_decode_tokens(scenario.osl))
+    dec_b1_s = (
+        dec_toks
+        * (
+            _eval_pp_bound_decode_cycle(bound_in, 1).hard_floor_s
+            / bound_in.effective_accept_len
+        )
+        if dec_toks > 0.0
+        else 0.0
+    )
+    return min(
+        capacity_rate_bound,
+        float(concurrency)
+        / max(_RATE_FLOOR_EPS, b_ttft_s + dec_b1_s + scenario.think_time_s),
+    )
+
+
+def floor_throughput_per_chip(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    scenario: TrafficScenario,
+    **opts: Unpack[_BoundOpts],
+) -> float:
+    """Return isolated physical per-chip token throughput ceiling (tok/s/chip)."""
+    x_rate_bound = request_rate_bound(geometry, dtypes, chip, scenario, **opts)
+    total_chips = opts.get("total_chips")
+    if total_chips is None:
+        dec_topo = opts.get("decode_topo")
+        pref_topo = opts.get("prefill_topo")
+        if dec_topo is None:
+            msg = "decode_topo or total_chips is required"
+            raise ValueError(msg)
+        if opts.get("prefill_par") is not None and pref_topo is not None:
+            prefill_instances = max(1, opts.get("prefill_instances", 1))
+            decode_instances = max(1, opts.get("decode_instances", 1))
+            total_chips = (
+                prefill_instances * pref_topo.num_chips
+                + decode_instances * dec_topo.num_chips
+            )
+        else:
+            total_chips = dec_topo.num_chips
+    return (x_rate_bound * float(scenario.isl + scenario.osl)) / float(
+        max(1, total_chips)
+    )
+
+
 def _eval_decode_floor(
     eval_context: _SolveContext,
     topology: SliceTopology,
@@ -904,6 +1783,7 @@ def _eval_decode_floor(
         dtypes=eval_context.dtypes,
         collective_latency_s=eval_context.collective_latency_s,
         topology=topology,
+        activation_model=eval_context.activation_model,
     )
     if eval_context.spec_k > 0:
         result = spec_cycle_floor(
@@ -1013,69 +1893,6 @@ def _eval_pp_decode_cycle(
     return serial_cycle_s, hard_cycle_s, stage_floor.binding
 
 
-def _eval_pp_decode_floor_times(
-    eval_context: _SolveContext,
-    topology: SliceTopology,
-    parallel: Parallel,
-    local_batch: int,
-    shared_prefix_tokens: int | None = None,
-) -> tuple[float, float, str, FloorTimes]:
-    """Return (serial_cycle_s, hard_cycle_s, binding, FloorTimes) for decode."""
-    batch = max(1, local_batch)
-    pp = parallel.pp
-    if pp <= 1:
-        floor = _eval_decode_floor(
-            eval_context, topology, parallel, batch, shared_prefix_tokens
-        )
-        return (
-            floor.serial_estimate_s,
-            floor.hard_floor_s,
-            floor.binding,
-            _floor_times(floor),
-        )
-    serial_cycle_s, stage_floor, full_floor_mb, full_batch_floor = (
-        _eval_pp_decode_stages(
-            eval_context,
-            topology,
-            parallel,
-            batch,
-            shared_prefix_tokens,
-            need_hard_floor=True,
-        )
-    )
-    if full_floor_mb is None or full_batch_floor is None:
-        return (
-            serial_cycle_s,
-            stage_floor.hard_floor_s,
-            stage_floor.binding,
-            _floor_times(stage_floor),
-        )
-    pp_f = float(pp)
-    hbm_b_s = max(full_floor_mb.hbm_bound_s, full_batch_floor.hbm_bound_s / pp_f)
-    matmul_b_s = max(
-        full_floor_mb.matmul_bound_s, full_batch_floor.matmul_bound_s / pp_f
-    )
-    vector_b_s = max(
-        full_floor_mb.vector_bound_s, full_batch_floor.vector_bound_s / pp_f
-    )
-    coll_b_s = max(full_floor_mb.coll_bound_s, full_batch_floor.coll_bound_s / pp_f)
-    hard_cycle_s = max(hbm_b_s, matmul_b_s, vector_b_s, coll_b_s)
-    floor_times = FloorTimes(
-        hbm_ms=stage_floor.hbm_s * UNIT_MILLIS_PER_SECOND,
-        matmul_ms=stage_floor.matmul_s * UNIT_MILLIS_PER_SECOND,
-        ici_ms=stage_floor.ici_s * UNIT_MILLIS_PER_SECOND,
-        chain_ms=stage_floor.chain_s * UNIT_MILLIS_PER_SECOND,
-        hop_latency_ms=stage_floor.latency_assumed_s * UNIT_MILLIS_PER_SECOND,
-        hard_floor_ms=hard_cycle_s * UNIT_MILLIS_PER_SECOND,
-        binding=stage_floor.binding,
-        hbm_bound_ms=hbm_b_s * UNIT_MILLIS_PER_SECOND,
-        matmul_bound_ms=matmul_b_s * UNIT_MILLIS_PER_SECOND,
-        vector_bound_ms=vector_b_s * UNIT_MILLIS_PER_SECOND,
-        coll_bound_ms=coll_b_s * UNIT_MILLIS_PER_SECOND,
-    )
-    return serial_cycle_s, hard_cycle_s, stage_floor.binding, floor_times
-
-
 def _eval_cached_step_floor(
     eval_context: _SolveContext,
     topology: SliceTopology,
@@ -1096,6 +1913,7 @@ def _eval_cached_step_floor(
             dtypes=eval_context.dtypes,
             collective_latency_s=eval_context.collective_latency_s,
             topology=topology,
+            activation_model=eval_context.activation_model,
         ),
     )
     eval_context.step_cache[cache_key] = result
@@ -1177,6 +1995,7 @@ def _prefill_step_floor(
             dtypes=eval_context.dtypes,
             collective_latency_s=eval_context.collective_latency_s,
             topology=topology,
+            activation_model=eval_context.activation_model,
         ),
     )
     eval_context.prefill_cache[cache_key] = result
@@ -1232,8 +2051,7 @@ def _find_prefill_options(
         for base_parallel in _candidate_prefill_parallels(
             eval_context.geometry, topology
         ):
-            best_opt: _PrefillOption | None = None
-            min_mode_floor_ttft_ms = math.inf
+            fitting_opts: list[_PrefillOption] = []
             for parallel in _candidate_residual_parallels(
                 eval_context.geometry, base_parallel
             ):
@@ -1258,12 +2076,10 @@ def _find_prefill_options(
                 ttft_ms = (
                     prefill_floor.serial_estimate_s * pp_factor * UNIT_MILLIS_PER_SECOND
                 )
-                floor_ttft_ms = (
-                    prefill_floor.hard_floor_s * pp_factor * UNIT_MILLIS_PER_SECOND
-                )
-                min_mode_floor_ttft_ms = min(min_mode_floor_ttft_ms, floor_ttft_ms)
+                floor_ttft_ms = prefill_floor.hard_floor_s * UNIT_MILLIS_PER_SECOND
+                env_ttft_ms = prefill_floor.envelope_floor_s * UNIT_MILLIS_PER_SECOND
                 rate_p = float(max(1, parallel.dp)) / max(
-                    1e-9, prefill_floor.serial_estimate_s
+                    _RATE_FLOOR_EPS, prefill_floor.serial_estimate_s
                 )
                 w_base_p = hbm_footprint_per_core_bytes(
                     eval_context.geometry,
@@ -1280,26 +2096,39 @@ def _find_prefill_options(
                     physical=False,
                     chip=eval_context.chip,
                 )
-                cand_opt = _PrefillOption(
-                    topology=topology,
-                    parallel=parallel,
-                    ttft_ms=ttft_ms,
-                    floor_ttft_ms=floor_ttft_ms,
-                    rate_p=rate_p,
-                    hbm_bd=hbm_bd,
-                    binding=prefill_floor.binding,
-                    w_base_b=w_base_p,
-                    kv_bytes_per_tok=kv_b_p,
-                    fixed_kv_per_seq_b=fixed_kv_p,
-                    offload_b_per_core=offload_b_per_core,
+                fitting_opts.append(
+                    _PrefillOption(
+                        topology=topology,
+                        parallel=parallel,
+                        ttft_ms=ttft_ms,
+                        floor_ttft_ms=floor_ttft_ms,
+                        envelope_ttft_ms=env_ttft_ms,
+                        rate_p=rate_p,
+                        hbm_bd=hbm_bd,
+                        binding=prefill_floor.binding,
+                        w_base_b=w_base_p,
+                        kv_bytes_per_tok=kv_b_p,
+                        fixed_kv_per_seq_b=fixed_kv_p,
+                        offload_b_per_core=offload_b_per_core,
+                    )
                 )
-                if best_opt is None or cand_opt.ttft_ms < best_opt.ttft_ms - 1e-12:
-                    best_opt = cand_opt
-            if best_opt is None:
+            if not fitting_opts:
                 continue
+            best_opt = fitting_opts[0]
+            for cand_opt in fitting_opts[1:]:
+                if cand_opt.ttft_ms < best_opt.ttft_ms - 1e-12:
+                    best_opt = cand_opt
+            min_mode_floor_ttft_ms = min(opt.floor_ttft_ms for opt in fitting_opts)
+            min_mode_env_ttft_ms = min(opt.envelope_ttft_ms for opt in fitting_opts)
+            alt_opt = next((opt for opt in fitting_opts if opt is not best_opt), None)
             min_req_ttft_ms = min(min_req_ttft_ms, min_mode_floor_ttft_ms)
             prefill_options.append(
-                replace(best_opt, floor_ttft_ms=min_mode_floor_ttft_ms)
+                replace(
+                    best_opt,
+                    floor_ttft_ms=min_mode_floor_ttft_ms,
+                    envelope_ttft_ms=min_mode_env_ttft_ms,
+                    alt_sp=alt_opt,
+                )
             )
     return prefill_options, min_req_ttft_ms
 
@@ -1341,7 +2170,7 @@ def _eval_mixed_step_floors(
     parallel: Parallel,
     resident_batch: int,
     eff_hit_rate: float,
-) -> tuple[int, float, str, float, str, float, FloorTimes]:
+) -> tuple[int, float, str, float, str, float]:
     """Evaluate PP-aware decode and mixed-chunk serial times at effective hit rate."""
     eff_isl_c = max(1, math.ceil((1.0 - eff_hit_rate) * eval_context.scenario.isl))
     cached_prefix_c = max(0, eval_context.scenario.isl - eff_isl_c)
@@ -1356,14 +2185,13 @@ def _eval_mixed_step_floors(
     mix_pre_total = round(mix_span)
     mix_hit_rate = avg_prior / mix_span if mix_span > 0.0 else 0.0
     shared_tok = round(eff_hit_rate * eval_context.scenario.isl)
-    decode_serial_s, _, decode_binding, decode_floor_times = (
-        _eval_pp_decode_floor_times(
-            eval_context,
-            topology,
-            parallel,
-            resident_batch,
-            shared_tok,
-        )
+    decode_serial_s, _, decode_binding = _eval_pp_decode_cycle(
+        eval_context,
+        topology,
+        parallel,
+        resident_batch,
+        shared_tok,
+        need_hard_floor=False,
     )
     if eval_context.spec_k > 0:
         ver_only_serial_s, _ = _eval_pp_step_serial(
@@ -1404,7 +2232,6 @@ def _eval_mixed_step_floors(
         mix_verify_serial_s + draft_serial_s,
         mix_binding,
         mix_verify_serial_s,
-        decode_floor_times,
     )
 
 
@@ -1434,6 +2261,70 @@ def _eval_pure_chunk_step_floor(
             prefill_tokens=round(mix_span),
             prefix_hit_rate=avg_prior / mix_span if mix_span > 0.0 else 0.0,
         ),
+    )
+
+
+def _compute_mixed_bounds(
+    eval_context: _SolveContext,
+    topology: SliceTopology,
+    parallel: Parallel,
+    concurrency: int,
+    bounds: _MixedPointBounds,
+) -> tuple[float, float, float, StepFloor, float, float, float, float]:
+    """Compute mixed-pool capacity ceiling, floor throughput, and latency bounds."""
+    replica_batch_cap = max(1, bounds.physical_batch_cap)
+    bound_in = _context_to_bound_input(eval_context, topology, parallel)
+    capacity_rate_bound = _mixed_capacity_work_bound(bound_in, replica_batch_cap)
+    bound_ttft_val = bounds.sf_ttft.hard_floor_s * UNIT_MILLIS_PER_SECOND
+    envelope_ttft_val = bounds.sf_ttft.envelope_floor_s * UNIT_MILLIS_PER_SECOND
+    think_s = eval_context.scenario.think_time_s
+    if think_s is not None:
+        dec_toks = float(_decode_tokens(eval_context.scenario.osl))
+        dec_b1_s = (
+            dec_toks
+            * (
+                _eval_pp_bound_decode_cycle(bound_in, 1).hard_floor_s
+                / eval_context.effective_accept_len
+            )
+            if dec_toks > 0.0
+            else 0.0
+        )
+        request_rate_limit = min(
+            capacity_rate_bound,
+            float(concurrency)
+            / max(
+                _RATE_FLOOR_EPS,
+                bound_ttft_val / UNIT_MILLIS_PER_SECOND + dec_b1_s + think_s,
+            ),
+        )
+    else:
+        request_rate_limit = capacity_rate_bound
+    floor_tput = (
+        request_rate_limit
+        * float(eval_context.scenario.isl + eval_context.scenario.osl)
+    ) / float(topology.num_chips)
+    min_decode_seqs, bound_sf_dec = _solve_fixed_point_residency(
+        bound_in,
+        concurrency,
+        replica_batch_cap,
+        max(1, parallel.dp),
+        capacity_rate_bound,
+    )
+    bound_tpot_val = (
+        bound_sf_dec.hard_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / eval_context.effective_accept_len
+    envelope_tpot_val = (
+        bound_sf_dec.envelope_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / eval_context.effective_accept_len
+    return (
+        capacity_rate_bound,
+        floor_tput,
+        min_decode_seqs,
+        bound_sf_dec,
+        bound_tpot_val,
+        envelope_tpot_val,
+        bound_ttft_val,
+        envelope_ttft_val,
     )
 
 
@@ -1495,7 +2386,6 @@ def _evaluate_mixed_point(
         mix_serial_s,
         mix_binding,
         mix_verify_serial_s,
-        decode_floor_times,
     ) = _eval_mixed_step_floors(
         eval_context, topology, parallel, resident_batch, eff_hit_rate
     )
@@ -1533,7 +2423,7 @@ def _evaluate_mixed_point(
     total_req_work_s = float(resident_batch) * replica_req_time_s
     res_cap = float(resident_batch * max(1, parallel.dp))
     c_served = min(float(concurrency), res_cap)
-    server_cap_rate = res_cap / max(1e-9, total_req_work_s)
+    server_cap_rate = res_cap / max(_RATE_FLOOR_EPS, total_req_work_s)
     mix_step_wait_s = mix_verify_serial_s if concurrency > 1 else 0.0
     ttft_in_server_s = max(
         sf_ttft_c.serial_estimate_s * pp_factor + mix_step_wait_s,
@@ -1541,20 +2431,20 @@ def _evaluate_mixed_point(
     )
     service_time_final_s = ttft_in_server_s + dec_steps_per_req * effective_step_s
     think_s = eval_context.scenario.think_time_s
-    rate_req_s = (
-        min(
+    if think_s is not None:
+        rate_req_s = min(
             server_cap_rate,
-            float(concurrency) / max(1e-9, service_time_final_s + think_s),
+            float(concurrency) / max(_RATE_FLOOR_EPS, service_time_final_s + think_s),
         )
-        if think_s is not None and think_s > 0.0
-        else c_served / max(1e-9, total_req_work_s)
-    )
+    else:
+        rate_req_s = c_served / max(_RATE_FLOOR_EPS, total_req_work_s)
     est_tpot_ms = (
         effective_step_s * UNIT_MILLIS_PER_SECOND / eval_context.effective_accept_len
     )
     c_demand = min(float(concurrency), float(local_batch * max(1, parallel.dp)))
     queue_wait_s = (
-        max(0.0, (c_demand / max(1e-9, res_cap)) - 1.0) * service_time_final_s
+        max(0.0, (c_demand / max(_RATE_FLOOR_EPS, res_cap)) - 1.0)
+        * service_time_final_s
     )
     est_ttft_ms = (ttft_in_server_s + queue_wait_s) * UNIT_MILLIS_PER_SECOND
     interactivity = UNIT_MILLIS_PER_SECOND / max(1e-6, est_tpot_ms)
@@ -1564,12 +2454,29 @@ def _evaluate_mixed_point(
         * float(eval_context.scenario.isl + eval_context.scenario.osl)
         / float(topology.num_chips)
     )
-    slo_ok = (
-        eval_context.scenario.ttft_slo_ms is None
-        or est_ttft_ms <= eval_context.scenario.ttft_slo_ms
-    ) and (
-        eval_context.scenario.tpot_slo_ms is None
-        or est_tpot_ms <= eval_context.scenario.tpot_slo_ms
+    (
+        capacity_rate_bound,
+        floor_tput,
+        min_decode_seqs,
+        bound_sf_dec,
+        bound_tpot_val,
+        envelope_tpot_val,
+        bound_ttft_val,
+        envelope_ttft_val,
+    ) = _compute_mixed_bounds(eval_context, topology, parallel, concurrency, bounds)
+    use_env = eval_context.activation_model.prunes_on_envelope
+    verdict = _resolve_slo_verdict(
+        eval_context.scenario,
+        est_ttft_ms,
+        est_tpot_ms,
+        envelope_ttft_val if use_env else bound_ttft_val,
+        envelope_tpot_val if use_env else bound_tpot_val,
+    )
+    verdict = _apply_capacity_ceiling_verdict(
+        eval_context.scenario,
+        verdict,
+        concurrency=concurrency,
+        pool_capacity_req_s=capacity_rate_bound,
     )
     pool = _build_pool_mesh_plan(
         _PoolPlanInput(
@@ -1598,11 +2505,18 @@ def _evaluate_mixed_point(
         token_throughput_per_chip=tot_tput,
         p_mixed=p_mix,
         binding=binding,
-        slo_met=slo_ok,
-        slo_verdict=(SLO_VERDICT_ESTIMATE_MEETS if slo_ok else SLO_VERDICT_RULED_OUT),
-        decode_floor=decode_floor_times,
+        slo_met=verdict == SLO_VERDICT_ESTIMATE_MEETS,
+        bound_tpot_ms=bound_tpot_val,
+        bound_ttft_ms=bound_ttft_val,
+        slo_verdict=verdict,
+        decode_floor=_floor_times(bound_sf_dec),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=eff_hit_rate,
+        min_decode_seqs=min_decode_seqs,
+        floor_throughput_per_chip=floor_tput,
+        envelope_tpot_ms=envelope_tpot_val,
+        envelope_ttft_ms=envelope_ttft_val,
+        envelope_decode_seqs=min_decode_seqs,
     )
 
 
@@ -1690,14 +2604,12 @@ def _evaluate_mixed_candidates(
                     parallel,
                     eval_context.scenario.prefix_hit_rate,
                 )
-                pp_factor = 1.0 + float(parallel.pp - 1) / float(
-                    max(1, eval_context.n_chunks)
-                )
                 min_req_ttft_ms = min(
                     min_req_ttft_ms,
-                    prefill_step_floor.hard_floor_s
-                    * pp_factor
-                    * UNIT_MILLIS_PER_SECOND,
+                    prefill_step_floor.hard_floor_s * UNIT_MILLIS_PER_SECOND,
+                )
+                physical_batch_cap = max(
+                    b_hbm_max, _steady_state_batch_cap_phys(eval_context, parallel)
                 )
                 fitting_modes.append(
                     (
@@ -1706,6 +2618,7 @@ def _evaluate_mixed_candidates(
                             w_base_b=w_base_b,
                             kv_bytes_per_tok=kv_bytes_core,
                             b_hbm_max=b_hbm_max,
+                            physical_batch_cap=physical_batch_cap,
                             sf_ttft=prefill_step_floor,
                             fixed_kv_per_seq_b=fixed_kv_per_seq_b,
                         ),
@@ -1713,32 +2626,34 @@ def _evaluate_mixed_candidates(
                 )
             if not fitting_modes:
                 continue
+            use_env = eval_context.activation_model.prunes_on_envelope
             for concurrency in eval_context.scenario.concurrencies:
-                best_point: ParetoPoint | None = None
-                merged_floor: FloorTimes | None = None
+                mode_points: list[ParetoPoint] = []
                 for parallel, bounds in fitting_modes:
                     point = _evaluate_mixed_point(
                         eval_context, topology, parallel, concurrency, bounds
                     )
-                    if point is None:
-                        continue
-                    merged_floor = _merge_floor_times_min(
-                        merged_floor, point.decode_floor
-                    )
-                    if best_point is None or _is_strictly_better_point(
+                    if point is not None:
+                        mode_points.append(point)
+                if not mode_points:
+                    continue
+                best_point = mode_points[0]
+                for point in mode_points[1:]:
+                    if _is_strictly_better_point(
                         point, best_point, eval_context.sort_by
                     ):
                         best_point = point
-                if best_point is not None:
-                    eval_context.hbm_fit += 1
-                    candidates.append(
-                        replace(
-                            best_point,
-                            decode_floor=_merge_floor_times_min(
-                                best_point.decode_floor, merged_floor
-                            ),
+                merged_point = best_point
+                for other_point in mode_points:
+                    if other_point is not best_point:
+                        merged_point = _merge_collapsed_point_bounds(
+                            merged_point,
+                            other_point,
+                            eval_context.scenario,
+                            use_envelope=use_env,
                         )
-                    )
+                eval_context.hbm_fit += 1
+                candidates.append(merged_point)
     return candidates, min_c1_tpot_ms, min_req_ttft_ms
 
 
@@ -1942,6 +2857,10 @@ def _build_decode_pool_states(
                         w_base_b=w_base_d,
                         b_hbm_max=b_hbm_max_d,
                         kv_bytes_per_tok=kv_b_d,
+                        physical_batch_cap=max(
+                            b_hbm_max_d,
+                            _steady_state_batch_cap_phys(eval_context, par_d),
+                        ),
                         offload_b_per_core=offload_b,
                         fixed_kv_per_seq_b=fixed_kv_d,
                     )
@@ -1994,7 +2913,9 @@ def _compute_disagg_metrics(
         rate_d_cap = math.inf
         queue_wait_d_ms = 0.0
     else:
-        rate_d_cap = c_served_d / (dec_steps_per_req * max(1e-9, decode_serial_s))
+        rate_d_cap = c_served_d / (
+            dec_steps_per_req * max(_RATE_FLOOR_EPS, decode_serial_s)
+        )
         c_demand_d = min(
             float(target.concurrency),
             float(
@@ -2003,15 +2924,15 @@ def _compute_disagg_metrics(
             ),
         )
         queue_wait_d_ms = (
-            max(0.0, (c_demand_d / max(1e-9, res_cap_d)) - 1.0)
+            max(0.0, (c_demand_d / max(_RATE_FLOOR_EPS, res_cap_d)) - 1.0)
             * (dec_steps_per_req * decode_serial_s)
             * UNIT_MILLIS_PER_SECOND
         )
     prefill_rate = float(target.prefill_instances) * batch_stats.rate_p_eff
     think_s = eval_context.scenario.think_time_s
-    if think_s is not None and think_s > 0.0:
+    if think_s is not None:
         client_rate = float(target.concurrency) / max(
-            1e-9,
+            _RATE_FLOOR_EPS,
             batch_stats.ttft_eff_ms / UNIT_MILLIS_PER_SECOND
             + dec_steps_per_req * decode_serial_s
             + think_s,
@@ -2021,7 +2942,7 @@ def _compute_disagg_metrics(
         coupled_rate = min(prefill_rate, rate_d_cap)
     ll_ttft_s = max(
         0.0,
-        float(target.concurrency) / max(1e-9, coupled_rate)
+        float(target.concurrency) / max(_RATE_FLOOR_EPS, coupled_rate)
         - dec_steps_per_req * decode_serial_s
         - (think_s or 0.0),
     )
@@ -2119,6 +3040,64 @@ def _resolve_effective_prefill(
     return cached_p
 
 
+def _prefill_unit_capacity_rate(
+    eval_context: _SolveContext,
+    pref: _PrefillOption,
+) -> float:
+    """Return cached per-instance prefill capacity ceiling (req/s) across residual."""
+    cache_key = (pref.topology.name, pref.parallel)
+    cached = eval_context.prefill_unit_cap_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    bound_in = _context_to_bound_input(eval_context, pref.topology, pref.parallel)
+
+    def _one_rate(opt: _PrefillOption) -> float:
+        pre_hbm, pre_mm, pre_vec, pre_load = _eval_unpadded_prefill_buckets(
+            bound_in, opt.parallel, opt.topology, zero_weights=True
+        )
+        pre_coll = eval_link_subset_bound_s(pre_load, eval_context.chip, opt.topology)
+        pre_time = max(pre_hbm, pre_mm, pre_vec, pre_coll)
+        return (
+            float(max(1, opt.parallel.dp)) / max(_CAP_DENOM_EPS, pre_time)
+            if pre_time > 0.0
+            else math.inf
+        )
+
+    rate = _one_rate(pref)
+    if pref.alt_sp is not None:
+        rate = max(rate, _one_rate(pref.alt_sp))
+    eval_context.prefill_unit_cap_cache[cache_key] = rate
+    return rate
+
+
+def _decode_unit_capacity_rate(
+    eval_context: _SolveContext,
+    dec: _DisaggDecodeState,
+    replica_batch_cap: int,
+) -> float:
+    """Return cached per-instance decode capacity ceiling (req/s)."""
+    cache_key = (dec.topology.name, dec.parallel, replica_batch_cap)
+    cached = eval_context.decode_unit_cap_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    dec_steps = _decode_steps_per_req(
+        eval_context.scenario.osl, eval_context.effective_accept_len
+    )
+    if dec_steps <= 0.0:
+        eval_context.decode_unit_cap_cache[cache_key] = math.inf
+        return math.inf
+    bound_in = _context_to_bound_input(eval_context, dec.topology, dec.parallel)
+    dec_hbm, dec_mm, dec_vec, dec_load = _eval_unpadded_decode_buckets(
+        bound_in, replica_batch_cap
+    )
+    dec_coll = eval_link_subset_bound_s(dec_load, eval_context.chip, dec.topology)
+    dec_scale = dec_steps / float(max(1, replica_batch_cap))
+    dec_time = dec_scale * max(dec_hbm, dec_mm, dec_vec, dec_coll)
+    rate = float(max(1, dec.parallel.dp)) / max(_CAP_DENOM_EPS, dec_time)
+    eval_context.decode_unit_cap_cache[cache_key] = rate
+    return rate
+
+
 def _evaluate_single_disagg_pair(
     eval_context: _SolveContext,
     dec: _DisaggDecodeState,
@@ -2136,7 +3115,12 @@ def _evaluate_single_disagg_pair(
         return None
     local_batch = _solve_disagg_think_batch(eval_context, dec, pref, target)
     b_start = min(local_batch, dec.b_hbm_max)
-    clamped = _clamp_resident_batch(eval_context, dec.parallel, b_start)
+    clamp_key = (dec.parallel, b_start)
+    if clamp_key in eval_context.clamp_cache:
+        clamped = eval_context.clamp_cache[clamp_key]
+    else:
+        clamped = _clamp_resident_batch(eval_context, dec.parallel, b_start)
+        eval_context.clamp_cache[clamp_key] = clamped
     if clamped is None:
         return None
     resident_batch, hbm_bd = clamped
@@ -2146,61 +3130,82 @@ def _evaluate_single_disagg_pair(
             target.concurrency / max(1, target.decode_instances * dec.parallel.dp)
         ),
     )
-    cap_tok, eff_hit_decode = kv_capacity_and_hit_rate(
-        eval_context.geometry,
-        eval_context.dtypes,
+    dec_kv_key = (
         dec.parallel,
         resident_batch,
-        KvFitInput(
-            working_set_batch=working_set_decode,
-            ctx_full=eval_context.ctx_full,
-            hbm_limit_b=eval_context.hbm_limit_b,
-            w_base_b=dec.w_base_b,
-            b_kv_phys_core=dec.kv_bytes_per_tok,
-            offload_b_per_core=dec.offload_b_per_core,
-            prefix_hit_rate=eval_context.scenario.prefix_hit_rate,
-            kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
-            fixed_kv_per_seq_bytes=dec.fixed_kv_per_seq_b,
-        ),
-        chip=eval_context.chip,
+        working_set_decode,
+        dec.offload_b_per_core,
     )
+    cached_dec_kv = eval_context.kv_fit_cache.get(dec_kv_key)
+    if cached_dec_kv is not None:
+        cap_tok, eff_hit_decode = cached_dec_kv
+    else:
+        cap_tok, eff_hit_decode = kv_capacity_and_hit_rate(
+            eval_context.geometry,
+            eval_context.dtypes,
+            dec.parallel,
+            resident_batch,
+            KvFitInput(
+                working_set_batch=working_set_decode,
+                ctx_full=eval_context.ctx_full,
+                hbm_limit_b=eval_context.hbm_limit_b,
+                w_base_b=dec.w_base_b,
+                b_kv_phys_core=dec.kv_bytes_per_tok,
+                offload_b_per_core=dec.offload_b_per_core,
+                prefix_hit_rate=eval_context.scenario.prefix_hit_rate,
+                kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
+                fixed_kv_per_seq_bytes=dec.fixed_kv_per_seq_b,
+            ),
+            chip=eval_context.chip,
+        )
+        eval_context.kv_fit_cache[dec_kv_key] = (cap_tok, eff_hit_decode)
     working_set_prefill = max(
         1,
         math.ceil(
             target.concurrency / max(1, target.prefill_instances * pref.parallel.dp)
         ),
     )
-    _, eff_hit_prefill = kv_capacity_and_hit_rate(
-        eval_context.geometry,
-        eval_context.dtypes,
+    pref_kv_key = (
         pref.parallel,
         1,
-        KvFitInput(
-            working_set_batch=working_set_prefill,
-            ctx_full=eval_context.ctx_full,
-            hbm_limit_b=eval_context.hbm_limit_b,
-            w_base_b=pref.w_base_b,
-            b_kv_phys_core=pref.kv_bytes_per_tok,
-            offload_b_per_core=pref.offload_b_per_core,
-            prefix_hit_rate=eval_context.scenario.prefix_hit_rate,
-            kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
-            fixed_kv_per_seq_bytes=pref.fixed_kv_per_seq_b,
-        ),
-        chip=eval_context.chip,
+        working_set_prefill,
+        pref.offload_b_per_core,
     )
+    cached_pref_kv = eval_context.kv_fit_cache.get(pref_kv_key)
+    if cached_pref_kv is not None:
+        _, eff_hit_prefill = cached_pref_kv
+    else:
+        pref_cap_tok, eff_hit_prefill = kv_capacity_and_hit_rate(
+            eval_context.geometry,
+            eval_context.dtypes,
+            pref.parallel,
+            1,
+            KvFitInput(
+                working_set_batch=working_set_prefill,
+                ctx_full=eval_context.ctx_full,
+                hbm_limit_b=eval_context.hbm_limit_b,
+                w_base_b=pref.w_base_b,
+                b_kv_phys_core=pref.kv_bytes_per_tok,
+                offload_b_per_core=pref.offload_b_per_core,
+                prefix_hit_rate=eval_context.scenario.prefix_hit_rate,
+                kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
+                fixed_kv_per_seq_bytes=pref.fixed_kv_per_seq_b,
+            ),
+            chip=eval_context.chip,
+        )
+        eval_context.kv_fit_cache[pref_kv_key] = (pref_cap_tok, eff_hit_prefill)
     cap_tok_int = None if math.isinf(cap_tok) else int(cap_tok)
     ttft_eff_ms, rate_p_eff = _resolve_effective_prefill(
         eval_context, pref, eff_hit_prefill, cache
     )
     shared_tok = round(eff_hit_decode * eval_context.scenario.isl)
-    decode_serial_s, _, decode_binding, decode_floor_times = (
-        _eval_pp_decode_floor_times(
-            eval_context,
-            dec.topology,
-            dec.parallel,
-            resident_batch,
-            shared_tok,
-        )
+    decode_serial_s, _, decode_binding = _eval_pp_decode_cycle(
+        eval_context,
+        dec.topology,
+        dec.parallel,
+        resident_batch,
+        shared_tok,
+        need_hard_floor=False,
     )
     (
         est_ttft_d_ms,
@@ -2235,14 +3240,13 @@ def _evaluate_single_disagg_pair(
             ),
         )
         if rb_eff < resident_batch:
-            decode_serial_s, _, decode_binding, decode_floor_times = (
-                _eval_pp_decode_floor_times(
-                    eval_context,
-                    dec.topology,
-                    dec.parallel,
-                    rb_eff,
-                    shared_tok,
-                )
+            decode_serial_s, _, decode_binding = _eval_pp_decode_cycle(
+                eval_context,
+                dec.topology,
+                dec.parallel,
+                rb_eff,
+                shared_tok,
+                need_hard_floor=False,
             )
             (
                 est_ttft_d_ms,
@@ -2259,35 +3263,123 @@ def _evaluate_single_disagg_pair(
                 _DisaggBatchStats(resident_batch, local_batch, ttft_eff_ms, rate_p_eff),
                 decode_serial_s,
             )
-    slo_ok = (
-        eval_context.scenario.ttft_slo_ms is None
-        or est_ttft_d_ms <= eval_context.scenario.ttft_slo_ms
-    ) and (
-        eval_context.scenario.tpot_slo_ms is None
-        or est_tpot_ms <= eval_context.scenario.tpot_slo_ms
+    replica_batch_cap = max(1, dec.physical_batch_cap)
+    pref_cap_rate = float(target.prefill_instances) * _prefill_unit_capacity_rate(
+        eval_context, pref
     )
-    p_pool = _build_pool_mesh_plan(
-        _PoolPlanInput(
-            role="prefill",
-            instances=target.prefill_instances,
-            topology=pref.topology,
-            parallel=pref.parallel,
-            hbm_bd=pref.hbm_bd,
-            hbm_limit_gb=eval_context.hbm_limit_gb,
-            resident_batch_cap=None,
+    dec_cap_rate = float(target.decode_instances) * _decode_unit_capacity_rate(
+        eval_context, dec, replica_batch_cap
+    )
+    capacity_rate_bound = min(pref_cap_rate, dec_cap_rate)
+    bound_ttft_val = pref.floor_ttft_ms
+    envelope_ttft_val = pref.envelope_ttft_ms
+    b1_key = (dec.topology.name, dec.parallel, 1)
+    bound_sf_b1 = eval_context.bound_decode_cache.get(b1_key)
+    if bound_sf_b1 is None:
+        bound_in_init = _context_to_bound_input(
+            eval_context, dec.topology, dec.parallel
         )
-    )
-    d_pool = _build_pool_mesh_plan(
-        _PoolPlanInput(
-            role="decode",
-            instances=target.decode_instances,
-            topology=dec.topology,
-            parallel=dec.parallel,
-            hbm_bd=hbm_bd,
-            hbm_limit_gb=eval_context.hbm_limit_gb,
-            resident_batch_cap=resident_batch,
+        bound_sf_b1 = _eval_pp_bound_decode_cycle(bound_in_init, 1)
+        eval_context.bound_decode_cache[b1_key] = bound_sf_b1
+    think_s = eval_context.scenario.think_time_s
+    dec_toks = float(_decode_tokens(eval_context.scenario.osl))
+    if think_s is not None:
+        dec_b1_s = (
+            dec_toks * (bound_sf_b1.hard_floor_s / eval_context.effective_accept_len)
+            if dec_toks > 0.0
+            else 0.0
         )
+        request_rate_limit = min(
+            capacity_rate_bound,
+            float(target.concurrency)
+            / max(
+                _RATE_FLOOR_EPS,
+                bound_ttft_val / UNIT_MILLIS_PER_SECOND + dec_b1_s + think_s,
+            ),
+        )
+    else:
+        request_rate_limit = capacity_rate_bound
+    floor_tput = (
+        request_rate_limit
+        * float(eval_context.scenario.isl + eval_context.scenario.osl)
+    ) / float(target.total_chips)
+    if eval_context.scenario.ttft_slo_ms is None or think_s is None or dec_toks <= 0.0:
+        min_decode_seqs = 1.0
+        bound_sf_d = bound_sf_b1
+    else:
+        bound_in = _context_to_bound_input(eval_context, dec.topology, dec.parallel)
+        rate_p_floor = float(max(1, target.prefill_instances * pref.parallel.dp)) / max(
+            _RATE_FLOOR_EPS, bound_ttft_val / UNIT_MILLIS_PER_SECOND
+        )
+        min_decode_seqs, bound_sf_d = _solve_fixed_point_residency(
+            bound_in,
+            target.concurrency,
+            replica_batch_cap,
+            max(1, target.decode_instances * dec.parallel.dp),
+            min(capacity_rate_bound, rate_p_floor),
+        )
+    bound_tpot_val = (
+        bound_sf_d.hard_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / eval_context.effective_accept_len
+    envelope_tpot_val = (
+        bound_sf_d.envelope_floor_s * UNIT_MILLIS_PER_SECOND
+    ) / eval_context.effective_accept_len
+    use_env = eval_context.activation_model.prunes_on_envelope
+    verdict = _resolve_slo_verdict(
+        eval_context.scenario,
+        est_ttft_d_ms,
+        est_tpot_ms,
+        envelope_ttft_val if use_env else bound_ttft_val,
+        envelope_tpot_val if use_env else bound_tpot_val,
     )
+    verdict = _apply_capacity_ceiling_verdict(
+        eval_context.scenario,
+        verdict,
+        concurrency=target.concurrency,
+        pool_capacity_req_s=capacity_rate_bound,
+    )
+    p_pool_key = (
+        "prefill",
+        target.prefill_instances,
+        pref.topology.name,
+        pref.parallel,
+        None,
+    )
+    p_pool = eval_context.pool_plan_cache.get(p_pool_key)
+    if p_pool is None:
+        p_pool = _build_pool_mesh_plan(
+            _PoolPlanInput(
+                role="prefill",
+                instances=target.prefill_instances,
+                topology=pref.topology,
+                parallel=pref.parallel,
+                hbm_bd=pref.hbm_bd,
+                hbm_limit_gb=eval_context.hbm_limit_gb,
+                resident_batch_cap=None,
+            )
+        )
+        eval_context.pool_plan_cache[p_pool_key] = p_pool
+    d_pool_key = (
+        "decode",
+        target.decode_instances,
+        dec.topology.name,
+        dec.parallel,
+        resident_batch,
+    )
+    d_pool = eval_context.pool_plan_cache.get(d_pool_key)
+    if d_pool is None:
+        d_pool = _build_pool_mesh_plan(
+            _PoolPlanInput(
+                role="decode",
+                instances=target.decode_instances,
+                topology=dec.topology,
+                parallel=dec.parallel,
+                hbm_bd=hbm_bd,
+                hbm_limit_gb=eval_context.hbm_limit_gb,
+                resident_batch_cap=resident_batch,
+            )
+        )
+        eval_context.pool_plan_cache[d_pool_key] = d_pool
     return ParetoPoint(
         mode="disagg",
         concurrency=target.concurrency,
@@ -2301,11 +3393,18 @@ def _evaluate_single_disagg_pair(
         token_throughput_per_chip=tot_tput,
         p_mixed=0.0,
         binding=decode_binding,
-        slo_met=slo_ok,
-        slo_verdict=(SLO_VERDICT_ESTIMATE_MEETS if slo_ok else SLO_VERDICT_RULED_OUT),
-        decode_floor=decode_floor_times,
+        slo_met=verdict == SLO_VERDICT_ESTIMATE_MEETS,
+        bound_tpot_ms=bound_tpot_val,
+        bound_ttft_ms=bound_ttft_val,
+        slo_verdict=verdict,
+        decode_floor=_floor_times(bound_sf_d),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=eff_hit_prefill,
+        min_decode_seqs=min_decode_seqs,
+        floor_throughput_per_chip=floor_tput,
+        envelope_tpot_ms=envelope_tpot_val,
+        envelope_ttft_ms=envelope_ttft_val,
+        envelope_decode_seqs=min_decode_seqs,
     )
 
 
@@ -2339,9 +3438,11 @@ def _evaluate_disagg_instance_pair(
         else rep_point
     )
     other = rep_point if chosen is sp_point else sp_point
-    return replace(
+    return _merge_collapsed_point_bounds(
         chosen,
-        decode_floor=_merge_floor_times_min(chosen.decode_floor, other.decode_floor),
+        other,
+        eval_context.scenario,
+        use_envelope=eval_context.activation_model.prunes_on_envelope,
     )
 
 
@@ -2366,7 +3467,8 @@ def _search_disagg_instance_ratios(
         eval_context, dec.topology, dec.parallel, b_one, need_hard_floor=False
     )
     rate_d_one = (
-        float(concurrency) / (dec_steps_per_req * max(1e-9, dec_one_serial_s))
+        float(concurrency)
+        / (dec_steps_per_req * max(_RATE_FLOOR_EPS, dec_one_serial_s))
         if dec_steps_per_req > 0.0
         else math.inf
     )
@@ -2703,15 +3805,7 @@ def solve_serving_plan(
     topos = _resolve_solve_topologies(eff_opts, chip=chip)
     hbm_limit_b = max(0.0, float(chip.hbm_bytes) - eff_opts.hbm_reserve_gb * UNIT_GIGA)
     effective_accept_len = max(1.0, scenario.accept_len)
-    spec_k = (
-        scenario.spec_tokens
-        if scenario.spec_tokens is not None
-        else (
-            max(geometry.mtp_layers, math.ceil(effective_accept_len) - 1)
-            if effective_accept_len > 1.0
-            else 0
-        )
-    )
+    spec_k = _resolve_spec_k(geometry, scenario)
     ctx_full = scenario.isl + scenario.osl
     eff_isl = max(1, math.ceil((1.0 - scenario.prefix_hit_rate) * scenario.isl))
     n_chunks = max(1, math.ceil(eff_isl / max(1, scenario.prefill_chunk)))
@@ -2735,12 +3829,13 @@ def solve_serving_plan(
         eff_isl=eff_isl,
         n_chunks=n_chunks,
         c_max=max(scenario.concurrencies),
-        shared_prefix_tokens=round(scenario.prefix_hit_rate * scenario.isl),
+        shared_prefix_tokens=_shared_prefix_tokens(scenario),
         collective_latency_s=eff_opts.collective_latency_s,
         sort_by=eff_opts.sort_by,
         prefill_topology=eff_opts.prefill_topology,
         decode_topology=eff_opts.decode_topology,
         pd_ratio=eff_opts.pd_ratio,
+        activation_model=eff_opts.activation_model,
     )
     core_grid = _count_core_grid(eval_context, topos, include_pairs=should_eval_pairs)
     eval_context.enumerated += _count_disagg_enumerated(
@@ -2797,14 +3892,37 @@ def solve_serving_plan(
             eff_opts.mode in ("auto", "disagg") and not should_eval_pairs
         ),
     )
-    slo_met_candidates = [point for point in ordered_candidates if point.slo_met]
+    meets_cands = [
+        point
+        for point in ordered_candidates
+        if point.slo_verdict == SLO_VERDICT_ESTIMATE_MEETS
+    ]
+    not_ruled_cands = [
+        point
+        for point in ordered_candidates
+        if point.slo_verdict != SLO_VERDICT_RULED_OUT
+    ]
+    rec_pool = meets_cands or not_ruled_cands
     recommended = (
         min(
-            slo_met_candidates,
+            rec_pool,
             key=lambda point: _candidate_sort_key(point, eff_opts.sort_by),
         )
-        if slo_met_candidates
+        if rec_pool
         else None
+    )
+    warn_list = list(warnings)
+    if recommended is not None and recommended.slo_verdict == SLO_VERDICT_UNDECIDED:
+        warn_list.append(UNDECIDED_SLO_WARNING)
+    warnings = tuple(warn_list)
+    not_ruled_out_count = sum(
+        1 for point in all_candidates if point.slo_verdict != SLO_VERDICT_RULED_OUT
+    )
+    env_feasible_count = sum(
+        1
+        for point in all_candidates
+        if point.slo_verdict != SLO_VERDICT_RULED_OUT
+        and _within_slo_bounds(scenario, point.envelope_ttft_ms, point.envelope_tpot_ms)
     )
     search_stats = SearchStats(
         enumerated=eval_context.enumerated,
@@ -2812,6 +3930,8 @@ def solve_serving_plan(
         slo_met=sum(1 for point in all_candidates if point.slo_met),
         frontier=len(frontier),
         core_grid=max(core_grid, eval_context.enumerated),
+        not_ruled_out=not_ruled_out_count,
+        envelope_feasible=env_feasible_count,
     )
     budget_val = (
         eff_max_chips
@@ -2837,6 +3957,8 @@ def solve_serving_plan(
         hbm_reserve_gb=eff_opts.hbm_reserve_gb,
         collective_latency_s=eff_opts.collective_latency_s,
         spec_k=spec_k,
+        spec_tokens=scenario.spec_tokens or 0,
+        mtp_layers=geometry.mtp_layers,
         sort_by=eff_opts.sort_by,
         model_id=geometry.model_id,
         search=search_stats,
@@ -2845,6 +3967,12 @@ def solve_serving_plan(
         budget_source=budget_source,
         max_instances=eff_opts.max_instances,
         pins=pins,
+        activation_model=eff_opts.activation_model,
+        ruled_out_candidates=tuple(
+            point
+            for point in all_candidates
+            if point.slo_verdict == SLO_VERDICT_RULED_OUT
+        ),
     )
 
 

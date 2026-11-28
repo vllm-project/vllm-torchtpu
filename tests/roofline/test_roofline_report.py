@@ -769,6 +769,10 @@ def test_report_slo_unmet_and_undecided_verdict_rendering(
     assert '<div class="alert-box alert-warning">' in html_unmet
     assert "recommended layout is infeasible" in html_unmet
 
+    # Real-solver floor_throughput_per_chip ceiling renders in the envelope & explorer.
+    assert sample_payload["recommended"]["floor_throughput_per_chip"] > 0.0
+    assert "Max Ceiling Tput" in html_ok
+
     payload_undecided: dict[str, object] = copy.deepcopy(dict(sample_payload))
     rec_undec = dict(sample_payload["recommended"])
     rec_undec["slo_met"] = False
@@ -777,6 +781,7 @@ def test_report_slo_unmet_and_undecided_verdict_rendering(
     payload_undecided["warnings"] = []
     html_undec = render_html(payload_undecided)
     assert "UNDECIDED" in html_undec
+    assert "INFEASIBLE" not in html_undec
     assert "recommended layout is infeasible" not in html_undec
 
 

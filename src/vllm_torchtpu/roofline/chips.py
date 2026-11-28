@@ -50,6 +50,7 @@ from .constants import (
     MXU_M_TILE_BRACKET,
     PCIE_BRACKET_BW,
     PERCENT_SCALE,
+    SOLVER_ASSUMPTIONS,
     SUBCHANNEL_BLOCK_K_FLOOR,
     TOPOLOGY_AXES,
     TPU7X_FP8_FLOPS_PER_CORE_BRACKET,
@@ -57,6 +58,7 @@ from .constants import (
     UNIT_GIGA,
     UNIT_KILO,
     UNIT_MEGA,
+    UNIT_MICRO,
     UNIT_MILLI,
     UNIT_TERA,
     VALID_CHIP_PROVENANCE,
@@ -1496,3 +1498,26 @@ def load_chip_spec(
         raw, chip.cores_per_chip, base_name, chip.min_torus_dim
     )
     return chip, topologies
+
+
+def get_solver_assumptions(
+    chip: ChipSpec | None = None,
+) -> list[dict[str, object]]:
+    """Return a fresh list of structured physics solver assumption entries."""
+    active_chip = chip if chip is not None else CHIPS["tpu7x"]
+    rows = [dict(entry) for entry in SOLVER_ASSUMPTIONS]
+    rows.append(
+        {
+            "name": "ici_hop_latency_us",
+            "flag": "--chip-spec",
+            "kind": "fact",
+            "value": active_chip.ici_hop_latency_s / UNIT_MICRO,
+            "unit": "us",
+            "description": (
+                "Per-hop ICI routing latency from the active chip spec "
+                "(applied to collective hop estimates)."
+            ),
+            "source": "chips",
+        }
+    )
+    return rows

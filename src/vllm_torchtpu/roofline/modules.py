@@ -346,7 +346,7 @@ def _route_matmul_flops(
 
 
 def _subchannel_scale_vector_flops(
-    rows: int,
+    rows: float,
     weight_elems: float,
     weight_bytes: float,
     weight_block_size: tuple[int, int] = (1, 1),
@@ -460,6 +460,7 @@ class _StepContext:
     activation_model: ExpertActivationModel = field(
         default_factory=ExpertActivationModel
     )
+    unpadded_linear: bool = False
     chip: ChipSpec = field(default_factory=lambda: CHIPS["tpu7x"])
 
 
@@ -2211,7 +2212,76 @@ class _RoutedMoeLayout:
     routed_act_elems: float
     routed_act_elems_min: float
     routed_rows: int
-    sh_rows: int
+    sh_rows: int | float
+
+
+def _routed_moe_min_elems(
+    geometry: ModelGeometry,
+    parallel: Parallel,
+    n_m_eff: float,
+    *,
+    has_rows: bool,
+) -> tuple[float, float, float]:
+    """Compute (min_active_experts, routed_unit, routed_elems_min) for routed MoE."""
+    tp = parallel.tp
+    ep_ranks = (parallel.ep if parallel.ep > 1 else tp) if parallel.moe == "ep" else 1
+    if parallel.moe == "ep":
+        min_active_experts = (
+            float(math.ceil(min(geometry.num_experts, geometry.top_k) / ep_ranks))
+            if has_rows
+            else 0.0
+        )
+        tp_sub = max(1, tp // max(1, ep_ranks)) if ep_ranks < tp else 1
+        width_exact = float(geometry.moe_inter) / float(tp_sub)
+    else:
+        min_active_experts = (
+            float(min(geometry.num_experts, geometry.top_k)) if has_rows else 0.0
+        )
+        width_exact = float(geometry.moe_inter) / float(max(1, tp))
+    expert_hidden = (
+        geometry.routed_expert_hidden
+        if geometry.routed_expert_hidden > 0
+        else geometry.hidden
+    )
+    routed_unit = (
+        float(n_m_eff * geometry.ffn_num_matrices * expert_hidden) * width_exact
+    )
+    return min_active_experts, routed_unit, min_active_experts * routed_unit
+
+
+def routed_moe_min_unpack_vector_flops(
+    geometry: ModelGeometry,
+    parallel: Parallel,
+    dtypes: Dtypes,
+    *,
+    chip: ChipSpec | None = None,
+    layer_scale: float = 1.0,
+    active_rows: int = 1,
+) -> float:
+    """Return strict routed-MoE weight-unpack vector FLOPs from one shared formula."""
+    if dtypes.w_expert >= FP8_BYTES or geometry.num_experts <= 0 or active_rows <= 0:
+        return 0.0
+    num_moe_layers = layer_ffn_kinds(geometry).count("moe")
+    if num_moe_layers <= 0:
+        return 0.0
+    pp_s = (
+        float(math.ceil(geometry.num_layers / max(1, parallel.pp)))
+        / float(geometry.num_layers)
+        if geometry.num_layers > 0 and parallel.pp > 1
+        else 1.0
+    )
+    n_m_eff = float(num_moe_layers) * pp_s * layer_scale
+    _, _, routed_elems_min = _routed_moe_min_elems(
+        geometry, parallel, n_m_eff, has_rows=active_rows > 0
+    )
+    unpack_vector = _sub_byte_unpack_vector_flops(
+        routed_elems_min,
+        dtypes.w_expert,
+        chip=chip,
+        weight_dtype=dtypes.w_expert_dtype,
+        act=dtypes.act,
+    )
+    return _strict_sub_byte_unpack_vector_flops(unpack_vector)
 
 
 def _routed_moe_layout(
@@ -2236,21 +2306,11 @@ def _routed_moe_layout(
         active_experts = ep_busiest_experts(
             geometry.num_experts, geometry.top_k, global_rows, ep_ranks
         )
-        min_active_experts = (
-            float(math.ceil(min(geometry.num_experts, geometry.top_k) / ep_ranks))
-            if global_rows > 0
-            else 0.0
-        )
         tp_sub = max(1, tp // max(1, ep_ranks)) if ep_ranks < tp else 1
         width_exact = float(geometry.moe_inter) / float(tp_sub)
     else:
         active_experts = experts_touched(
             geometry.num_experts, geometry.top_k, eval_context.rows
-        )
-        min_active_experts = (
-            float(min(geometry.num_experts, geometry.top_k))
-            if eval_context.rows > 0
-            else 0.0
         )
         width_exact = float(geometry.moe_inter) / float(max(1, tp))
     width = math.ceil(width_exact)
@@ -2260,9 +2320,11 @@ def _routed_moe_layout(
         else geometry.hidden
     )
     ffn_mats = geometry.ffn_num_matrices
-    routed_unit = float(n_m_eff * ffn_mats * expert_hidden) * width_exact
+    has_rows = (global_rows > 0) if parallel.moe == "ep" else (eval_context.rows > 0)
+    min_active_experts, routed_unit, routed_elems_min = _routed_moe_min_elems(
+        geometry, parallel, n_m_eff, has_rows=has_rows
+    )
     routed_elems = active_experts * routed_unit
-    routed_elems_min = min_active_experts * routed_unit
     shared_tp_width = (
         max(1, geometry.shared_inter // tp) if geometry.shared_inter > 0 else 0
     )
@@ -2319,10 +2381,14 @@ def _routed_moe_layout(
         * (geometry.moe_inter / eff_moe_div)
     )
     routed_rows = global_rows if is_ep else eval_context.rows
-    sh_rows = (
-        math.ceil(eval_context.rows / tp)
-        if parallel.residual == "sp"
-        else eval_context.rows
+    sh_rows: int | float = (
+        float(eval_context.rows) / float(tp)
+        if (eval_context.unpadded_linear and parallel.residual == "sp")
+        else (
+            math.ceil(eval_context.rows / tp)
+            if parallel.residual == "sp"
+            else eval_context.rows
+        )
     )
     return _RoutedMoeLayout(
         tp=tp,
@@ -2892,7 +2958,7 @@ def _compute_lm_head_cost(
     sampled_rows = (
         eval_context.decode_rows
         if eval_context.decode_rows > 0
-        else max(1, eval_context.batch)
+        else (0 if eval_context.rows == 0 else max(1, eval_context.batch))
     )
     # Last pipeline stage holds lm_head whole (sharded only across TP).
     lm_elems = float(geometry.vocab * geometry.hidden // tp)
@@ -2939,6 +3005,7 @@ class PassCostOptions(TypedDict, total=False):
     mxu_lhs_rows_fp8: int | None
     fp8_to_bf16_ratio: float | None
     activation_model: ExpertActivationModel
+    unpadded_linear: bool
     chip: ChipSpec | None
 
 
@@ -2967,6 +3034,7 @@ def pass_costs(
     )
     fp8_to_bf16_ratio = default_fp8_ratio if raw_fp8_ratio is None else raw_fp8_ratio
     activation_model = options.get("activation_model", _DEFAULT_ACTIVATION_MODEL)
+    unpadded_linear = options.get("unpadded_linear", False)
     eff_ranks = (
         parallel.ranks_per_chip
         if parallel.ranks_per_chip is not None
@@ -2986,14 +3054,16 @@ def pass_costs(
         else 1.0
     )
     decode_rows = shape.batch * shape.rows_per_seq
+    raw_uncached = (
+        shape.prefill_tokens
+        * max(0.0, 1.0 - shape.prefix_hit_rate)
+        / max(1, eff_parallel.pcp)
+    )
     eff_prefill = (
-        max(
-            1,
-            math.ceil(
-                shape.prefill_tokens
-                * max(0.0, 1.0 - shape.prefix_hit_rate)
-                / max(1, eff_parallel.pcp)
-            ),
+        (
+            math.floor(raw_uncached)
+            if unpadded_linear
+            else max(1, math.ceil(raw_uncached))
         )
         if shape.prefill_tokens > 0
         else 0
@@ -3021,6 +3091,7 @@ def pass_costs(
         mxu_lhs_rows_fp8=mxu_lhs_rows_fp8,
         fp8_to_bf16_ratio=fp8_to_bf16_ratio,
         activation_model=activation_model,
+        unpadded_linear=unpadded_linear,
         chip=eff_chip,
     )
 

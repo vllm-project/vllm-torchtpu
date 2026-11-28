@@ -402,13 +402,14 @@ BLOCK_PARALLEL_ENABLED: int = 2
 
 # Informational warning emitted when closed-loop think_time_s is zero.
 
-UNKNOWN_THINK_TIME_WARNING: str = (
-    "Think time omitted: closed-loop concurrency throttling is not applied."
+
+UNDECIDED_SLO_WARNING: str = (
+    "Recommended layout is UNDECIDED: physical lower bounds meet SLOs, "
+    "but the uncalibrated serial estimate exceeds at least one SLO."
 )
 
-ZERO_THINK_TIME_WARNING: str = (
-    "Closed-loop scenario evaluated with zero think time: decode residency "
-    "matches concurrency up to the HBM capacity limit without client request pauses."
+UNKNOWN_THINK_TIME_WARNING: str = (
+    "Think time omitted: closed-loop concurrency throttling is not applied."
 )
 
 ACTIVATION_HULL_SCHEMA: str = "vllm_torchtpu.roofline.moe_activation_hull/v1"
@@ -418,3 +419,95 @@ HULL_CONCAVITY_SLOPE_TOLERANCE: float = 1e-9
 # Absorbs 6-decimal JSON rounding (0.5e-6 half-ULP with 2x margin,
 # unit: experts) when comparing exported knots to the Bernoulli cap.
 HULL_BERNOULLI_CAP_TOLERANCE: float = 1e-6
+
+_SOLVER_ASSUMPTION_ROWS: tuple[tuple[str, str, str, object, str, str, str], ...] = (
+    (
+        "bound_ttft_envelope_formula",
+        "",
+        "assumption",
+        "hit-rate-adjusted uncached prefill step floor",
+        "formula",
+        "TTFT bounds evaluate unpadded prefill at scenario prefix hit rate.",
+        "solver",
+    ),
+    (
+        "bound_tpot_residency",
+        "",
+        "assumption",
+        "least fixed-point steady-state residency",
+        "formula",
+        "TPOT bounds evaluate bottom-up from batch 1 to physical HBM batch cap.",
+        "solver",
+    ),
+    (
+        "bound_capacity_ceiling",
+        "",
+        "assumption",
+        "unpadded linear work-conservation",
+        "req/s",
+        (
+            "pool_capacity_bound divides unpadded HBM, matmul, vector, "
+            "and per-link-axis cuts."
+        ),
+        "solver",
+    ),
+    (
+        "eff_prefill_rounding",
+        "",
+        "assumption",
+        "floor((1 - h) * isl) for bounds; ceil(...) for estimates",
+        "tokens",
+        "Strict bounds floor uncached tokens; estimates include chunk overhead.",
+        "modules",
+    ),
+    (
+        "hbm_reserve_gb",
+        "--hbm-reserve-gb",
+        "constraint",
+        DEFAULT_HBM_RESERVE_GB,
+        "GB",
+        "Optional HBM reserve subtracted from physical per-core memory.",
+        "cli",
+    ),
+    (
+        "prefill_chunk_tokens",
+        "",
+        "assumption",
+        DEFAULT_PREFILL_CHUNK,
+        "tokens",
+        "Default chunk size for chunked prefill under mixed concurrency.",
+        "constants",
+    ),
+    (
+        "collective_latency_us",
+        "--collective-latency-us",
+        "calibration",
+        0.0,
+        "us",
+        "Optional per-hop ICI calibration latency added only to estimates "
+        "(0 means none added).",
+        "cli",
+    ),
+    (
+        "ep_uniform_routing",
+        "--moe-activation",
+        "constraint",
+        "bernoulli",
+        "mode",
+        "Default routed MoE activation unless a supplied hull is active.",
+        "occupancy",
+    ),
+)
+
+SOLVER_ASSUMPTIONS: tuple[dict[str, object], ...] = tuple(
+    {
+        "name": name,
+        "flag": flag,
+        "kind": kind,
+        "value": value,
+        "unit": unit,
+        "description": desc,
+        "source": src,
+    }
+    for name, flag, kind, value, unit, desc, src in _SOLVER_ASSUMPTION_ROWS
+)

@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
 from .chips import count_hosts
@@ -26,10 +26,12 @@ from .constants import (
     DEFAULT_HBM_RESERVE_GB,
     DEFAULT_PREFILL_CHUNK,
     SLO_VERDICT_ESTIMATE_MEETS,
+    SLO_VERDICT_RANK,
     SLO_VERDICT_RULED_OUT,
     TOPOLOGY_AXES,
     SloVerdict,
 )
+from .occupancy import ExpertActivationModel
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -176,6 +178,8 @@ class SearchStats:
     slo_met: int
     frontier: int
     core_grid: int = 0
+    not_ruled_out: int = 0
+    envelope_feasible: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,10 +245,17 @@ class ParetoPoint:
     p_mixed: float
     binding: str
     slo_met: bool
-    slo_verdict: SloVerdict | None = None
+    bound_tpot_ms: float = 0.0
+    bound_ttft_ms: float = 0.0
+    slo_verdict: SloVerdict = SLO_VERDICT_ESTIMATE_MEETS
     decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
+    min_decode_seqs: float = 0.0
+    floor_throughput_per_chip: float = 0.0
+    envelope_tpot_ms: float = 0.0
+    envelope_ttft_ms: float = 0.0
+    envelope_decode_seqs: float = 0.0
     is_pareto: bool = False
 
 
@@ -265,6 +276,8 @@ class ServingPlan:
     hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
     collective_latency_s: float = 0.0
     spec_k: int = 0
+    spec_tokens: int = 0
+    mtp_layers: int = 0
     sort_by: SortBy = "throughput"
     model_id: str = ""
     search: SearchStats | None = None
@@ -273,6 +286,10 @@ class ServingPlan:
     budget_source: str = "flag"
     max_instances: int | None = None
     pins: dict[str, object] | None = None
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
+    ruled_out_candidates: tuple[ParetoPoint, ...] = ()
 
 
 class ProvenancePayload(TypedDict):
@@ -372,10 +389,13 @@ class CeilingRow(TypedDict):
     output_throughput_per_chip: float
     est_ttft_ms: float
     est_tpot_ms: float
+    bound_tpot_ms: float
     concurrency: int
     total_chips: int
     mode: str
     binding_unit: str
+    min_decode_seqs: float
+    floor_throughput_per_chip: float
     slo_met: bool
     is_pareto: bool
     decode_topology: str
@@ -537,19 +557,24 @@ def _point_struct_key(
 def candidate_sort_key(
     point: ParetoPoint,
     sort_by: SortBy,
-) -> tuple[bool, bool, float, float, int, str]:
-    """Build unified candidate sort key shared by solver, emit, and families."""
-    not_ruled_out = effective_slo_verdict(point) != SLO_VERDICT_RULED_OUT
+) -> tuple[int, float, float, float, int, str]:
+    """Build unified candidate sort key shared by solver, emit, and families.
+
+    Orders by 3-valued SLO verdict rank, primary estimate metric, secondary
+    estimate metric (breaking ties toward Pareto-optimal points), ceiling
+    throughput tie-break, total chips, and structural identity.
+    """
+    verdict_rank = -SLO_VERDICT_RANK[effective_slo_verdict(point)]
     primary, secondary = (
         (point.est_interactivity_tok_s, point.token_throughput_per_chip)
         if sort_by == "interactivity"
         else (point.token_throughput_per_chip, point.est_interactivity_tok_s)
     )
     return (
-        not point.slo_met,
-        not not_ruled_out,
+        verdict_rank,
         -primary,
         -secondary,
+        -point.floor_throughput_per_chip,
         point.total_chips,
         str(_point_struct_key(point)),
     )
