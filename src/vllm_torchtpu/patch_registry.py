@@ -181,6 +181,11 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    Patch(
+        "vllm_torchtpu.models.bailing_moe_v3.patch:maybe_patch_bailing_moe_v3",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
 )
 
 _applied: set[str] = set()
