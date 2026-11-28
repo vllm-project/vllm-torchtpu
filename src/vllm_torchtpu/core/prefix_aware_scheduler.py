@@ -44,7 +44,11 @@ For an aggregated engine, ``prefix_aware_levers`` runs the decode-leg levers
 above on an engine that is not a KV consumer, and resolves divergent hybrid
 hits through the KV connector there. ``hybrid_state_retention`` keeps the GDN
 state snapshots a later turn hits on (core/hybrid_retention.py, through
-core/retention_scheduler.py) on a Qwen3.5 MoE model, on any engine.
+core/retention_scheduler.py) on a Qwen3.5 MoE model, on any engine. With the
+levers on, the prefill shaping options (``prefill_chunk_cap``,
+``srpf_running``, ``admission_tiers``; see core/prefill_shaping.py) cap
+prefill chunks against the step's decoders, order running prefills and tier
+the ranking.
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
@@ -68,7 +72,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request, RequestStatus
 
-from vllm_torchtpu.core import prefix_change_log, scheduler_options
+from vllm_torchtpu.core import prefill_shaping, prefix_change_log, scheduler_options
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
 from vllm_torchtpu.core.retention_scheduler import (
@@ -250,6 +254,11 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
     _levers_switch = False
     _hit_resolver: DivergentHitResolver | None = None
 
+    # Prefill shaping, off unless __init__ reads the options.
+    _srpf_running = False
+    _admission_tiers = False
+    _chunk_cap: prefill_shaping.PrefillChunkCap | None = None
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._paw_n = 0
@@ -288,6 +297,7 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         self._decode_throttle_switch = options.decode_inflight_throttle
         if options.hybrid_state_retention:
             self._init_retention()
+        self._init_prefill_shaping(options)
         self._memo_xstep = False
         if self._levers_on():
             self._enable_memo_xstep()
@@ -316,7 +326,7 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
             logger.info(
                 "PrefixAwareScheduler: %s.prefix_aware_levers adds nothing on a "
                 "KV consumer: the levers run anyway, and divergent hybrid hits "
-                "keep vLLM's lookup.",
+                "keep vLLM's lookup. The prefill shaping options still need it.",
                 scheduler_options.SECTION,
             )
             return
@@ -694,6 +704,63 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
             base, max(min_reserved, per_seq_reserved * (num_running + num_inflight))
         )
 
+    # ------------------------------------------------------------------
+    # Prefill shaping (options prefill_chunk_cap, srpf_running and
+    # admission_tiers; core/prefill_shaping.py). schedule() starts each step
+    # with _begin_prefill_shaping_step; the chunk cap sizes prefill chunks in
+    # _mamba_block_aligned_split (or, without the Mamba alignment,
+    # _reserve_prefill_lookahead); the tiers rank in _rank_and_warmth.
+    # ------------------------------------------------------------------
+
+    def _init_prefill_shaping(
+        self, options: scheduler_options.SchedulerOptions
+    ) -> None:
+        self._srpf_running = options.srpf_running
+        self._admission_tiers = options.admission_tiers
+        if options.prefill_chunk_cap:
+            self._chunk_cap = prefill_shaping.PrefillChunkCap(
+                prefill_shaping.ChunkCapLimits.derive(
+                    self.max_num_scheduled_tokens, self.max_num_running_reqs
+                ),
+                self._get_block_size(),
+            )
+        if options.prefill_chunk_cap or options.srpf_running or options.admission_tiers:
+            logger.info(
+                "PrefixAwareScheduler: prefill shaping ACTIVE (chunk_cap=%s, "
+                "srpf_running=%s, admission_tiers=%s)",
+                self._chunk_cap.limits if self._chunk_cap is not None else None,
+                self._srpf_running,
+                self._admission_tiers,
+            )
+
+    def _begin_prefill_shaping_step(self) -> None:
+        if self._srpf_running:
+            decoding = [r for r in self.running if _is_decoding(r)]
+            prefilling = [r for r in self.running if not _is_decoding(r)]
+            if len(prefilling) > 1:
+                prefilling.sort(key=prefill_shaping.remaining_prompt_tokens)
+                self.running[:] = decoding + prefilling
+        if self._chunk_cap is not None:
+            self._chunk_cap.begin_step(self.running)
+
+    def _cap_prefill_chunk(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int:
+        """The chunk cap's chunk. Any request in either waiting queue counts
+        as waiting, a KV load in flight included."""
+        assert self._chunk_cap is not None
+        capped = self._chunk_cap.cap(
+            request,
+            start,
+            num_new_tokens,
+            has_waiting=bool(self.waiting) or bool(self.kv_holding_waiting),
+        )
+        if capped == 0 < num_new_tokens and self.need_mamba_block_aligned_split:
+            # A 0 from the Mamba split ends vLLM's waiting loop; without the
+            # split vLLM skips the request and keeps scanning.
+            self._note_waiting_stop(request, "chunk_cap0")
+        return capped
+
     def _now(self) -> float:
         """The time ``_promote_warmest`` ranks the window at. This scheduler's
         ranking does not age requests; the pipeline chunk scheduler, which
@@ -759,6 +826,8 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
 
     def schedule(self, *args, **kwargs):
         self._retention_begin_step()
+        if self._srpf_running or self._chunk_cap is not None:
+            self._begin_prefill_shaping_step()
         if not self._levers_on():
             # Without the levers: the warmest-first admission alone, unless
             # tpu_scheduler.promote_warmest=false asks for FCFS admission.
@@ -835,12 +904,12 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
     def _waiting_loop_stop_reason(self, out, waiting_at_start: int) -> str:
         """Names what ended vLLM's waiting loop on this step.
 
-        ``align0`` / ``lookahead0``: the chunk of the request at the head came
-        out 0 tokens (the Mamba block-aligned split, the MTP lookahead
-        reserve). Otherwise ``idle`` (nothing was waiting), ``preempted`` (the
-        loop did not run), ``max_running``, ``budget`` (no token budget left),
-        ``drained`` (every waiting request was admitted or skipped) or
-        ``other``.
+        ``align0`` / ``lookahead0`` / ``chunk_cap0``: the chunk of the request
+        at the head came out 0 tokens (the Mamba block-aligned split, the MTP
+        lookahead reserve, the prefill chunk cap's step total). Otherwise
+        ``idle`` (nothing was waiting), ``preempted`` (the loop did not run),
+        ``max_running``, ``budget`` (no token budget left), ``drained`` (every
+        waiting request was admitted or skipped) or ``other``.
         """
         event = getattr(self, "_step_wait_event", None)
         if event is not None:
@@ -929,7 +998,7 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        if self._retention is None:
+        if self._retention is None and self._chunk_cap is None:
             aligned = super()._mamba_block_aligned_split(
                 request,
                 num_new_tokens,
@@ -942,6 +1011,11 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
                 + num_new_local_computed_tokens
                 + num_external_computed_tokens
             )
+            if self._chunk_cap is not None:
+                # The cap runs first, so the split's block alignment and the
+                # retention stops apply to the capped chunk.
+                num_new_tokens = self._cap_prefill_chunk(request, start, num_new_tokens)
+            # vLLM's block-aligned split alone when there is no retention.
             aligned = self._retention_split(
                 request,
                 start,
@@ -951,6 +1025,8 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
             )
         if aligned <= 0:
             self._note_waiting_stop(request, "align0")
+        if self._chunk_cap is not None:
+            self._chunk_cap.record(request, aligned)
         return aligned
 
     def _reserve_prefill_lookahead(
@@ -968,11 +1044,19 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
             if cap is not None:
                 self.max_num_active_reqs = cap
             return 0
+        if self._chunk_cap is not None and not self.need_mamba_block_aligned_split:
+            num_new_tokens = self._cap_prefill_chunk(
+                request, num_computed_tokens, num_new_tokens
+            )
+            if num_new_tokens <= 0:
+                return 0
         reserved = super()._reserve_prefill_lookahead(
             request, num_computed_tokens, num_new_tokens
         )
         if reserved <= 0:
             self._note_waiting_stop(request, "lookahead0")
+        if self._chunk_cap is not None:
+            self._chunk_cap.record(request, reserved)
         return reserved
 
     def _get_block_size(self) -> int:
@@ -1081,12 +1165,18 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
     ) -> tuple[tuple[int, float, float], int]:
         """Return (sort_key, warmth). Lower sort_key is admitted first.
 
-        ``_promote_warmest`` also passes ``free_blocks_for_fit`` and ``now``,
-        which the pipeline-parallel prefill scheduler's own ranking uses.
+        ``_promote_warmest`` also passes ``free_blocks_for_fit``, which the
+        ``admission_tiers`` option ranks against, and ``now``, which the
+        pipeline-parallel prefill scheduler's own ranking uses.
         """
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)
-        tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+        if self._admission_tiers:
+            tier = prefill_shaping.admission_tier(
+                request, warmth, free_blocks_for_fit, self._get_block_size()
+            )
+        else:
+            tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
         return (tier, cold_tokens, request.arrival_time), warmth
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
@@ -1105,10 +1195,17 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
 
     def _free_blocks_for_fit(self, head: Request) -> int | None:
         """The free-block count ``_rank_and_warmth`` ranks the window against
-        when ``head`` does not fit it, else None. This scheduler's ranking
-        does not read it, so it answers None without a lookup; the pipeline
-        chunk scheduler, which borrows ``_promote_warmest``, ranks by fit."""
-        return None
+        when ``head`` does not fit it, else None. Without the
+        ``admission_tiers`` option the ranking does not read it, so it
+        answers None without a lookup; the pipeline chunk scheduler, which
+        borrows ``_promote_warmest``, ranks by fit."""
+        if not self._admission_tiers:
+            return None
+        return prefill_shaping.free_blocks_for_fit(
+            self._get_num_free_blocks(),
+            head.num_tokens - self._prefix_warmth(head),
+            self._get_block_size(),
+        )
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
