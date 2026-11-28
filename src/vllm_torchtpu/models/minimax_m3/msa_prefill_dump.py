@@ -128,17 +128,20 @@ def stash(module, index_q, q, candidates, metadata, num_tokens: int) -> None:
         q = q.transpose(0, 1)
     q = q.reshape(q.shape[0], -1).to(torch.bfloat16)
     module.pfd_q.copy_(_fit(q, module.pfd_q.shape))
+    # No tensors from Python data in the traced graph (torch_tpu would make
+    # them arguments the replay does not provide): constants ride on ops of
+    # existing device tensors.
     if candidates is None:
-        candidates = torch.zeros(
-            (num_tokens, 1), dtype=torch.float32, device=module.pfd_cand.device
+        module.pfd_cand.mul_(0.0)
+    else:
+        module.pfd_cand.copy_(
+            _fit(candidates.to(torch.float32), module.pfd_cand.shape)
         )
-    module.pfd_cand.copy_(_fit(candidates.to(torch.float32), module.pfd_cand.shape))
     n_sl, n_qsl, n_bt = module.pfd_sizes
     mns = int(metadata.seq_lens.shape[0])
     cols = int(metadata.block_tables.numel()) // mns
-    head = torch.tensor(
-        [num_tokens, mns, cols], dtype=torch.int32, device=metadata.seq_lens.device
-    )
+    zero = metadata.seq_lens.reshape(-1)[:1].to(torch.int32) * 0
+    head = torch.cat([zero + num_tokens, zero + mns, zero + cols])
     dist = metadata.request_distribution.reshape(-1).to(torch.int32)[2:3]
     module.pfd_meta.copy_(
         torch.cat(
