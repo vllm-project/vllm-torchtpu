@@ -27,7 +27,10 @@ import pytest
 from vllm.config.parallel import ParallelConfig
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu import _patch_sequence_parallel_moe_admission
+from vllm_torchtpu import (
+    _patch_group_coordinator_device,
+    _patch_sequence_parallel_moe_admission,
+)
 
 _REGISTRY_PATH = (
     Path(__file__).resolve().parents[2] / "src/vllm_torchtpu/patch_registry.py"
@@ -399,3 +402,31 @@ def test_sequence_parallel_moe_admission(monkeypatch):
         enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
     )
     assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)
+
+
+@pytest.mark.parametrize("has_communicator", [True, False])
+def test_group_device_is_the_workers_own(monkeypatch, has_communicator):
+    import torch
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+    def upstream_init(self, local_rank):
+        # vLLM takes the device index from the local rank.
+        self.device = torch.device(f"cuda:{local_rank}")
+        self.device_communicator = (
+            SimpleNamespace(device=self.device) if has_communicator else None
+        )
+
+    monkeypatch.setattr(GroupCoordinator, "__init__", upstream_init)
+    monkeypatch.setattr(
+        GroupCoordinator, "_tpu_group_device_patch", False, raising=False
+    )
+    _patch_group_coordinator_device()
+    group = GroupCoordinator(local_rank=3)
+    assert group.device == torch.device("cuda")
+    assert group.device.index is None
+    if has_communicator:
+        assert group.device_communicator.device == group.device
+    # A second application leaves the one wrapper in place.
+    installed = GroupCoordinator.__init__
+    _patch_group_coordinator_device()
+    assert GroupCoordinator.__init__ is installed

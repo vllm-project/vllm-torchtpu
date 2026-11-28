@@ -749,6 +749,35 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     logger.info("Applied TPU patch: MultiprocExecutor worker binding env.")
 
 
+def _patch_group_coordinator_device() -> None:
+    """Name a parallel group's device as its worker addresses it.
+
+    vLLM names the device `<type>:<local_rank>`, for workers that each see
+    every device of their host. A TPU worker sees its own device alone, so
+    the local rank is an index it cannot address, and a tensor moved to the
+    group's device (the DP batch sync without async scheduling) is refused.
+    """
+    import functools
+
+    import torch
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+    if getattr(GroupCoordinator, "_tpu_group_device_patch", False):
+        return
+    _orig = GroupCoordinator.__init__
+
+    @functools.wraps(_orig)
+    def _wrapped(self, *args, **kwargs):
+        _orig(self, *args, **kwargs)
+        self.device = torch.device(self.device.type)
+        if self.device_communicator is not None:
+            self.device_communicator.device = self.device
+
+    GroupCoordinator.__init__ = _wrapped
+    GroupCoordinator._tpu_group_device_patch = True
+    logger.info("Applied TPU patch: parallel groups on the worker's own device.")
+
+
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
     from vllm_torchtpu import patch_registry
 
