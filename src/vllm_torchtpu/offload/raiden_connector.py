@@ -614,7 +614,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         Keys touched later end nearer the MRU end, so the order below decides
         what an active conversation loses first under host pressure.
         """
-        local_tokens = int(getattr(req_status, "num_locally_computed_tokens", 0) or 0)
+        local_tokens = req_status.num_locally_computed_tokens
         local_hit = _local_hit_tokens(req_status.req)
         if local_hit > local_tokens:
             local_tokens = local_hit

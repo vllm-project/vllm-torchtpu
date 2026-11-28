@@ -688,17 +688,16 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         if hit is not None:
             request._tpu_local_hit_tokens = hit[1]
             return hit
-        resolver = self._hit_resolver
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
             super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         )
-        if hit_diverged and resolver is not None:
+        if hit_diverged and self._hit_resolver is not None:
             kvm = self.kv_cache_manager
             reconciled_blocks, num_reconciled, reconciled_boundary = (
                 kvm.get_computed_blocks(request, max_cache_hit_length)
             )
             block_size = self._get_block_size()
-            target_local = resolver.resolve_divergent_local_hit_tokens(
+            target_local = self._hit_resolver.resolve_divergent_local_hit_tokens(
                 request, num_local, num_reconciled, block_size
             )
             if target_local is None:
