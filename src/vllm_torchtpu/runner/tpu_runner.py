@@ -8255,10 +8255,8 @@ class TPUModelRunner(GPUModelRunner):
         block_ids_per_group = []
         max_nblk = 0
         for group in self.kv_cache_config.kv_cache_groups:
-            group_block_size = int(group.kv_cache_spec.block_size)
-            group_num_blocks = min(
-                cdiv(max_pos, group_block_size),
-                cdiv(self.max_model_len, group_block_size),
+            group_num_blocks = group.kv_cache_spec.max_num_blocks_per_req(
+                self.vllm_config, max_pos
             )
             block_ids_per_group.append(list(range(top - group_num_blocks, top)))
             max_nblk = max(max_nblk, group_num_blocks)
@@ -9050,10 +9048,10 @@ class TPUModelRunner(GPUModelRunner):
                 # above never compile them.
                 P_mix = int(self.max_num_tokens) - R * (1 + K)
                 P_mix = max(P, min(P_mix, self.max_model_len - (1 + K) - 1))
+                mix_max_pos = min(P_mix + 1 + K, self.max_model_len)
                 mix_nblks = [
-                    min(
-                        cdiv(P_mix + 1 + K, int(g.kv_cache_spec.block_size)),
-                        cdiv(self.max_model_len, int(g.kv_cache_spec.block_size)),
+                    g.kv_cache_spec.max_num_blocks_per_req(
+                        self.vllm_config, mix_max_pos
                     )
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
