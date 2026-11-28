@@ -35,6 +35,7 @@ import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.runner.routed_experts import RoutedExpertsCapture
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import cpu_pinning
 from vllm_torchtpu.worker.tpu_worker import (
     TPUWorker,
     _configure_tpu_process_env,
@@ -394,6 +395,8 @@ def test_compile_or_warm_up_drops_traced_modules_before_freezing_the_heap():
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(capture_model=lambda: None),
         compilation_config=SimpleNamespace(compilation_time=0.0),
+        # Not registered for CPU pinning, so no pinning runs.
+        model_config=SimpleNamespace(architecture="UnpinnedForCausalLM"),
     )
     calls = []
 
@@ -800,6 +803,35 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
 
 
+def test_warmup_pins_cpus_only_for_a_registered_architecture(monkeypatch):
+    applied = []
+    monkeypatch.setattr(cpu_pinning, "_PINNED_ARCHITECTURES", {"PinnedForCausalLM"})
+    monkeypatch.setattr(cpu_pinning, "apply", lambda *args: applied.append(args))
+
+    def worker(arch, numa_bind=False):
+        return SimpleNamespace(
+            model_runner=SimpleNamespace(capture_model=lambda: None),
+            compilation_config=SimpleNamespace(compilation_time=0.0),
+            speculative_config=None,
+            model_config=SimpleNamespace(architecture=arch),
+            parallel_config=SimpleNamespace(numa_bind=numa_bind),
+            rank=3,
+            local_rank=1,
+        )
+
+    with (
+        patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap"),
+        patch("vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"),
+    ):
+        TPUWorker.compile_or_warm_up_model(worker("OtherForCausalLM"))
+        assert applied == []
+        # --numa-bind is the user's choice: no second pinning on top of it.
+        TPUWorker.compile_or_warm_up_model(worker("PinnedForCausalLM", True))
+        assert applied == []
+        TPUWorker.compile_or_warm_up_model(worker("PinnedForCausalLM"))
+    assert applied == [(3, 1)]
+
+
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
 def test_load_model_patches_loads_releases_then_sets_runtime_threads(
     monkeypatch, managed_by_vllm, runtime_threads
@@ -847,6 +879,8 @@ def test_warmup_freezes_heap_and_reports_compilation_time():
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(capture_model=capture_model),
         compilation_config=SimpleNamespace(compilation_time=0.0),
+        # CPU pinning is not registered for this architecture.
+        model_config=SimpleNamespace(architecture="UnregisteredForCausalLM"),
     )
     with (
         patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,

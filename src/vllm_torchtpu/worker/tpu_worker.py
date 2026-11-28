@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import cpu_pinning
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -919,6 +920,12 @@ class TPUWorker(WorkerBase):
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
         _release_free_host_heap()
+        if cpu_pinning.is_registered(self.model_config.architecture):
+            if self.parallel_config.numa_bind:
+                # The user bound the worker with --numa-bind; keep that.
+                logger.info("CPU pin skipped: --numa-bind is set")
+            else:
+                cpu_pinning.apply(self.rank, self.local_rank)
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
