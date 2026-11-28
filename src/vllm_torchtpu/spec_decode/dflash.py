@@ -70,6 +70,24 @@ def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
     return any(isinstance(m, MoERunner) for m in draft_model.modules())
 
 
+class TpuContextKVFromAuxList:
+    """Drafter capability: build the context KV from the aux hidden-state list.
+
+    A drafter that inherits this receives the target's auxiliary hidden
+    states as a list in ``tpu_precompute_and_store_context_kv``, before they
+    are concatenated, so it can slice first and concatenate only what it
+    needs. Drafters without it get the concatenated tensor.
+    """
+
+    def tpu_precompute_and_store_context_kv(
+        self,
+        hidden_states: list[torch.Tensor],
+        positions: torch.Tensor,
+        draft_md_tuple: tuple[AttentionMetadata, ...],
+    ) -> tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor:
+        raise NotImplementedError
+
+
 class DFlashProposer:
     """DFlash draft proposer for TPU.
 
@@ -1009,6 +1027,23 @@ class DFlashProposer:
         """
         assert self.draft_model is not None
         self_model = self.draft_model.model
+        if isinstance(self.draft_model, TpuContextKVFromAuxList):
+            # The drafter takes the aux hidden-state list and concatenates it
+            # itself (or slices first, then concatenates); a single tensor is
+            # a one-element list.
+            aux = (
+                list(hidden_states)
+                if isinstance(hidden_states, (list, tuple))
+                else [hidden_states]
+            )
+            return self.draft_model.tpu_precompute_and_store_context_kv(
+                aux, positions, draft_md_tuple
+            )
+        # Only opt into TPU-specific hooks; upstream methods with a similar
+        # name may call GPU custom ops. Other drafts use the TPU path below.
+        tpu_precompute = getattr(
+            self.draft_model, "tpu_precompute_and_store_context_kv", None
+        )
         if isinstance(hidden_states, (list, tuple)):
             target_hidden = (
                 hidden_states[0]
@@ -1018,11 +1053,6 @@ class DFlashProposer:
         else:
             target_hidden = hidden_states
 
-        # Only opt into TPU-specific hooks; upstream methods with a similar
-        # name may call GPU custom ops. Other drafts use the TPU path below.
-        tpu_precompute = getattr(
-            self.draft_model, "tpu_precompute_and_store_context_kv", None
-        )
         if callable(tpu_precompute):
             return tpu_precompute(target_hidden, positions, draft_md_tuple)
         if getattr(type(self.draft_model), "owns_context_kv", False):
