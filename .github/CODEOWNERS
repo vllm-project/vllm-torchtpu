@@ -169,8 +169,8 @@
 /tests/models/vllm/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
 
 # Models: MiniMax M3
-/src/vllm_torchtpu/models/minimax_m3/ @DRZDONG @caojx-google @qizzzh
-/tests/models/minimax_m3/ @DRZDONG @caojx-google @qizzzh
+/src/vllm_torchtpu/models/minimax_m3/ @DRZDONG @Annie215 @caojx-google @qizzzh
+/tests/models/minimax_m3/ @DRZDONG @Annie215 @caojx-google @qizzzh
 
 # Models: Kimi-K3
 /src/vllm_torchtpu/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
