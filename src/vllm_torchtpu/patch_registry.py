@@ -32,7 +32,12 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 Stage = Literal[
-    "import", "platform_activation", "engine_core", "worker_init", "model_load"
+    "import",
+    "plugin_load",
+    "platform_activation",
+    "engine_core",
+    "worker_init",
+    "model_load",
 ]
 
 
@@ -153,6 +158,9 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    # vLLM config validation, before any VllmConfig is built (the API server
+    # validates the parallel config before platform activation).
+    Patch("vllm_torchtpu.distributed.dcp:_patch_vllm_gqa_dcp_limit", ("plugin_load",)),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
@@ -219,6 +227,7 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
     """
     if stage not in (
         "import",
+        "plugin_load",
         "platform_activation",
         "engine_core",
         "worker_init",
