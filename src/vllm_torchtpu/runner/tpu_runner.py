@@ -6585,6 +6585,11 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+        # Off unless the model sets its own all-reduce (tpu_communicator
+        # .ModelAllReduce). Its setup may run collectives, so after the load.
+        from vllm_torchtpu.distributed.tpu_communicator import install_model_all_reduce
+
+        install_model_all_reduce(self.model, self.vllm_config, self.device)
         self._arm_hier_reduce_scatter()
 
     def _arm_hier_reduce_scatter(self) -> None:
