@@ -131,7 +131,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
         main_pool: torch.Tensor,
     ) -> torch.Tensor:
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        index_q, raw_keys = self.indexer(hidden_states, positions, cos_sin_cache)
+        index_cos_sin = cos_sin_cache[positions]
+        pooled_cos_sin = cos_sin_cache[
+            (positions - (self.compress_ratio - 1)).clamp(min=0)
+        ]
+        index_q, raw_keys = self.indexer(hidden_states, index_cos_sin)
         attn_metadata = get_forward_context().attn_metadata
         assert isinstance(attn_metadata, dict)
         metadata: Any = attn_metadata[self.attn.layer_name]
@@ -152,7 +156,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention):
             block_tables=metadata.block_tables,
             main_pool=main_pool,
             index_pool=self.index_cache.kv_cache,
-            cos_sin_cache=cos_sin_cache,
+            cos_sin=pooled_cos_sin,
             k_norm_weight=self.indexer.k_layernorm.weight,
             kv_scales=kv_scales,
             num_kv_heads=self.num_kv_heads,
@@ -196,26 +200,23 @@ class Qwen4ExpQSAIndexer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
+        cos_sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """(normed, roped index queries [T, heads, dim], raw keys [T, dim])."""
         qk, _ = self.index_qk_proj(hidden_states)
         q, raw_keys = qk.split([self.num_heads * self.head_dim, self.head_dim], -1)
         q = self.q_layernorm(q.reshape(-1, self.num_heads, self.head_dim))
-        return _apply_partial_rope(q, positions, cos_sin_cache), raw_keys
+        return _apply_partial_rope(q, cos_sin), raw_keys
 
 
-def _apply_partial_rope(
-    x: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor
-) -> torch.Tensor:
-    """NeoX RoPE on the first ``cos_sin_cache.shape[-1]`` dims of ``x``.
+def _apply_partial_rope(x: torch.Tensor, cos_sin: torch.Tensor) -> torch.Tensor:
+    """NeoX RoPE on the first ``cos_sin.shape[-1]`` dims of ``x``.
 
-    ``x`` is [num_tokens, heads, dim]; ``cos_sin_cache`` [max_pos, rotary_dim]
-    holds cos then sin, as vLLM's RotaryEmbedding builds it.
+    ``x`` is [num_tokens, heads, dim]; ``cos_sin`` holds per-token
+    ``[num_tokens, rotary_dim]`` cos then sin rows.
     """
-    rotary_dim = cos_sin_cache.shape[-1]
-    cos, sin = cos_sin_cache[positions].float().unsqueeze(1).chunk(2, dim=-1)
+    rotary_dim = cos_sin.shape[-1]
+    cos, sin = cos_sin.float().unsqueeze(1).chunk(2, dim=-1)
     rot, rest = x[..., :rotary_dim].float(), x[..., rotary_dim:]
     x1, x2 = rot.chunk(2, dim=-1)
     rot = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)

@@ -44,7 +44,7 @@ def qsa_attention(
     block_tables: torch.Tensor,
     main_pool: torch.Tensor,
     index_pool: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
+    cos_sin: torch.Tensor,
     k_norm_weight: torch.Tensor,
     kv_scales: torch.Tensor,
     num_kv_heads: int,
@@ -66,7 +66,7 @@ def qsa_attention(
         block_tables.to(torch.int32),
         main_pool,
         index_pool,
-        cos_sin_cache,
+        cos_sin,
         k_norm_weight,
         kv_scales,
         num_kv_heads,
@@ -224,7 +224,6 @@ def _qsa_attention(
     pooled = block.astype(jnp.float32).mean(axis=1).astype(raw_keys.dtype)
     pooled = _rope(
         _rms_norm(pooled, k_norm_weight, norm_eps),
-        jnp.maximum(positions - (ratio - 1), 0),
         cos_sin,
     )
     pooled = jnp.where(((positions + 1) % ratio == 0)[:, None], pooled, 0)
@@ -464,11 +463,11 @@ def _rms_norm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
     return (x32 * (1.0 + weight.astype(jnp.float32))).astype(x.dtype)
 
 
-def _rope(x: jax.Array, positions: jax.Array, cos_sin: jax.Array) -> jax.Array:
+def _rope(x: jax.Array, cos_sin: jax.Array) -> jax.Array:
     """NeoX RoPE on the first ``cos_sin.shape[-1]`` dims of [T, dim] rows."""
     rotary_dim = cos_sin.shape[-1]
     half = rotary_dim // 2
-    cs = cos_sin[positions].astype(jnp.float32)
+    cs = cos_sin.astype(jnp.float32)
     cos, sin = cs[:, :half], cs[:, half:]
     rot = x[:, :rotary_dim].astype(jnp.float32)
     x1, x2 = rot[:, :half], rot[:, half:]
