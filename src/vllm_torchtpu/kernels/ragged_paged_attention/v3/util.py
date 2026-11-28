@@ -14,7 +14,12 @@
 """Utility functions for ragged paged attention."""
 
 import jax
+import jax.numpy as jnp
 from jax._src import dtypes
+
+# Finite float32 mask sentinel (-0.7 * float32.max) avoids (-inf) - (-inf) = NaN
+# and prevents float32 subtraction overflow when shifting by positive logits.
+DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 
 def cdiv(a, b):

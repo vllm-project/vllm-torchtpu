@@ -115,7 +115,9 @@ def calculate_and_store_out(
 
     def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
         assert lse_o_vref is not None
-        lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
+        lse_val = batch_m.astype(cfgs.serve.dtype_acc) + jnp.log(
+            jnp.maximum(batch_l.astype(cfgs.serve.dtype_acc), 1e-9)
+        )
         lse_u32 = lse_o_vref.at[b_idx].bitcast(jnp.uint32)
         lse_ref = lse_u32.reshape(-1, lse_o_vref.shape[-1])
         lse_val = pltpu.bitcast(
@@ -898,15 +900,15 @@ def rpa_kernel(
             scratches=(
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=cfgs.serve.dtype_acc,
                 ),  # m
                 pltpu.VMEM(
                     cfgs.lm_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=cfgs.serve.dtype_acc,
                 ),  # l
                 pltpu.VMEM(
                     cfgs.acc_scratch_shape,
-                    dtype=cfgs.serve.dtype_out,
+                    dtype=cfgs.serve.dtype_acc,
                 ),  # acc
             ),
         )

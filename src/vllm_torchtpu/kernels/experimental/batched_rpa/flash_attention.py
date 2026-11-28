@@ -69,9 +69,8 @@ def flash_attention_qk_softmax(
     if k_scale is not None:
         qk *= k_scale
 
-    # We convert to the output dtype after scaling, because especially for very
-    # low precision, we want to have 32-bit scale factors and do scaling in fp32.
-    qk = qk.astype(cfgs.serve.dtype_out)
+    # Keep online-softmax state in fp32 (dtype_acc) to avoid BF16 drift across KV tiles.
+    qk = qk.astype(cfgs.serve.dtype_acc)
 
     if cfgs.model.soft_cap is not None:
         qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)
@@ -97,7 +96,7 @@ def flash_attention_qk_softmax(
 
     m_next = jnp.stack(m_next_list, axis=0)
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
-    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
+    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_acc)
 
     l_next_list = []
     for b_idx in range(cfgs.block.batch_size):
@@ -160,7 +159,7 @@ def flash_attention_pv(
             dimension_numbers=(([2], [1]), ([0], [0])),
             preferred_element_type=jnp.float32,
         )
-    pv = pv.astype(cfgs.serve.dtype_out).reshape(b, k_heads, tq, h_size)
+    pv = pv.astype(cfgs.serve.dtype_acc).reshape(b, k_heads, tq, h_size)
 
     if not cfgs.serve.per_token_scale and cfgs.serve.scale_v is not None:
         pv *= cfgs.serve.scale_v

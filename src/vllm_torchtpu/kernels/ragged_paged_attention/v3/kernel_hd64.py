@@ -28,12 +28,11 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.tuned_block_sizes_hd64 impo
     get_tuned_block_sizes,
 )
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
+    DEFAULT_MASK_VALUE,
     align_to,
     cdiv,
     get_dtype_packing,
 )
-
-DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
