@@ -775,6 +775,104 @@ def _patch_row_parallel_input_split(model: nn.Module) -> int:
     return patched
 
 
+# Per-rank constant naming the rank's slice of sequence-parallel activations.
+_SP_RANK_BUFFER = "export_sp_tp_rank"
+_ACTIVE_SP_STACK: list[tuple[torch.Tensor, int]] = []
+_ORIG_SEQUENCE_PARALLEL_CHUNK: Any = None
+
+
+def _uses_sequence_parallel(model: nn.Module) -> bool:
+    return any(
+        getattr(m, "use_sequence_parallel", False)
+        or getattr(m, "is_sequence_parallel", False)
+        or getattr(m, "use_attn_reduce_scatter_for_moe", False)
+        for m in model.modules()
+    )
+
+
+def _slice_sequence_parallel_tensor(
+    x: torch.Tensor, rank: torch.Tensor, tp_size: int
+) -> torch.Tensor:
+    seq_len = x.shape[0]
+    remainder = seq_len % tp_size
+    if remainder != 0:
+        pad_len = tp_size - remainder
+        pad_dims = (0, 0) * (x.ndim - 1) + (0, pad_len)
+        x = torch.nn.functional.pad(x, pad_dims)
+    return x.unflatten(0, (tp_size, -1)).index_select(0, rank).squeeze(0)
+
+
+def _export_sequence_parallel_chunk(x: torch.Tensor) -> torch.Tensor:
+    if _ACTIVE_SP_STACK:
+        rank, tp_size = _ACTIVE_SP_STACK[-1]
+        return _slice_sequence_parallel_tensor(x, rank, tp_size)
+    return _ORIG_SEQUENCE_PARALLEL_CHUNK(x)
+
+
+def _install_sequence_parallel_chunk_hook() -> None:
+    global _ORIG_SEQUENCE_PARALLEL_CHUNK
+    import sys
+
+    from vllm.model_executor.models import utils as model_utils
+
+    utils_mod: Any = model_utils
+    if _ORIG_SEQUENCE_PARALLEL_CHUNK is None:
+        _ORIG_SEQUENCE_PARALLEL_CHUNK = utils_mod.sequence_parallel_chunk
+    orig = _ORIG_SEQUENCE_PARALLEL_CHUNK
+    if getattr(utils_mod, "sequence_parallel_chunk", None) is orig:
+        utils_mod.sequence_parallel_chunk = _export_sequence_parallel_chunk
+    for mod_name, mod in list(sys.modules.items()):
+        if (
+            mod is not None
+            and mod_name.startswith("vllm.model_executor.models.")
+            and getattr(mod, "sequence_parallel_chunk", None) is orig
+        ):
+            mod_any: Any = mod
+            mod_any.sequence_parallel_chunk = _export_sequence_parallel_chunk
+
+
+def _patch_sequence_parallel_chunk(model: nn.Module) -> int:
+    """Routes `sequence_parallel_chunk` through a per-rank buffer during export.
+
+    vLLM's `sequence_parallel_chunk_impl` slices `x` with Python `tp_rank` (`0`
+    on export rank 0), baking `[0:chunk]` into the single SPMD MLIR for every
+    TPU device. Registering a `[1]` per-rank buffer on `model` lets
+    `functional_call` lift it as a per-device constant so every rank keeps its
+    own `[rank * chunk : (rank + 1) * chunk]` slice. Returns 1 if patched else 0.
+    """
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return 0
+    tp = get_tensor_model_parallel_world_size()
+    if tp <= 1 or not _uses_sequence_parallel(model) or hasattr(model, _SP_RANK_BUFFER):
+        return 0
+    _install_sequence_parallel_chunk_hook()
+    first_tensor = next(model.parameters(), next(model.buffers(), None))
+    device = first_tensor.device if first_tensor is not None else torch.device("cpu")
+    model.register_buffer(
+        _SP_RANK_BUFFER,
+        torch.tensor([get_tensor_model_parallel_rank()], device=device),
+        persistent=False,
+    )
+    orig_forward = model.forward
+
+    def sp_forward(*args: Any, **kwargs: Any) -> Any:
+        rank = getattr(model, _SP_RANK_BUFFER)
+        _ACTIVE_SP_STACK.append((rank, tp))
+        try:
+            return orig_forward(*args, **kwargs)
+        finally:
+            _ACTIVE_SP_STACK.pop()
+
+    model.forward = sp_forward
+    return 1
+
+
 def _backbone_kwargs(
     backbone: nn.Module,
     *,
@@ -987,10 +1085,12 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                     )
                 )
         _patch_row_parallel_input_split(self._model)
+        _patch_sequence_parallel_chunk(self._model)
         for draft in (self._mtp_draft, self._draft_model):
             if draft is not None:
                 # Kept off the target's module tree, like the RoPE patch above.
                 _patch_row_parallel_input_split(draft)
+                _patch_sequence_parallel_chunk(draft)
         if not self._export_config.uses_mrope and any(
             rope_in_graph.compute_mrope_dim_modalities(m) is not None
             for _, m in self._model.named_modules()
