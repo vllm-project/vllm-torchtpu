@@ -4584,3 +4584,155 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+# A K=7 drafter at max_num_seqs 48: the served token
+# buckets, a 8192-token budget.
+SERVED_PADDINGS = [4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 384, 512]
+SERVED_PADDINGS += [1024, 2048, 3072, 4096, 8192]
+
+
+def _glue_runner(chunk_reqs: int = 48, max_seqs: int = 48, K: int = 7):
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs, async_scheduling=True),
+        _is_async_drafter=True,
+        max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
+        num_reqs_max_model_len=chunk_reqs,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
+        num_tokens_paddings=SERVED_PADDINGS,
+        uses_mrope=False,
+        device=torch.device("cpu"),
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+    )
+    for name in (
+        "_chunk_request_capacities",
+        "_async_spec_source_rows",
+        "_async_spec_glue_shapes",
+        "_park_async_spec_source",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    return runner
+
+
+def _shapes(*tensors: torch.Tensor) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(t.shape) for t in tensors)
+
+
+def test_async_spec_glue_precompile_covers_every_step(monkeypatch):
+    """Every step a served batch can take -- any verify request count next to
+    a prefill chunk landing in any token bucket -- hands the subtract and
+    extract glue a shape the precompile warmed. The real spec-decode warmup
+    pairs large token buckets with one request only (a serving run compiled
+    tt_jit_sub / tt_jit_index mid-serving)."""
+    runner = _glue_runner()
+    K = runner.speculative_config.num_speculative_tokens
+    pads = runner.num_tokens_paddings
+    warmed_subtract: set = set()
+    warmed_extract: set = set()
+
+    def record_subtract(*args):
+        warmed_subtract.add(_shapes(*args))
+        return args[0], args[1]
+
+    def record_extract(*args):
+        warmed_extract.add(_shapes(*args))
+        return args[1]
+
+    monkeypatch.setattr(tpu_runner, "_subtract_num_rejected_tokens", record_subtract)
+    monkeypatch.setattr(tpu_runner, "_extract_draft_token_ids", record_extract)
+    TPUModelRunner._precompile_async_spec_glue(runner)
+
+    manager_runner = MagicMock()
+    manager_runner.device = torch.device("cpu")
+    manager_runner.arange_np = np.arange(pads[-1] + 1, dtype=np.int32)
+    manager_runner.num_tokens_paddings = pads
+    manager_runner.input_ids_cpu = torch.zeros(pads[-1], dtype=torch.int32)
+    manager = SpeculativeDecodingManager(manager_runner)
+
+    rows = runner._async_spec_source_rows()
+    chunk_reqs = runner.num_reqs_max_model_len
+    counts = [11, 15, *range(20, 32), 34, 35, *range(38, 49), 1, 8, 33]
+    for num_verify in counts:
+        verify_tokens = num_verify * (1 + K)
+        # Decode-only, then a prefill chunk filling each larger token bucket.
+        totals = [verify_tokens] + [t for t in pads if t > verify_tokens]
+        for total in totals:
+            num_tokens = tpu_runner._get_padded_token_len(pads, total)
+            num_reqs = num_verify + (total > verify_tokens)
+            if num_reqs > runner.scheduler_config.max_num_seqs:
+                continue
+            md = manager.get_spec_decode_metadata(
+                num_draft_tokens=np.full(num_verify, K, dtype=np.int32),
+                cu_num_scheduled_tokens=np.cumsum(
+                    np.full(num_verify, 1 + K, dtype=np.int32)
+                ),
+                padded_num_reqs=tpu_runner._get_padded_num_reqs_with_upper_limit(
+                    num_reqs, runner.max_num_reqs
+                ),
+            )
+            logits_len = md.final_logits_indices.shape[0]
+            assert ((num_tokens,), (logits_len,), (logits_len,)) in warmed_extract, (
+                num_verify,
+                total,
+            )
+            assert (
+                (chunk_reqs,),
+                (num_tokens,),
+                (rows,),
+                (chunk_reqs,),
+                (num_tokens,),
+            ) in warmed_subtract, (num_verify, total)
+
+
+@pytest.mark.parametrize("chunk_reqs", [48, 33, 20, 9])
+def test_async_spec_source_rows_hold_every_chunk_split(chunk_reqs):
+    """The parked substitution source and rejected counts are padded to one
+    row count; it must hold every chunk split's padded rows, or a split step
+    parks an odd length and the next step compiles the glue mid-serving."""
+    runner = _glue_runner(chunk_reqs=chunk_reqs)
+    rows = runner._async_spec_source_rows()
+    max_seqs = runner.scheduler_config.max_num_seqs
+    for num_reqs in range(1, max_seqs + 1):
+        full, rest = divmod(num_reqs, chunk_reqs)
+        chunks = [chunk_reqs] * full + ([rest] if rest else [])
+        parked = sum(
+            tpu_runner._get_padded_num_reqs_with_upper_limit(n, runner.max_num_reqs)
+            for n in chunks
+        )
+        assert parked <= rows, (num_reqs, chunks)
+
+
+@pytest.mark.parametrize("chunk_reqs", [48, 20, 9])
+def test_park_async_spec_source_has_one_length(chunk_reqs):
+    """`sample_tokens` parks the substitution source and the rejected counts
+    at one length whatever chunks the step had: single chunk, several chunks,
+    and a full single chunk (whose source is a flattened view, cloned so the
+    next step reads a plain tensor like the precompile's). The real values
+    stay in front; the tail is padding."""
+    runner = _glue_runner(chunk_reqs=chunk_reqs)
+    K = runner.speculative_config.num_speculative_tokens
+    rows = runner._async_spec_source_rows()
+    bound = rows * (1 + K)
+    sources = {"single_chunk": [torch.arange(8 * (1 + K), dtype=torch.int32)]}
+    if chunk_reqs < runner.scheduler_config.max_num_seqs:
+        # A full chunk, then the remaining requests in a second chunk.
+        sources["multi_chunk"] = [
+            torch.arange(n * (1 + K), dtype=torch.int32) for n in (chunk_reqs, 8)
+        ]
+    for name, chunks in sources.items():
+        source = chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+        num_rejected = torch.ones(sum(c.shape[0] for c in chunks) // (1 + K))
+        parked, parked_rejected = runner._park_async_spec_source(source, num_rejected)
+        assert parked.shape == (bound,), name
+        assert parked_rejected.shape == (rows,), name
+        assert torch.equal(parked[: source.shape[0]], source), name
+        assert torch.equal(parked_rejected[: num_rejected.shape[0]], num_rejected)
+    # A full chunk: already `bound` long, a view of the [rows, 1 + K] source.
+    full = torch.arange(bound, dtype=torch.int32).view(rows, 1 + K).flatten()
+    assert full._base is not None
+    parked, parked_rejected = runner._park_async_spec_source(full, torch.ones(rows))
+    assert parked.shape == (bound,) and parked._base is None
+    assert torch.equal(parked, full)
+    assert parked_rejected.shape == (rows,)
