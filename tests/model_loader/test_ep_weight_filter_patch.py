@@ -21,10 +21,27 @@ unused (``is_unused_checkpoint_weight``) before they are read. No TPU, no
 network.
 """
 
+from types import SimpleNamespace
+
+import pytest
 import torch
+import vllm.config
+import vllm.distributed
+from safetensors.torch import save_file
+from vllm.config.load import LoadConfig
+from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+    determine_expert_map,
+)
+from vllm.model_executor.model_loader import (
+    default_loader,
+    ep_weight_filter,
+    runai_streamer_loader,
+    weight_utils,
+)
 
 from vllm_torchtpu import model_loader_patches
 from vllm_torchtpu.model_loader_patches import (
+    _compute_local_expert_ids,
     _local_tensor_ranges,
     _should_skip_weight_tpu,
     _start_ep_range_prefetch,
@@ -112,6 +129,12 @@ def _restore_iterators(monkeypatch):
         default_loader.DefaultModelLoader,
         "_get_weights_iterator",
         default_loader.DefaultModelLoader._get_weights_iterator,
+    )
+    loader_cls = default_loader.DefaultModelLoader
+    monkeypatch.setattr(
+        loader_cls,
+        "_init_ep_weight_filter",
+        loader_cls._init_ep_weight_filter,  # noqa: SLF001 -- restore loader hook
     )
 
 
@@ -507,3 +530,332 @@ def test_default_loader_skips_unused_shards_and_colocated_tensors(
     (tmp_path / "main.safetensors").unlink()
     with pytest.raises(FileNotFoundError, match="main.safetensors"):
         list(loader.get_all_weights(model_config, dummy_model))
+
+
+def test_should_partition_draft_experts_by_dspark_count_across_loaders(
+    tmp_path, monkeypatch
+):
+    hf_cfg = SimpleNamespace(n_routed_experts=256, dspark_n_routed_experts=128)
+    target_cfg = SimpleNamespace(
+        is_moe=True,
+        runner_type="generate",
+        get_num_experts=lambda: 256,
+        hf_config=hf_cfg,
+    )
+    draft_cfg = SimpleNamespace(
+        model=str(tmp_path),
+        revision=None,
+        quantization=None,
+        multimodal_config=None,
+        is_moe=True,
+        runner_type="draft",
+        get_num_experts=lambda: 256,
+        hf_config=hf_cfg,
+    )
+
+    state = {"ep_size": 4, "ep_rank": 1}
+    vllm_cfg = SimpleNamespace(
+        model_config=target_cfg,
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_ep_weight_filter=True,
+            enable_eplb=False,
+            data_parallel_size=1,
+            tensor_parallel_size=4,
+            prefill_context_parallel_size=1,
+            expert_placement_strategy="linear",
+        ),
+    )
+
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: vllm_cfg)
+    monkeypatch.setattr(
+        vllm.distributed,
+        "get_tensor_model_parallel_rank",
+        lambda: state["ep_rank"],
+    )
+    # Isolate from earlier hierarchical-EP tests that permanently wrap
+    # default_loader.compute_local_expert_ids in the same pytest worker.
+    monkeypatch.setattr(
+        default_loader,
+        "compute_local_expert_ids",
+        ep_weight_filter.compute_local_expert_ids,
+    )
+
+    # At ep_size=1 all experts are local (returns None); at EP in {2, 4, 8} draft
+    # partitions 128 experts work-proportionally (disjoint union == 0..127).
+    vllm_cfg.parallel_config.tensor_parallel_size = 1
+    state["ep_rank"] = 0
+    assert _compute_local_expert_ids(draft_cfg) is None
+    for ep_size in (2, 4, 8):
+        vllm_cfg.parallel_config.tensor_parallel_size = ep_size
+        per_rank_sets = []
+        for rank in range(ep_size):
+            state["ep_rank"] = rank
+            ids = _compute_local_expert_ids(draft_cfg)
+            assert ids is not None
+            assert len(ids) == 128 // ep_size
+            _, expert_map, _ = determine_expert_map(
+                ep_size=ep_size,
+                ep_rank=rank,
+                global_num_experts=draft_cfg.hf_config.dspark_n_routed_experts,
+                expert_placement_strategy="linear",
+            )
+            assert expert_map is not None
+            expected_map_ids = {
+                gid for gid, lid in enumerate(expert_map.tolist()) if lid >= 0
+            }
+            assert ids == expected_map_ids
+            per_rank_sets.append(ids)
+        assert set().union(*per_rank_sets) == set(range(128))
+        assert sum(len(s) for s in per_rank_sets) == 128
+
+    # At ep_size=4, ep_rank=1: target owns {64..127} whereas draft owns {32..63}.
+    vllm_cfg.parallel_config.tensor_parallel_size = 4
+    state["ep_rank"] = 1
+    assert _compute_local_expert_ids(target_cfg) == set(range(64, 128))
+    assert _compute_local_expert_ids(draft_cfg) == set(range(32, 64))
+
+    # DefaultModelLoader filters safetensors using draft partition {32..63}.
+    shard = tmp_path / "model-00001.safetensors"
+    packed = torch.ones(8, dtype=torch.uint8)
+    save_file(
+        {
+            "layers.0.ffn.experts.32.w1.weight_packed": packed,
+            "layers.0.ffn.experts.64.w1.weight_packed": packed.clone(),
+            "layers.0.self_attn.o_proj.weight": torch.ones(2, 2),
+        },
+        str(shard),
+    )
+    read_names = []
+    real_safe_open = weight_utils.safe_open
+
+    class _TrackingSafeOpen:
+        def __init__(self, filename, *args, **kwargs):
+            self._inner = real_safe_open(filename, *args, **kwargs)
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def keys(self):
+            return self._inner.keys()
+
+        def get_tensor(self, name):
+            read_names.append(name)
+            return self._inner.get_tensor(name)
+
+    monkeypatch.setattr(weight_utils, "safe_open", _TrackingSafeOpen)
+    monkeypatch.setattr(
+        weight_utils, "should_skip_weight", weight_utils.should_skip_weight
+    )
+    monkeypatch.setattr(
+        ep_weight_filter, "should_skip_weight", ep_weight_filter.should_skip_weight
+    )
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
+    patch_default_loader_ep_weight_filter()
+
+    loader = default_loader.DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    loaded = []
+    dummy_model = SimpleNamespace(
+        load_weights=lambda weights: loaded.extend(name for name, _ in weights)
+    )
+    loader.load_weights(dummy_model, draft_cfg)
+    assert loader.local_expert_ids == set(range(32, 64))
+    assert set(read_names) == {
+        "layers.0.ffn.experts.32.w1.weight_packed",
+        "layers.0.self_attn.o_proj.weight",
+    }
+    assert set(loaded) == set(read_names)
+
+    # RunaiModelStreamerLoader threads model_config and resets it in finally.
+    rsl_cls = runai_streamer_loader.RunaiModelStreamerLoader
+    monkeypatch.setattr(rsl_cls, "load_weights", rsl_cls.load_weights)
+    orig_rsl_iter = rsl_cls._get_weights_iterator  # noqa: SLF001 -- restore hook
+    monkeypatch.setattr(rsl_cls, "_get_weights_iterator", orig_rsl_iter)
+    monkeypatch.setattr(rsl_cls, "_tpu_sharded_ep_patch", False, raising=False)
+    monkeypatch.setattr(rsl_cls, "_loading_model", None, raising=False)
+    monkeypatch.setattr(rsl_cls, "_loading_model_config", None, raising=False)
+
+    captured_stream_ids = []
+    fail_on_call = {"flag": False}
+
+    def fake_orig_load(self, model, model_config):
+        list(self._get_weights_iterator(model_config.model, model_config.revision))
+        if fail_on_call["flag"]:
+            raise RuntimeError("injected stream failure")
+
+    monkeypatch.setattr(rsl_cls, "load_weights", fake_orig_load)
+    monkeypatch.setattr(
+        model_loader_patches, "_patch_runai_local_rank_discovery", lambda: None
+    )
+    monkeypatch.setattr(
+        model_loader_patches,
+        "_sharded_runai_weights_iterator",
+        lambda files, local_ids, use_tqdm, model, **_kwargs: (
+            captured_stream_ids.append(set(local_ids)) or iter(())
+        ),
+    )
+    model_loader_patches.patch_runai_sharded_expert_streaming()
+
+    streamer = object.__new__(rsl_cls)
+    streamer.load_config = LoadConfig(load_format="runai_streamer")
+    monkeypatch.setattr(
+        streamer, "_prepare_weights", lambda path, rev: ["shard-0.safetensors"]
+    )
+    streamer.load_weights(dummy_model, draft_cfg)
+    assert captured_stream_ids == [set(range(32, 64))]
+    assert streamer._loading_model_config is None  # noqa: SLF001 -- verify reset
+
+    fail_on_call["flag"] = True
+    with pytest.raises(RuntimeError, match="injected stream failure"):
+        streamer.load_weights(dummy_model, draft_cfg)
+    assert streamer._loading_model_config is None  # noqa: SLF001 -- verify reset
+
+
+def test_should_fallback_to_model_num_experts_when_draft_dspark_count_absent_or_zero(
+    monkeypatch,
+):
+    vllm_cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_moe=True,
+            runner_type="generate",
+            get_num_experts=lambda: 256,
+            hf_config=SimpleNamespace(n_routed_experts=256),
+        ),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_ep_weight_filter=True,
+            enable_eplb=False,
+            data_parallel_size=1,
+            tensor_parallel_size=4,
+            prefill_context_parallel_size=1,
+            expert_placement_strategy="linear",
+        ),
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: vllm_cfg)
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(
+        default_loader,
+        "compute_local_expert_ids",
+        ep_weight_filter.compute_local_expert_ids,
+    )
+
+    for hf_cfg in (SimpleNamespace(), SimpleNamespace(dspark_n_routed_experts=0)):
+        draft_cfg = SimpleNamespace(
+            is_moe=True,
+            runner_type="draft",
+            get_num_experts=lambda: 64,
+            hf_config=hf_cfg,
+        )
+        assert _compute_local_expert_ids(draft_cfg) == set(range(16, 32))
+
+
+def test_should_support_both_default_loader_init_ep_filter_signatures_and_delegate(
+    monkeypatch,
+):
+    vllm_cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_moe=True,
+            runner_type="generate",
+            get_num_experts=lambda: 256,
+            hf_config=SimpleNamespace(n_routed_experts=256),
+        ),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_ep_weight_filter=True,
+            enable_eplb=False,
+            data_parallel_size=1,
+            tensor_parallel_size=4,
+            prefill_context_parallel_size=1,
+            expert_placement_strategy="linear",
+        ),
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: vllm_cfg)
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(
+        default_loader,
+        "compute_local_expert_ids",
+        ep_weight_filter.compute_local_expert_ids,
+    )
+
+    draft_cfg = SimpleNamespace(
+        is_moe=True,
+        runner_type="draft",
+        get_num_experts=lambda: 256,
+        hf_config=SimpleNamespace(n_routed_experts=256, dspark_n_routed_experts=128),
+    )
+    target_cfg = vllm_cfg.model_config
+    dummy_model = SimpleNamespace(name="dummy")
+
+    # 1. vLLM >=0.34 signature: _init_ep_weight_filter(self, model, model_config).
+    delegated_v34 = []
+
+    def fake_v34_init_ep_filter(self, model, model_config) -> None:
+        delegated_v34.append((model, model_config))
+        if model_config.runner_type == "generate":
+            self.local_expert_ids = {99}
+
+    monkeypatch.setattr(
+        weight_utils, "should_skip_weight", weight_utils.should_skip_weight
+    )
+    monkeypatch.setattr(
+        ep_weight_filter, "should_skip_weight", ep_weight_filter.should_skip_weight
+    )
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
+    monkeypatch.setattr(
+        default_loader.DefaultModelLoader,
+        "_init_ep_weight_filter",
+        fake_v34_init_ep_filter,
+    )
+    patch_default_loader_ep_weight_filter()
+
+    loader = default_loader.DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    # DSpark draft overrides local_expert_ids without delegating to upstream.
+    loader._init_ep_weight_filter(dummy_model, draft_cfg)  # noqa: SLF001
+    assert loader.local_expert_ids == set(range(32, 64))
+    assert delegated_v34 == []
+
+    # Target model delegates with both (model, model_config) args intact.
+    loader._init_ep_weight_filter(dummy_model, target_cfg)  # noqa: SLF001
+    assert delegated_v34 == [(dummy_model, target_cfg)]
+    assert loader.local_expert_ids == {99}
+
+    # Reusing the same loader for a non-MoE model clears stale local_expert_ids.
+    non_moe_cfg = SimpleNamespace(
+        is_moe=False,
+        runner_type="draft",
+        get_num_experts=lambda: 0,
+        hf_config=SimpleNamespace(),
+    )
+    loader._init_ep_weight_filter(dummy_model, non_moe_cfg)  # noqa: SLF001
+    assert loader.local_expert_ids is None
+    assert delegated_v34[-1] == (dummy_model, non_moe_cfg)
+
+    # 2. vLLM 0.33 signature: _init_ep_weight_filter(self, model_config).
+    delegated_v33 = []
+
+    def fake_v33_init_ep_filter(self, model_config) -> None:
+        delegated_v33.append(model_config)
+        self.local_expert_ids = {77}
+
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
+    monkeypatch.setattr(
+        default_loader.DefaultModelLoader,
+        "_init_ep_weight_filter",
+        fake_v33_init_ep_filter,
+    )
+    patch_default_loader_ep_weight_filter()
+
+    loader._init_ep_weight_filter(draft_cfg)  # noqa: SLF001
+    assert loader.local_expert_ids == set(range(32, 64))
+    assert delegated_v33 == []
+
+    loader._init_ep_weight_filter(model_config=target_cfg)  # noqa: SLF001
+    assert delegated_v33 == [target_cfg]
+    assert loader.local_expert_ids == {77}

@@ -51,6 +51,7 @@ in the allowlist and stay unfiltered.
 
 import functools
 import gc
+import inspect
 import json
 import os
 import struct
@@ -130,7 +131,7 @@ def _should_skip_weight_tpu(
     return _should_skip(weight_name, local_expert_ids)
 
 
-def _compute_local_expert_ids() -> set[int] | None:
+def _compute_local_expert_ids(model_config=None) -> set[int] | None:
     """Local expert ids for this rank, or None when filtering is off.
 
     Mirrors ``DefaultModelLoader._init_ep_weight_filter`` (vLLM 0.26) so the
@@ -140,7 +141,8 @@ def _compute_local_expert_ids() -> set[int] | None:
     from vllm.model_executor.model_loader import default_loader
 
     vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
+    if model_config is None:
+        model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
 
     if not (
@@ -153,6 +155,12 @@ def _compute_local_expert_ids() -> set[int] | None:
     if parallel_config.enable_eplb:
         return None
     num_experts = model_config.get_num_experts()
+    if model_config.runner_type == "draft":
+        # vLLM ModelConfig.get_num_experts() reads target n_routed_experts;
+        # override with dspark_n_routed_experts when non-zero to match draft
+        # MoE EP expert maps.
+        dspark_experts = getattr(model_config.hf_config, "dspark_n_routed_experts", 0)
+        num_experts = dspark_experts or num_experts
     if num_experts <= 0:
         return None
 
@@ -467,10 +475,12 @@ def patch_runai_sharded_expert_streaming() -> None:
 
     def load_weights(self, model, model_config):
         self._loading_model = model
+        self._loading_model_config = model_config
         try:
             return original_load_weights(self, model, model_config)
         finally:
             self._loading_model = None
+            self._loading_model_config = None
 
     def _get_weights_iterator(
         self,
@@ -479,7 +489,7 @@ def patch_runai_sharded_expert_streaming() -> None:
         is_unused_weight: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         try:
-            local_expert_ids = _compute_local_expert_ids()
+            local_expert_ids = _compute_local_expert_ids(self._loading_model_config)
         except AttributeError:
             # A vLLM without the EP weight filter (no
             # enable_ep_weight_filter / expert_placement_strategy fields).
@@ -519,6 +529,8 @@ def patch_runai_sharded_expert_streaming() -> None:
         )
 
     rsl.RunaiModelStreamerLoader._loading_model = None
+    # Default class attr for direct _get_weights_iterator calls.
+    rsl.RunaiModelStreamerLoader._loading_model_config = None
     rsl.RunaiModelStreamerLoader.load_weights = load_weights
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
     rsl.RunaiModelStreamerLoader._tpu_sharded_ep_patch = True
@@ -621,9 +633,41 @@ def patch_default_loader_ep_weight_filter() -> None:
 
         return _iter_skipping_unused()
 
+    original_init_ep_filter = (
+        default_loader.DefaultModelLoader._init_ep_weight_filter  # noqa: SLF001 -- wrapping upstream DefaultModelLoader EP filter setup
+    )
+
+    # Upstream DefaultModelLoader._init_ep_weight_filter does not account for
+    # hf_config.dspark_n_routed_experts when computing local_expert_ids for
+    # draft models under --enable-ep-weight-filter; remove this wrapper once
+    # upstream supports draft-specific expert counts.
+    orig_sig = inspect.signature(original_init_ep_filter)
+
+    @functools.wraps(original_init_ep_filter)
+    def _init_ep_weight_filter(self, *args, **kwargs) -> None:
+        bound = orig_sig.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        model_config = bound.arguments["model_config"]
+        dspark_experts = getattr(model_config.hf_config, "dspark_n_routed_experts", 0)
+        if model_config.runner_type == "draft" and dspark_experts:
+            self.local_expert_ids = _compute_local_expert_ids(model_config)
+            if self.local_expert_ids is not None:
+                logger.warning_once(
+                    "Applying temporary TPU EP weight filter override for draft "
+                    "model (dspark_n_routed_experts=%d): upstream vLLM's "
+                    "DefaultModelLoader._init_ep_weight_filter ignores "
+                    "dspark_n_routed_experts under --enable-ep-weight-filter.",
+                    dspark_experts,
+                )
+            return
+        # Clear any stale filter state if the same loader instance is reused.
+        self.local_expert_ids = None
+        return original_init_ep_filter(self, *args, **kwargs)
+
     weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
     default_loader.safetensors_weights_iterator = safetensors_weights_iterator
     default_loader.DefaultModelLoader._get_weights_iterator = _get_weights_iterator
+    default_loader.DefaultModelLoader._init_ep_weight_filter = _init_ep_weight_filter  # noqa: SLF001 -- patching DefaultModelLoader for draft EP expert counts
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers %s, skips unused "
