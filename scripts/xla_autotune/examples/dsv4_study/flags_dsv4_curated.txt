@@ -1,0 +1,51 @@
+# Curated XLA / libtpu candidate flag subset for DeepSeek-V4 Pro
+# Focuses on MoE collectives, SparseCore offloading, latency hiding, and VMEM scavenging.
+
+# --- 1. MoE All-to-All & Ragged Communication ---
+--xla_tpu_enable_async_all_to_all=true
+--xla_tpu_enable_async_all_to_all=false
+--xla_tpu_force_async_all_to_all=true
+--xla_tpu_enable_async_ragged_all_to_all=true
+--xla_tpu_enable_sparse_core_async_all_to_all=true
+--xla_tpu_enable_sparse_core_collective_offload_ragged_all_to_all=true
+--xla_tpu_all_to_all_with_different_output_addresses=true
+--xla_tpu_force_custom_barrier_for_ragged_all_to_all=false
+
+# --- 2. Collective Offloading & Async All-Gather ---
+--xla_enable_async_all_gather=ENABLED
+--xla_enable_async_all_gather=DISABLED
+--xla_tpu_enable_sparse_core_collective_offload_all_gather=ENABLED
+--xla_tpu_enable_sparse_core_collective_offload_all_gather=DISABLED
+--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0
+--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=65536
+--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=524288
+--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=ENABLED
+--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=DISABLED
+--xla_tpu_enable_sparse_core_reduce_scatter_v2=true
+--xla_tpu_prefer_einsum_reduce_scatter=true
+--xla_tpu_use_minor_sharding_for_major_trivial_input=true
+
+# --- 3. Collective Fusion & Async Merger ---
+--xla_tpu_enable_async_collective_fusion=true
+--xla_tpu_enable_async_collective_fusion=false
+--xla_tpu_enable_async_collective_merger=true
+--xla_tpu_enable_async_collective_merger=false
+--xla_tpu_communication_computation_optimization=true
+--xla_tpu_communication_computation_optimization=false
+--xla_tpu_enable_collective_compute_fusion=true
+--xla_tpu_enable_collective_pipeliner=true
+--xla_tpu_enable_collective_pipeliner=false
+
+# --- 4. Latency Hiding & Scheduling ---
+--xla_tpu_enable_latency_hiding_scheduler=true
+--xla_tpu_enable_latency_hiding_scheduler=false
+--xla_tpu_enable_brkga_latency_hiding_scheduler=true
+--xla_tpu_enable_dozer_latency_hiding_scheduler=true
+--xla_latency_hiding_scheduler_resource_sharing=true
+--xla_latency_hiding_scheduler_resource_serializing=true
+
+# --- 5. VMEM Scavenging ---
+--xla_tpu_vmem_scavenging_mode=NONE
+--xla_tpu_vmem_scavenging_mode=SAFE
+--xla_tpu_vmem_scavenging_mode=AGGRESSIVE
+--xla_tpu_vmem_scavenging_mode=SAFE_IFF_KERNEL_REQUIRED
