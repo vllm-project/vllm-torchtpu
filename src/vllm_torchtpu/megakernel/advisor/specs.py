@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, TypedDict, get_args
 
@@ -64,14 +64,18 @@ __all__ = [
     "STRUCTURAL_LAYER_TAGS",
     "SUPPORTED_ONCHIP_FAMILIES",
     "VALID_SOURCE_SCOPES",
+    "AdvisorReport",
     "CollectiveCall",
     "DispatchRegime",
     "EfficiencySpec",
     "FusionScope",
     "GainBasis",
+    "LayerGroupCandidate",
+    "LayerGroupSearchReport",
     "MeasurementsData",
     "MoEMode",
     "ObjectiveMode",
+    "ParallelismComparisonRow",
     "Phase",
     "ProvenanceMetric",
     "ProvenanceTag",
@@ -573,6 +577,8 @@ class WorkloadSpec:
     per_op_step_us: float | None = None
     step_coverage: float | None = None
     batch_explicit: bool = False
+    # True when the caller explicitly fixed moe_mode rather than leaving it unpinned.
+    moe_mode_explicit: bool = False
     latent_proj_tp: int = 0
 
     def _validate_literals_and_bools(self) -> None:
@@ -593,6 +599,7 @@ class WorkloadSpec:
             "vmem_fit_headroom",
             "host_head_explicit",
             "batch_explicit",
+            "moe_mode_explicit",
         ):
             scalar_bool(getattr(self, name), f"WorkloadSpec.{name}")
 
@@ -691,3 +698,120 @@ class ScopeEstimate:
     break_even_host_head_delta_us: float = 0.0
     ranking_metric: str = "step_bound_us"
     binding_unit: str = "hbm"
+
+
+class ParallelismComparisonRow(TypedDict):
+    """Single layout comparison entry returned by `compare_parallelism_candidates`."""
+
+    layout: str
+    chips: int
+    step_floor_us: float
+    throughput_tok_s_per_chip: float
+    recommended_scope: FusionScope
+    fastest_scope: FusionScope
+    hbm_fits: bool
+    valid: bool
+
+
+@dataclass(frozen=True)
+class AdvisorReport:
+    """First-principles physics fusion-scope verdict for a single workload.
+
+    `hbm_fits` checks physical HBM capacity (`<= 1.00 * hbm_capacity_bytes`)
+    to report hard physical OOM, whereas `hbm_pool_overflow` flags footprints
+    exceeding `workload.hbm_utilization_cap` (defaulting to
+    `HBM_UTILIZATION_CAP = 0.92` for non-KV runtime headroom).
+    """
+
+    model: str
+    chip: str
+    phase: Phase
+    active_tokens: int
+    effective_context: int
+    vmem_budget_mib: float
+    hbm_fits: bool
+    hbm_used_gb: float
+    hbm_capacity_gb: float
+    ridge_dense_flop_per_byte: float
+    step_arithmetic_intensity: float
+    asymptotic_decode_intensity: float | None
+    recommended_scope: FusionScope
+    build_megakernel: bool
+    rationale: str
+    scopes: tuple[ScopeEstimate, ...]
+    per_token_vmem_bytes: int = 0
+    ridge_tokens: int = 0
+    recommended_moe_mode: str = "dense_mlp"
+    dma_buffers: int = 2
+    verdict: str = "separate_likely"
+    confidence: str = "prior_only"
+    flags: tuple[str, ...] = ()
+    metrics: dict[str, ProvenanceMetric] = field(default_factory=dict)
+    unresolved_assumptions: tuple[dict[str, object], ...] = ()
+    fastest_scope: FusionScope = "per_op"
+    fastest_verdict: str = "separate_likely"
+    evidence: SupportStatus = "baseline"
+    gain_basis: GainBasis = "fused_scope_device_estimate"
+    coverage: str = (
+        "decoder layer stack; excludes embedding, LM head, sampling, "
+        "draft heads and modality towers"
+    )
+    hbm_pool_overflow: bool = False
+    hbm_utilization_cap: float = HBM_UTILIZATION_CAP
+    ranking_metric: str = "step_bound_us"
+    binding_unit: str = "hbm"
+    core_support: SupportStatus = "baseline"
+    core_blockers: tuple[str, ...] = ()
+    core_ready: bool = False
+    core_ready_scope: FusionScope = "per_op"
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize `AdvisorReport` to a JSON-compatible dictionary.
+
+        Returns:
+            Dictionary representation suitable for JSON serialization.
+        """
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LayerGroupCandidate:
+    """Evaluation of one layer-stack partition under fused `layer_group` pricing."""
+
+    label: str
+    layer_groups: tuple[int, ...]
+    num_groups: int
+    feasible: bool
+    max_vmem_tokens: int
+    num_vmem_splits: int
+    step_bound_us: float
+    step_achievable_us: float
+    step_upper_us: float
+    is_listed: bool = False
+
+
+@dataclass(frozen=True)
+class LayerGroupSearchReport:
+    """Comparison of candidate `layer_group` partitions against `per_op`."""
+
+    model: str
+    chip: str
+    phase: Phase
+    layout: str
+    active_tokens: int
+    per_op_step_bound_us: float
+    per_op_step_achievable_us: float
+    per_op_step_upper_us: float
+    listed_layer_groups: tuple[int, ...]
+    listed_step_bound_us: float | None
+    best: LayerGroupCandidate | None
+    gap_vs_per_op_us: float
+    gap_vs_per_op_pct: float
+    gap_vs_listed_us: float | None
+    gap_vs_listed_pct: float | None
+    candidates: tuple[LayerGroupCandidate, ...]
+    note: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize layer-group search summary to a JSON-ready dictionary."""
+        return asdict(self)
