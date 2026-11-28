@@ -82,7 +82,6 @@ WIDE_GEOM = ModelGeometry(
     vocab=248320,
     mtp_layers=0,
 )
-TP32 = Parallel(tp=32)
 
 
 def test_hard_floor_is_max_of_resources() -> None:

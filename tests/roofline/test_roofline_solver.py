@@ -1410,6 +1410,91 @@ def test_cli_ici_bw_override_scales_ici_bw_and_pool_tables(
     assert "pareto" in table_out
 
 
+def test_hbm_breakdown_search_funnel_and_decode_floor_on_basis() -> None:
+    """Verify HBM breakdown sums, SearchStats monotonicity, and decode_floor."""
+    q35_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    q35_cfg = json.loads(q35_path.read_text(encoding="utf-8"))
+    geometry = rf.from_hf_config(q35_cfg, model_ref="Qwen/Qwen3.5-397B-A17B-FP8")
+    dtypes = rf.dtypes_from_hf_config(q35_cfg)
+    chip = rf.CHIPS["tpu7x"]
+    scenario = rf.TrafficScenario(
+        name="funnel-check",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(1, 8),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = rf.solve_serving_plan(
+        geometry, dtypes, chip, scenario, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert serving_plan.search is not None
+    assert serving_plan.search.core_grid >= serving_plan.search.enumerated
+    assert serving_plan.search.enumerated >= serving_plan.search.hbm_fit
+    assert serving_plan.search.hbm_fit >= serving_plan.search.slo_met
+    assert serving_plan.search.slo_met >= serving_plan.search.frontier
+    assert serving_plan.search.frontier == len(serving_plan.frontier) > 0
+    assert serving_plan.search.slo_met == sum(
+        1 for point in serving_plan.candidates if point.slo_met
+    )
+    assert serving_plan.recommended is not None
+    record = serving_plan.recommended
+    assert record.decode_floor is not None
+    assert record.decode_floor.hard_floor_ms > 0.0
+    pool = record.decode_pool
+    assert pool.hbm_weights_gb + pool.hbm_kv_gb + pool.hbm_state_gb == pytest.approx(
+        pool.hbm_used_gb, rel=1e-6
+    )
+
+    tight_scenario = rf.TrafficScenario(
+        name="tight-slo-funnel",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 8),
+        tpot_slo_ms=0.001,
+        kv_working_set_turns=1.0,
+    )
+    tight_plan = rf.solve_serving_plan(
+        geometry, dtypes, chip, tight_scenario, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert tight_plan.search is not None
+    assert tight_plan.search.slo_met == 0
+    assert tight_plan.search.frontier == 0
+    assert len(tight_plan.frontier) == 0
+
+    disagg_plan = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        rf.TrafficScenario(
+            name="disagg-funnel-256",
+            isl=4096,
+            osl=256,
+            prefix_hit_rate=0.0,
+            accept_len=1.0,
+            think_time_s=None,
+            concurrencies=(8,),
+            kv_working_set_turns=1.0,
+        ),
+        SolveOptions(
+            mode="disagg",
+            max_chips=256,
+            include_pairs=True,
+            topologies=(rf.TOPOLOGIES["2x2x1"],),
+        ),
+    )
+    assert disagg_plan.search is not None
+    assert disagg_plan.search.core_grid >= disagg_plan.search.enumerated
+    assert disagg_plan.search.enumerated >= disagg_plan.search.hbm_fit
+    assert disagg_plan.search.hbm_fit >= disagg_plan.search.slo_met
+    assert disagg_plan.search.slo_met >= disagg_plan.search.frontier
+
+
 def test_decode_pool_record_counts_decode_steps_after_first_token() -> None:
     """Verify standalone decode pool records use max(0, osl - 1) decode steps."""
     bundle = load_locked_bundle("qwen3_5_397b_fp8.json")

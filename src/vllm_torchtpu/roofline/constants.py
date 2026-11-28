@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from jax.experimental.pallas import tpu as pltpu
 
@@ -250,6 +250,19 @@ NO_FEASIBLE_LAYOUT_WARNING: str = (
     "No feasible layout met memory and latency constraints."
 )
 
+
+type SloVerdict = Literal["ruled_out", "estimate_meets", "undecided"]
+
+SLO_VERDICT_RULED_OUT: SloVerdict = "ruled_out"
+SLO_VERDICT_UNDECIDED: SloVerdict = "undecided"
+SLO_VERDICT_ESTIMATE_MEETS: SloVerdict = "estimate_meets"
+SLO_VERDICT_RANK: dict[str, int] = {
+    SLO_VERDICT_RULED_OUT: 0,
+    SLO_VERDICT_UNDECIDED: 1,
+    SLO_VERDICT_ESTIMATE_MEETS: 2,
+}
+FRONTIER_2D_TIE_TOLERANCE: float = 1e-9
+
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
 CHIP_SPEC_SCHEMA: str = "vllm_torchtpu.roofline.chip_spec/v1"
@@ -393,6 +406,11 @@ UNIT_COLL_CACHE_MAXSIZE: int = 32768
 BLOCK_PARALLEL_ENABLED: int = 2
 
 # Informational warning emitted when closed-loop think_time_s is zero.
+
+UNKNOWN_THINK_TIME_WARNING: str = (
+    "Think time omitted: closed-loop concurrency throttling is not applied."
+)
+
 ZERO_THINK_TIME_WARNING: str = (
     "Closed-loop scenario evaluated with zero think time: decode residency "
     "matches concurrency up to the HBM capacity limit without client request pauses."

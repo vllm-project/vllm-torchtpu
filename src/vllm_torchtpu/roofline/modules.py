@@ -27,6 +27,7 @@ from .constants import (
     BF16_BYTES,
     CAUSAL_MIDPOINT_HALF,
     DEFAULT_CORES_PER_CHIP,
+    DEFAULT_SSM_STATE_BYTES,
     FP8_BYTES,
     FP32_BYTES,
     GLU_MATMUL_COUNT,
@@ -65,21 +66,25 @@ _DIST_SAMPLING_SCALAR_BYTES: float = 2.0 * FP32_BYTES
 class Dtypes:
     """Element widths in bytes for each tensor role and activation peak."""
 
-    w_dense: float = 1.0
-    w_expert: float = 1.0
-    w_aux: float = 2.0
-    kv: float = 1.0
-    state: float = 4.0
-    conv: float = 2.0
-    router: float = 2.0
-    lm_head: float = 2.0
+    w_dense: float = FP8_BYTES
+    w_expert: float = FP8_BYTES
+    w_aux: float = BF16_BYTES
+    kv: float = FP8_BYTES
+    state: float = DEFAULT_SSM_STATE_BYTES
+    conv: float = BF16_BYTES
+    router: float = BF16_BYTES
+    lm_head: float = BF16_BYTES
     act: Literal["a4", "a8", "a16"] = "a8"
     w_dense_source: Literal["quantization_config", "flag", "default"] = "default"
     w_expert_source: Literal["quantization_config", "flag", "default"] = "default"
     kv_source: Literal["quantization_config", "flag", "default"] = "default"
-    w_dense_dtype: str = "bfloat16"
-    w_expert_dtype: str = "bfloat16"
-    kv_dtype: str = "bfloat16"
+    state_source: Literal["quantization_config", "config", "flag", "default"] = (
+        "default"
+    )
+    w_dense_dtype: str = "fp8"
+    w_expert_dtype: str = "fp8"
+    kv_dtype: str = "fp8"
+    state_dtype: str = "float32"
 
 
 def activation_wire_bytes(act: str) -> float:
