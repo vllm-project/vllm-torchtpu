@@ -45,6 +45,7 @@ _PIECES_ENV = {
     "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE": False,
     "TPU_MINIMAX_M3_SP_E4M3_SHARED": False,
     "TPU_MINIMAX_M3_SP_ATTN_PIECES": False,
+    "TPU_MINIMAX_M3_SP_SHARED_PIECES": False,
 }
 
 
@@ -125,6 +126,25 @@ def test_ffn_pieces_bit_exact(tp, monkeypatch, name, dense_per_piece):
     base._flags_restored(models)
     assert calls2.count("rs") == calls1.count("rs") + 4
     assert "ar" not in calls2
+
+
+@pytest.mark.parametrize("attn_pieces", [False, True])
+def test_shared_pieces_bit_exact(tp, monkeypatch, piece_attn, attn_pieces):
+    """TPU_MINIMAX_M3_SP_SHARED_PIECES on the target SP flags through the
+    layer harness (its stand-in FFN has no shared expert, so this checks the
+    layer path and calls are unchanged; test_moe_shared_pieces_match_block
+    checks the shared expert itself): same bits as one piece."""
+    cfg = dict(base._TARGET)
+    want, _, _ = _run(tp, monkeypatch, **cfg)
+    kw = dict(TPU_MINIMAX_M3_SP_ATTN_PIECES=attn_pieces)
+    plain, calls1, _ = _run(tp, monkeypatch, **cfg, **_pieces(**kw))
+    outs, calls2, models = _run(
+        tp, monkeypatch, **cfg, **_pieces(TPU_MINIMAX_M3_SP_SHARED_PIECES=True, **kw)
+    )
+    _assert_same(plain, want)
+    _assert_same(outs, want)
+    base._flags_restored(models)
+    assert calls2 == calls1
 
 
 def test_ffn_pieces_hand_the_ffn_a_list(tp, monkeypatch):
@@ -291,6 +311,36 @@ def test_moe_list_input_matches_block(monkeypatch):
     got = moe(list(pieces))
     assert moe.experts.routed_experts.quant_method.calls == 2
     torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_moe_shared_pieces_match_block(monkeypatch):
+    """TPU_MINIMAX_M3_SP_SHARED_PIECES: the shared expert's gate_up runs once
+    per e4m3 piece (runner path and shared-in-combine path), same bits."""
+    _jax_e4m3_matmul(monkeypatch)
+    seen = []
+    quant = base.quant
+    inner = quant._e4m3_matmul
+    monkeypatch.setattr(
+        quant, "_e4m3_matmul", lambda q, *a: (seen.append(q.shape[0]), inner(q, *a))[1]
+    )
+    x = base._input()
+    q8, scale = mm._quantize_rows(x)
+    pieces = [(q8[:128], scale[:128]), (q8[128:], scale[128:])]
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_E4M3_SHARED", True, raising=False)
+    for combine in (False, True):
+        monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_SHARED_PIECES", False, raising=False)
+        if combine:
+            moe, _ = base._moe_with_shared(monkeypatch, True)
+        else:
+            moe, mlp = base._shared_moe()
+        want = moe((q8, scale))
+        monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_SHARED_PIECES", True, raising=False)
+        seen.clear()
+        got = moe(list(pieces))
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+        assert seen == [128, q8.shape[0] - 128], (combine, seen)
+        if not combine:
+            assert "_e4m3_rows" not in mlp.__dict__
 
 
 def test_mlp_list_input_matches_block(monkeypatch):

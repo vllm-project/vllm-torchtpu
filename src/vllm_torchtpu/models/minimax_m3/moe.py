@@ -45,6 +45,13 @@ def cat_rows(pieces: "Rows | list[Rows]") -> Rows:
     return torch.cat(pieces)
 
 
+def _num_rows(x: "Rows | list[Rows]") -> int:
+    """Row count of a row block, an (e4m3, scale) pair or a list of pieces."""
+    if isinstance(x, list):
+        return sum(_num_rows(piece) for piece in x)
+    return (x[0] if isinstance(x, tuple) else x).shape[0]
+
+
 def _dequant(x: Rows) -> torch.Tensor:
     return (x[0].float() * x[1]).to(torch.bfloat16) if isinstance(x, tuple) else x
 
@@ -99,6 +106,14 @@ class MiniMaxM3MLP(nn.Module):
 
     def activation(self, x: Rows | list[Rows]) -> torch.Tensor:
         """``act_fn(gate_up_proj(x))``: the down projection's input."""
+        if (
+            envs.TPU_MINIMAX_M3_SP_SHARED_PIECES
+            and isinstance(x, list)
+            and len(x) > 1
+            and isinstance(x[0], tuple)
+        ):
+            # Per gathered e4m3 piece (row-local: same bits as the joined rows).
+            return torch.cat([self.activation(piece) for piece in x])
         x = cat_rows(x)
         if isinstance(x, tuple):
             e4m3_apply = getattr(self.gate_up_proj.quant_method, "apply_e4m3_rows", None)
@@ -109,7 +124,7 @@ class MiniMaxM3MLP(nn.Module):
                 gate_up = e4m3_apply(self.gate_up_proj, *x)
         else:
             rows = self.__dict__.get("_e4m3_rows")
-            if rows is not None and rows[0].shape[0] == x.shape[0]:
+            if rows is not None and _num_rows(rows) == x.shape[0]:
                 # Shared expert of an SP step (TPU_MINIMAX_M3_SP_E4M3_SHARED):
                 # x is the bf16 dequantization of these e4m3 rows.
                 return self.activation(rows)
@@ -215,7 +230,9 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states = torch.cat(rows_bf16)
         rows = None
         if envs.TPU_MINIMAX_M3_SP_E4M3_SHARED and isinstance(pieces[0], tuple):
-            rows = cat_rows(pieces)
+            # TPU_MINIMAX_M3_SP_SHARED_PIECES: the shared expert takes the
+            # pieces (`SharedExpert.activation` runs gate_up per piece).
+            rows = list(pieces) if envs.TPU_MINIMAX_M3_SP_SHARED_PIECES else cat_rows(pieces)
         return hidden_states, rows, router_logits
 
     def _shared_in_combine(self, num_tokens: int) -> bool:

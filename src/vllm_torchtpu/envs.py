@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
     TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE: bool = False
     TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
+    TPU_MINIMAX_M3_SP_SHARED_PIECES: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -1002,6 +1003,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # projection run per piece. Row-local math only: same bits.
     "TPU_MINIMAX_M3_SP_ATTN_PIECES": env_bool(
         "TPU_MINIMAX_M3_SP_ATTN_PIECES", default=False
+    ),
+    # With TPU_MINIMAX_M3_SP_FFN_PIECES and the e4m3 SP gather: a MoE layer's
+    # shared expert gate_up (+ activation) runs on each gathered e4m3 piece as
+    # it lands instead of once on the joined rows, so it overlaps the next
+    # piece's all-gather. Row-local math only: same bits.
+    "TPU_MINIMAX_M3_SP_SHARED_PIECES": env_bool(
+        "TPU_MINIMAX_M3_SP_SHARED_PIECES", default=False
     ),
     # "full" SP: instead of reduce-scattering o_proj's per-rank partial sums
     # (bf16 [T, hidden]), all-to-all the attention output (bf16 [T, heads/TP x
