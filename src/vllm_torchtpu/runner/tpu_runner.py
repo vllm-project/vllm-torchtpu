@@ -194,6 +194,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.owned_args import static_shape_args_owned
 from vllm_torchtpu.runner.pcp import (
     PcpManager,
     mla_kv_page_size,
@@ -418,6 +419,12 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
+# The input ids reaching async substitution can carry the forward's
+# mark_dynamic stamp, which outranks dynamic=False and recompiled the same shape
+# mid-run; strip it with an owned alias (not eagle3's `a[:]` view): the program
+# mutates the ids in place, and the caller gets its own tensor back, so the
+# forward receives exactly the object it passed in.
+@static_shape_args_owned
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,

@@ -20,6 +20,11 @@ import pytest
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.runner.owned_args import (
+    is_owned,
+    is_stamped,
+    static_shape_args_owned,
+)
 from vllm_torchtpu.runner.tpu_runner import (
     TPUModelRunner,
     _substitute_placeholder_token,
@@ -109,3 +114,74 @@ def test_substitute_placeholder_token_rejects_mismatched_lengths():
             torch.zeros(4, dtype=torch.int32),
             torch.zeros(2, dtype=torch.int32),
         )
+
+
+def test_substitute_placeholder_token_strips_dynamic_dim_marks():
+    x = torch.tensor([-1, 10, -1, 20], dtype=torch.int32)
+    torch._dynamo.mark_dynamic(x, 0)
+    assert hasattr(x, "_dynamo_dynamic_indices")
+
+    cur_idx = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
+    pre_idx = torch.tensor([0, 1, -1, -1], dtype=torch.int64)
+    next_tok = torch.tensor([101, 202], dtype=torch.int64)
+    with torch.compiler.set_stance("force_eager"):
+        out = _substitute_placeholder_token(x, cur_idx, pre_idx, next_tok)
+    # The caller gets its own tensor back, updated in place.
+    assert out is x
+    assert out.tolist() == [101, 10, 202, 20]
+    assert _substitute_placeholder_token.__code__.co_filename.endswith("owned_args.py")
+
+
+@pytest.mark.tpu_test
+def test_substitute_placeholder_token_compiled_writes_stamped_buffer(device):
+    """Compiled path: a mark_dynamic buffer is updated in place and returned,
+    and a second call of the same shape does not compile again."""
+    x_np = np.array([-1, 10, -1, 20, -1, 30], dtype=np.int32)
+    cur_np = np.array([0, 2, 1, 3, 4, 5], dtype=np.int64)
+    pre_np = np.array([1, 0, -1, -1, -1, -1], dtype=np.int64)
+    next_np = np.array([101, 202], dtype=np.int32)
+    ref = x_np.copy()
+    real = pre_np >= 0
+    ref[cur_np[real]] = next_np[pre_np[real]]
+
+    def call():
+        x = torch.from_numpy(x_np.copy()).to(device)
+        torch._dynamo.mark_dynamic(x, 0)
+        out = _substitute_placeholder_token(
+            x,
+            torch.from_numpy(cur_np).to(device),
+            torch.from_numpy(pre_np).to(device),
+            torch.from_numpy(next_np).to(device),
+        )
+        assert out is x
+        np.testing.assert_array_equal(x.cpu().numpy(), ref)
+
+    call()
+    graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+    call()
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
+
+
+def test_static_shape_args_owned_passes_stamp_free_owned_args():
+    seen = []
+
+    def probe(a, b):
+        seen.append(a)
+        a.add_(1)
+        return a, b
+
+    wrapped = static_shape_args_owned(probe)
+    x = torch.zeros(4, dtype=torch.int32)
+    torch._dynamo.mark_dynamic(x, 0)
+    big = torch.zeros(8, dtype=torch.int32)
+    view = big[2:6]
+    torch._dynamo.mark_dynamic(view, 0)
+
+    out_a, out_b = wrapped(x, view)
+    alias = seen[0]
+    assert alias is not x and not is_stamped(alias)
+    assert alias.data_ptr() == x.data_ptr()
+    assert out_a is x and x.tolist() == [1, 1, 1, 1]
+    # A stamped view becomes an owned, stamp-free copy.
+    assert out_b is not view and is_owned(out_b) and not is_stamped(out_b)
+    assert torch.equal(out_b, view)
