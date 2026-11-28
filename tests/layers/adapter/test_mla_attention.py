@@ -1470,6 +1470,7 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
         )
         indexer.topk_tokens = topk
         indexer.k_cache = SimpleNamespace(prefix="model.layers.0.indexer")
+        indexer.kv_cache_mode = mla_attention_op._explicit_indexer_kv_cache_mode()
         indexer._build_streamidx_op()
         assert captured["donate_argnums"] == (2,)
         new_cache, topk_out = captured["fn"](
@@ -1786,3 +1787,109 @@ def test_sparse_page_size_packs_rope_by_default_on_sparsecore(monkeypatch):
         )
         == padded
     )
+
+
+@pytest.mark.parametrize(
+    ("writer", "layout_name", "match"),
+    [
+        ("bogus", "HEAD_ALONG_SUBLANE", "Expected writer"),
+        ("xla", "SEQ_ALONG_LANE", "only supports HEAD_ALONG_SUBLANE"),
+    ],
+)
+def test_indexer_k_append_rejects_what_the_dcp_writer_rejects(
+    writer, layout_name, match
+):
+    """`indexer_k_append` refuses the same `writer` / `kv_layout` pairs as
+    `_cp_scatter_indexer_k`, before touching the cache."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    zeros = jnp.zeros((1,), dtype=jnp.int32)
+    with pytest.raises(ValueError, match=match):
+        mla_attention_op.indexer_k_append(
+            jnp.zeros((1, 1, 1, 1), dtype=jnp.uint8),
+            jnp.zeros((1, 1), dtype=jnp.uint8),
+            zeros,
+            zeros,
+            zeros,
+            writer=writer,
+            kv_layout=KVLayout[layout_name],
+        )
+
+
+def test_sparse_attn_indexer_resolves_the_kv_cache_mode_before_its_ops(monkeypatch):
+    """`VllmTPUSparseAttnIndexer.__init__` stores the explicit indexer cache
+    mode (None when unset) before it builds the ops that read it."""
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    cls = mla_attention_op.VllmTPUSparseAttnIndexer
+    seen = []
+    monkeypatch.setattr(
+        mla_attention_op.SparseAttnIndexer, "__init__", lambda self, *a, **k: None
+    )
+    monkeypatch.setattr(
+        cls, "_build_streamidx_op", lambda self: seen.append(self.kv_cache_mode)
+    )
+    monkeypatch.setattr(
+        mla_attention_op, "get_current_vllm_config_or_none", lambda: None
+    )
+    # See `test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence` for
+    # why the module dict entry goes first.
+    if "VLLM_TPU_INDEXER_KV_CACHE_MODE" in vars(envs):
+        monkeypatch.delattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE")
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    assert mla_attention_op._explicit_indexer_kv_cache_mode() is None
+    assert cls().kv_cache_mode is None
+
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "has")
+    assert mla_attention_op._explicit_indexer_kv_cache_mode() == "has"
+    assert cls().kv_cache_mode == "has"
+    assert seen == [None, "has"]
+
+
+def test_indexer_k_append_xla_writes_every_row_in_place():
+    """The XLA writer puts each real row at its sequence position's page and
+    slot, across a page boundary, and drops the padded row."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        get_kv_cache_shape,
+    )
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    page_size, num_pages, width = 16, 8, 129
+    shape = get_kv_cache_shape(num_pages, page_size, width, KVLayout.HEAD_ALONG_SUBLANE)
+    cache = jnp.zeros(shape, dtype=jnp.uint8)
+    # Two requests: 3 new tokens at positions 5..7, 4 new tokens at 14..17
+    # (crossing a page); one padded row.
+    seq_lens = jnp.array([8, 18], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 3, 7], dtype=jnp.int32)
+    pages = jnp.array([[2, 6], [3, 5]], dtype=jnp.int32).reshape(-1)
+    rng = np.random.default_rng(0)
+    k_packed = jnp.asarray(rng.integers(1, 255, (8, width), dtype=np.uint8))
+    out = np.asarray(
+        mla_attention_op.indexer_k_append(
+            cache,
+            k_packed,
+            seq_lens,
+            pages,
+            cu_q_lens,
+            writer="xla",
+            kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+        )
+    )
+    kv_packing = shape[2]
+    expected = np.zeros_like(out)
+    rows = [(0, p) for p in range(5, 8)] + [(1, p) for p in range(14, 18)]
+    page_table = np.asarray(pages).reshape(2, -1)
+    for t, (r, pos) in enumerate(rows):
+        page = page_table[r, pos // page_size]
+        slot = pos % page_size
+        expected[page, slot // kv_packing, slot % kv_packing, :width] = np.asarray(
+            k_packed[t]
+        )
+    np.testing.assert_array_equal(out, expected)

@@ -891,6 +891,71 @@ def mla_attention(
     return kv_cache, output_TNA
 
 
+def sparse_mla_cache_partition_spec(
+    dcp_size: int = 1, dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME
+) -> P:
+    """Partition spec of a sparse MLA layer's nope and rope caches.
+
+    Replicated without DCP; under DCP, each rank holds its position shard
+    along `dcp_axis_name`. Every `shard_map` that writes these caches with
+    `sparse_mla_write_kv_shard` uses it for both caches.
+    """
+    return P(dcp_axis_name) if dcp_size > 1 else P(None)
+
+
+def sparse_mla_write_kv_shard(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int = 1,
+    interleave_size: int = 1,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array]:
+    """Write one step's latents into this shard's nope and rope caches.
+
+    Runs inside a `shard_map` body whose caches are partitioned with
+    `sparse_mla_cache_partition_spec(dcp_size)` and whose latents and
+    metadata are replicated. Under DCP, the rank comes from `cp_rank_as_data`
+    and each rank keeps only the rows it owns.
+
+    Returns the updated `(kv_cache_nope, kv_cache_rope)`.
+    """
+    if dcp_size > 1:
+        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        return update_sparse_mla_kv_cache_dcp(
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp_rank,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+    return update_sparse_mla_kv_cache(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        nope_spec=nope_spec,
+        rope_spec=rope_spec,
+    )
+
+
 def sparse_mla_attention(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -972,13 +1037,14 @@ def sparse_mla_attention(
         f"{rope_dim}"
     )
 
+    cache_spec = sparse_mla_cache_partition_spec()
     in_specs = (
         P(None, None, None),  # ql_nope
         P(None, None, None),  # q_pe
         P(None, None),  # kv_c_normed
         P(None, None),  # k_pe
-        P(None),  # kv_cache_nope
-        P(None),  # kv_cache_rope
+        cache_spec,  # kv_cache_nope
+        cache_spec,  # kv_cache_rope
         P(None),  # topk_indices
         P(None),  # seq_lens
         P(None),  # block_tables
@@ -987,8 +1053,8 @@ def sparse_mla_attention(
     )
     out_specs = (
         P(None, None, None),  # attn output (T, N, D)
-        P(None),  # updated nope cache
-        P(None),  # updated rope cache
+        cache_spec,  # updated nope cache
+        cache_spec,  # updated rope cache
     )
 
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
@@ -1014,7 +1080,7 @@ def sparse_mla_attention(
         query_start_loc_,
         request_distribution_,
     ):
-        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
+        kv_cache_nope, kv_cache_rope = sparse_mla_write_kv_shard(
             kv_cache_nope,
             kv_cache_rope,
             kv_c_normed,
@@ -1175,13 +1241,14 @@ def sparse_mla_attention_dcp(
     )
 
     replicated_3d = P(None, None, None)
+    cache_spec = sparse_mla_cache_partition_spec(dcp_size, dcp_axis_name)
     in_specs = (
         replicated_3d,  # ql_nope
         replicated_3d,  # q_pe
         P(None, None),  # kv_c_normed
         P(None, None),  # k_pe
-        P(dcp_axis_name),  # kv_cache_nope
-        P(dcp_axis_name),  # kv_cache_rope
+        cache_spec,  # kv_cache_nope
+        cache_spec,  # kv_cache_rope
         P(dcp_axis_name, None),  # local_topk_indices
         P(None),  # seq_lens
         P(None),  # block_tables
@@ -1189,8 +1256,8 @@ def sparse_mla_attention_dcp(
         P(None),  # request_distribution
     )
     out_specs = (
-        P(dcp_axis_name),  # nope cache shard
-        P(dcp_axis_name),  # rope cache shard
+        cache_spec,  # nope cache shard
+        cache_spec,  # rope cache shard
         P(dcp_axis_name, None, None),  # partial output
         P(dcp_axis_name, None),  # partial lse
     )
@@ -1217,8 +1284,7 @@ def sparse_mla_attention_dcp(
         query_start_loc_,
         request_distribution_,
     ):
-        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
-        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
+        kv_cache_nope, kv_cache_rope = sparse_mla_write_kv_shard(
             kv_cache_nope,
             kv_cache_rope,
             kv_c_normed,
@@ -1226,11 +1292,11 @@ def sparse_mla_attention_dcp(
             seq_lens_,
             block_tables_,
             query_start_loc_,
-            dcp_rank,
             nope_spec=nope_spec,
             rope_spec=rope_spec,
             dcp_size=dcp_size,
             interleave_size=interleave_size,
+            dcp_axis_name=dcp_axis_name,
         )
 
         # A rank owning none of a token's top-k still has to be handed one

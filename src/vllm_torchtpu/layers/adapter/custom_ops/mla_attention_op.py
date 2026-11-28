@@ -247,6 +247,18 @@ def _resolve_indexer_kv_cache_mode(
     return "pallas", kv_layout
 
 
+def _explicit_indexer_kv_cache_mode() -> str | None:
+    """`VLLM_TPU_INDEXER_KV_CACHE_MODE` when it is set, else None.
+
+    None lets `_resolve_indexer_kv_cache_mode` pick the layout's default.
+    """
+    return (
+        envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+        if envs.is_indexer_kv_cache_mode_explicit()
+        else None
+    )
+
+
 def _dcp_indexer_a2a_for_bucket(
     num_tokens: int, enabled: bool, min_tokens: int
 ) -> bool:
@@ -308,6 +320,51 @@ def _topk_rows(
     if pad_cols:
         rows = torch.nn.functional.pad(rows, (0, pad_cols), value=-1)
     return rows
+
+
+def indexer_k_append(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    writer: str,
+    kv_layout: KVLayout,
+) -> jax.Array:
+    """Append this step's packed K rows to an unsharded indexer cache.
+
+    `writer` and `kv_layout` come from `_resolve_indexer_kv_cache_mode`.
+    Padded rows go to an out-of-bounds page, which the XLA scatter drops.
+    """
+    if writer not in ("xla", "pallas"):
+        raise ValueError(f"Expected writer in ('xla', 'pallas'), got {writer!r}.")
+    if writer == "xla" and kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
+        raise ValueError(
+            f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
+        )
+    if writer == "pallas":
+        return coalesced_kv_append(
+            cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, kv_layout=kv_layout
+        )
+    _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+    block_size = block_size_per_kv_packing * kv_packing
+    # Cache rows are padded to the 128-lane HBM width; pad the packed fp8+scale
+    # rows to match before scattering.
+    k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+
+    # Insert this step's K rows into the KV cache.
+    tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+    seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32)
+    q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+    pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+    page = jnp.where(
+        tok < cu_q_lens[-1],
+        page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
+        jnp.int32(2**30),
+    )
+    slot = pos % block_size
+    return cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(k_packed)
 
 
 def _cp_scatter_indexer_k(
@@ -386,6 +443,9 @@ def _cp_scatter_indexer_k(
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Resolved once, before the builders below read it, so every op that
+        # writes this indexer's K cache picks the same writer and layout.
+        self.kv_cache_mode = _explicit_indexer_kv_cache_mode()
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
@@ -424,11 +484,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
             envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
         )
-        kv_cache_mode = (
-            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
-            if envs.is_indexer_kv_cache_mode_explicit()
-            else None
-        )
+        kv_cache_mode = self.kv_cache_mode
         op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
         # Each layer calls the same jitted kernel with the same shapes, so
         # without its own slot every layer after the first would reuse the
@@ -454,42 +510,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
             )
-            if writer == "xla":
-                _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-                block_size = block_size_per_kv_packing * kv_packing
-                # Cache rows are padded to the 128-lane HBM width; pad the packed
-                # fp8+scale rows to match before scattering.
-                k_packed = jnp.pad(
-                    k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1]))
-                )
-
-                # Insert this step's K rows into the KV cache.
-                tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                    jnp.int32
-                )
-                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-                page = jnp.where(
-                    tok < cu_q_lens[-1],
-                    page_indices.reshape(seq_lens.shape[0], -1)[
-                        seq_id, pos // block_size
-                    ],
-                    jnp.int32(2**30),
-                )
-                slot = pos % block_size
-                cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                    k_packed
-                )
-            else:
-                cache_kv = coalesced_kv_append(
-                    cache_kv,
-                    k_packed,
-                    seq_lens,
-                    page_indices,
-                    cu_q_lens,
-                    kv_layout=kv_layout,
-                )
+            cache_kv = indexer_k_append(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                writer=writer,
+                kv_layout=kv_layout,
+            )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
@@ -553,11 +582,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
             envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
         )
-        kv_cache_mode = (
-            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
-            if envs.is_indexer_kv_cache_mode_explicit()
-            else None
-        )
+        kv_cache_mode = self.kv_cache_mode
         op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
         scheduling_group_slot = streamidx_config.layer_scheduling_group_slot(
             self.k_cache.prefix
@@ -824,6 +849,20 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         )
         return kvg.merge_decode_rows(prefill_topk, decode_topk, md)
 
+    @staticmethod
+    def pack_k(k: torch.Tensor) -> torch.Tensor:
+        """K quantized to fp8 with a per-token e8m0 scale, packed into the
+        uint8 row layout the TPU kernel unpacks (head_dim value bytes + 1
+        scale byte)."""
+        k_quant, k_scale = quantize_tensor(
+            k,
+            torch.float8_e4m3fn,
+            axis=-1,
+            use_ue8m0=True,
+        )
+        # cat requires a single dtype, so view the fp8 values as raw bytes.
+        return torch.cat([k_quant.view(torch.uint8), k_scale], dim=-1)
+
     def forward_oot(
         self,
         hidden_states: torch.Tensor,
@@ -835,16 +874,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
         )
 
-        k_quant, k_scale = quantize_tensor(
-            k,
-            torch.float8_e4m3fn,
-            axis=-1,
-            use_ue8m0=True,
-        )
-        # Pack per-token fp8 values + 1-byte e8m0 scale into the uint8 row
-        # layout the TPU kernel unpacks (head_dim value bytes + 1 scale byte).
-        # cat requires a single dtype, so view the fp8 values as raw bytes.
-        k_quant_packed = torch.cat([k_quant.view(torch.uint8), k_scale], dim=-1)
+        k_quant_packed = VllmTPUSparseAttnIndexer.pack_k(k)
 
         attn_metadata = get_forward_context().attn_metadata
         metadata = None
@@ -961,14 +991,10 @@ class VllmTPUIndexer(Indexer):
         )
         return cast("VllmTPUIndexer", indexer)
 
-    def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
-    ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
-        q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+    def _project_k(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`(k_pe, k_nope, weights)`: K normed and split, before the rope."""
         # Fused wk + weights_proj: one GEMM, then split
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
@@ -978,6 +1004,17 @@ class VllmTPUIndexer(Indexer):
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
+        return k_pe, k_nope, weights
+
+    def forward(
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
+        q, _ = self.wq_b(qr)
+        q = q.view(-1, self.n_head, self.head_dim)
+        q_pe, q_nope = torch.split(
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+        k_pe, k_nope, weights = self._project_k(hidden_states)
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
         # Note: RoPE (NeoX) can introduce extra leading dimensions during
@@ -1354,6 +1391,43 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         self.prefix = prefix
 
+    def _project_qkv_a(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        """`(q_c, kv_lora, output_gate)`: the latent projection, before any
+        norm. `q_c` is None without q_lora, `output_gate` unless fused."""
+        if self.q_lora_rank is not None:
+            assert self.fused_qkv_a_proj is not None, (
+                "fused_qkv_a_proj is required when q_lora_rank is not None"
+            )
+            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            if self.gate_is_fused:
+                q_c, kv_lora, output_gate = qkv_lora.split(
+                    [
+                        self.q_lora_rank,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                        self.num_heads * self.v_head_dim,
+                    ],
+                    dim=-1,
+                )
+                return q_c, kv_lora, output_gate
+            q_c, kv_lora = qkv_lora.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+            return q_c, kv_lora, None
+        assert self.kv_a_proj_with_mqa is not None, (
+            "kv_a_proj_with_mqa is required when q_lora_rank is None"
+        )
+        return None, self.kv_a_proj_with_mqa(hidden_states)[0], None
+
+    def _split_kv_lora(
+        self, kv_lora: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(kv_c_normed, k_pe)` of the latent projection, k_pe not rotated."""
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        return self.kv_a_layernorm(kv_c), k_pe
+
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
@@ -1382,10 +1456,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         llama_4_scaling: torch.Tensor | None = None,
         prefill_group=None,
     ) -> torch.Tensor:
-        q_c = None
-        kv_lora = None
-        output_gate = None
-
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
             assert self.q_a_layernorm is not None
@@ -1400,49 +1470,22 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             )
             q = self.q_b_proj(q_c)[0]
         else:
-            if self.q_lora_rank is not None:
-                assert self.fused_qkv_a_proj is not None, (
-                    "fused_qkv_a_proj is required when q_lora_rank is not None"
-                )
+            q_c, kv_lora, output_gate = self._project_qkv_a(hidden_states)
+            if q_c is not None:
                 assert self.q_a_layernorm is not None, (
                     "q_a_layernorm is required when q_lora_rank is not None"
                 )
                 assert self.q_b_proj is not None, (
                     "q_b_proj is required when q_lora_rank is not None"
                 )
-
-                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-                if self.gate_is_fused:
-                    q_c, kv_lora, output_gate = qkv_lora.split(
-                        [
-                            self.q_lora_rank,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                            self.num_heads * self.v_head_dim,
-                        ],
-                        dim=-1,
-                    )
-                else:
-                    q_c, kv_lora = qkv_lora.split(
-                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                        dim=-1,
-                    )
                 q_c = self.q_a_layernorm(q_c)
                 q = self.q_b_proj(q_c)[0]
             else:
-                assert self.kv_a_proj_with_mqa is not None, (
-                    "kv_a_proj_with_mqa is required when q_lora_rank is None"
-                )
                 assert self.q_proj is not None, (
                     "q_proj is required when q_lora_rank is None"
                 )
-                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
                 q = self.q_proj(hidden_states)[0]
-
-            assert kv_lora is not None
-            kv_c, k_pe = kv_lora.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            kv_c_normed = self.kv_a_layernorm(kv_c)
+            kv_c_normed, k_pe = self._split_kv_lora(kv_lora)
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
         # the projection already returned the whole DCP group's heads.
