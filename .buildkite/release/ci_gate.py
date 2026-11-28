@@ -19,12 +19,16 @@
 Reads the commit's GitHub statuses, which Buildkite posts for every
 vllm-torchtpu-ci build of it, so no Buildkite token is needed on the release
 agent. Passing means the newest buildkite/vllm-torchtpu-ci status is success
-and at least one nightly-only step passed in that same build: a PR-lane build
-alone doesn't run the nightly suites, so it can't vouch for a release.
+and at least one nightly-only TPU v7x step passed in that same build: a
+PR-lane build alone doesn't run the nightly suites, so it can't vouch for a
+release.
 
-A step counts as nightly-only when its status context contains "nightly",
-i.e. its label in the CI pipeline says "(Nightly)". Renaming those steps
-changes what this gate accepts.
+A step counts when its status context, after CONTEXT + "/", starts with
+V7X_STEP and contains "nightly", i.e. its label in the CI pipeline says
+"(Nightly)" and bootstrap.py put v7x's name before it (tpu_generations.py).
+A build without such a step - one that ran v6e alone (CI_EXTRAS=tpu-v6e), or
+the CPU checks alone - can't vouch for a release. Renaming those steps changes
+what this gate accepts.
 """
 
 import json
@@ -34,6 +38,9 @@ import urllib.request
 
 REPO = "vllm-project/vllm-torchtpu"
 CONTEXT = "buildkite/vllm-torchtpu-ci"
+# How a v7x step's status context starts after CONTEXT + "/": its label with
+# the "v7x " prefix, as GitHub names it.
+V7X_STEP = "v7x-"
 
 
 def statuses(sha):
@@ -77,12 +84,16 @@ def check(sha, all_statuses):
         ).startswith(build["target_url"] + "#"):
             latest.setdefault(s["context"], s)  # newest first, so the first one wins
     nightly = [
-        c for c, s in latest.items() if "nightly" in c and s["state"] == "success"
+        c
+        for c, s in latest.items()
+        if c.removeprefix(CONTEXT + "/").startswith(V7X_STEP)
+        and "nightly" in c
+        and s["state"] == "success"
     ]
-    print(f"nightly-only steps passed: {len(nightly)}")
+    print(f"nightly-only v7x steps passed: {len(nightly)}")
     if not nightly:
         return None, (
-            f"{CONTEXT} passed on {sha}, but no nightly step ran in that build. "
+            f"{CONTEXT} passed on {sha}, but no nightly v7x step ran in that build. "
             f"Run it again with NIGHTLY=1 (or the run-full-ci label on a PR) "
             f"so the release is tested by the full suite."
         )
