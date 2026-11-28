@@ -12,9 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+import inspect
 
-from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+import pytest
+import torch
+
+from vllm_torchtpu import gdn_pool_layout
+from vllm_torchtpu.gdn_pool_layout import (
+    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    derive_pooled_gdn_state_layout,
+    pooled_gdn_conv_state_bytes,
+)
+from vllm_torchtpu.layers.core import gdn_attention
 
 
 @pytest.mark.parametrize(
@@ -71,3 +80,31 @@ def test_layout_pads_states_to_token_rows(
     assert layout.ssm_tokens * token_bytes >= ssm_bytes
     assert layout.conv_tokens * token_bytes >= conv_bytes
     assert layout.required_tokens == ssm_tokens + conv_tokens
+
+
+def test_pooled_conv_state_dtype_and_sublane_doc_invariants():
+    assert DEFAULT_POOLED_GDN_CONV_STATE_DTYPE == "torch.float32"
+    assert pooled_gdn_conv_state_bytes(kernel_size=4, conv_dim=2048) == 3 * 2048 * 4
+
+    for fn in (
+        gdn_pool_layout.pooled_gdn_conv_state_bytes,
+        gdn_attention.run_jax_gdn_attention_pooled_local,
+        gdn_attention.run_jax_gdn_attention_pooled,
+    ):
+        doc = inspect.getdoc(fn) or ""
+        assert "fixed-BF16 Conv" not in doc
+        assert "dense bf16 rows" not in doc
+
+    # Verify (-2, -1) sublane unpacking restores exact finite float32 words
+    # when adjacent lanes form a quiet-NaN bit pattern under naive row-major view.
+    words_i64 = torch.tensor([0x3F800001, 0x40007FC0], dtype=torch.int64)
+    expected_f32 = words_i64.to(torch.uint32).view(torch.float32)
+    assert torch.isfinite(expected_f32).all()
+
+    pairs_u16 = expected_f32.view(torch.uint16).reshape(-1, 2)
+    sublane_packed = pairs_u16.transpose(-2, -1).contiguous().view(torch.bfloat16)
+    assert torch.isnan(sublane_packed.contiguous().view(torch.float32)).any()
+    restored_f32 = (
+        sublane_packed.movedim(-2, -1).contiguous().view(torch.float32).reshape(-1)
+    )
+    assert torch.equal(restored_f32, expected_f32)

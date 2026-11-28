@@ -852,10 +852,14 @@ def run_jax_gdn_attention_pooled_local(
     """GDN attention over the unified block pool.
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
-    in ``recurrent_state_dtype`` at token offset 0 and the fixed-BF16 Conv
-    region in the following tokens. All pool knowledge lives here: this
-    function builds the copy-plan that maps those two regions onto the V3
-    kernel's state operands, so the kernel itself never sees the pool layout.
+    in ``recurrent_state_dtype`` at token offset 0 and the fixed-FP32 Conv
+    region (``conv_dtype=jnp.float32``) in the following tokens. Inside the
+    pool, 32-bit state words are stored in TPU ``(packing=2, 128)`` sublane
+    layout across the last two axes (host callers inspecting raw pool slots
+    as ``float32``/``uint32`` must transpose ``(-2, -1)`` first). All pool
+    knowledge lives here: this function builds the copy-plan that maps those
+    two regions onto the V3 kernel's state operands, so the kernel itself
+    never sees the pool layout.
     """
 
     pool_shape = recurrent_state.shape
@@ -927,8 +931,10 @@ def run_jax_gdn_attention_pooled(
         recurrent_state: The attention-shaped pool
           `(num_blocks, block_size, num_kv_heads * 2, head_size)` in the KV
           dtype, carrying the SSM region in ``recurrent_state_dtype`` and the
-          fixed-BF16 Conv region as token-ranges of each state block. Block 0
-          is the null block, only used for padded / invalid tokens.
+          fixed-FP32 Conv region as token-ranges of each state block (with
+          32-bit words packed in ``(packing=2, 128)`` sublane order across the
+          last two axes). Block 0 is the null block, only used for padded /
+          invalid tokens.
         j_conv_weight: Convolutional weight tensor of shape `(dim, 1,
           kernel_size)`.
         j_conv_bias: Optional convolutional bias tensor of shape `(dim,)`.
