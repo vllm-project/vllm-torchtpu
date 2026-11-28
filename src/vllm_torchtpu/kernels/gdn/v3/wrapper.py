@@ -308,6 +308,563 @@ def outer_kernel(
     _run()
 
 
+def _conv_silu_heads_bf16(
+    S4: jax.Array,  # bf16[4C, K_ext_pad]
+    X_ext: jax.Array,  # bf16[K_ext_pad, dim]
+    conv_weight_ref: jax.Ref,  # f32[4, 1, dim]
+    conv_bias_all: jax.Array | None,  # f32[1, dim]
+    col_start: int,
+    n_cols: int,
+    C: int,
+    N_blk: int,
+    head_dim: int,
+    full_carry_parts: list[jax.Array],
+) -> jax.Array:
+    """N-tiled MXU Toeplitz Shift Conv1D + SiLU returning f32[n_heads, C, head_dim]."""
+    assert n_cols % N_blk == 0 and N_blk % head_dim == 0
+    heads_per_blk = N_blk // head_dim
+    head_list: list[jax.Array] = []
+    for col in range(col_start, col_start + n_cols, N_blk):
+        X_blk = X_ext[:, col : col + N_blk]  # bf16[K_ext_pad, N_blk]
+        sh = jax.lax.dot_general(
+            S4,
+            X_blk,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )  # f32[4C, N_blk]
+        c0 = sh[0:C]
+        c1 = sh[C : 2 * C]
+        c2 = sh[2 * C : 3 * C]
+        c3 = sh[3 * C : 4 * C]
+        full_carry_parts.append(c0[C - 16 : C].astype(jnp.bfloat16))
+
+        w_blk = conv_weight_ref[:, :, col : col + N_blk].astype(jnp.float32)
+        conv = c0 * w_blk[3] + c1 * w_blk[2] + c2 * w_blk[1] + c3 * w_blk[0]
+        if conv_bias_all is not None:
+            conv = conv + conv_bias_all[:, col : col + N_blk]
+        act = jax.nn.silu(conv)  # f32[C, N_blk]
+        for h in range(heads_per_blk):
+            head_list.append(act[:, h * head_dim : (h + 1) * head_dim])
+    return jnp.stack(head_list, axis=0)
+
+
+def _inner_kernel_per_seq_bf16(
+    qkv_slot_ref: jax.Ref,  # bf16[max_blks, 16, dim]
+    b_slot_ref: jax.Ref,
+    a_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,  # [1, 1, 3, 1, dim]
+    recurrent_in_slot_ref: jax.Ref,  # [1, 1, n_v, d_k // packing, d_v] uint32
+    out_slot_ref: jax.Ref,  # [1, C, n_v, d_v]
+    conv_state_out_slot_ref: jax.Ref,  # [1, 1, 3, 1, dim]
+    recurrent_out_slot_ref: jax.Ref,  # [1, 1, n_v, d_k // packing, d_v] uint32
+    metadata_ref: memory_ref.MetadataRef,
+    weights_ref: memory_ref.WeightRefs,
+    carry_conv_scratch_ref: jax.Ref,  # bf16[16, dim]
+    carry_recurrent_scratch_ref: jax.Ref,  # f32[1, n_v, d_k, d_v]
+    *,
+    cfg: config.GDNConfig,
+    head_groups: int,
+    conv_n_block: int,
+):
+    """PER_SEQ inner kernel reading native bf16[T//16, 16, dim] via MXU Toeplitz Conv1D."""
+    p_id = pl.program_id(0)
+    s_idx = metadata_ref.p_id_to_s_idx[p_id, 0]
+    r_base = metadata_ref.p_id_to_r_base[p_id, 0]
+    r_size = metadata_ref.p_id_to_r_size[p_id, 0]
+    is_first_tile = metadata_ref.p_id_is_first_tile[p_id, 0]
+    is_last_tile = metadata_ref.p_id_is_last_tile[p_id, 0]
+    has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
+    if metadata_ref.s_idx_to_prefill_ckpt_row is not None:
+        should_store_state = is_last_tile | metadata_ref.is_prefill_ckpt_tile(p_id, 0)
+    else:
+        should_store_state = is_last_tile
+
+    C = cfg.chunk_size
+    dim = cfg.dim_size
+    n_kq = cfg.num_kq_heads
+    n_v = cfg.num_v_heads
+    d_k = cfg.kq_head_dim
+    d_v = cfg.v_head_dim
+    max_blks = min(cfg.batch_size // 16, C // 16 + 1)
+    K_ext = 16 + max_blks * 16
+    K_ext_pad = pl.cdiv(K_ext, 128) * 128
+
+    @pl.when(is_first_tile)
+    def _load_init():
+        raw_c = conv_state_in_slot_ref[0, 0].astype(jnp.float32)
+        raw_r = pltpu.bitcast(
+            recurrent_in_slot_ref[0, 0], cfg.dtypes.recurrent_state
+        ).astype(jnp.float32)
+        c3 = jnp.where(has_initial_state, raw_c, 0.0)
+        row16 = jax.lax.broadcasted_iota(jnp.int32, (16, dim), 0)
+        prev16 = jnp.where(
+            row16 == 13,
+            c3[0],
+            jnp.where(row16 == 14, c3[1], jnp.where(row16 == 15, c3[2], 0.0)),
+        ).astype(jnp.bfloat16)
+        carry_conv_scratch_ref[...] = prev16
+        carry_recurrent_scratch_ref[0] = jnp.where(has_initial_state, raw_r, 0.0)
+
+    prev_16 = carry_conv_scratch_ref[...]
+    state_prev = carry_recurrent_scratch_ref[0]
+
+    # NaN-proof zero-masking of unread VMEM blocks and in-block padding rows.
+    r_off = r_base & 15
+    raw_qkv = qkv_slot_ref[...].reshape(max_blks * 16, dim)
+    qrow = jax.lax.broadcasted_iota(jnp.int32, (max_blks * 16, dim), 0)
+    valid_row = (qrow >= r_off) & (qrow < r_off + r_size)
+    qkv_clean = jnp.where(valid_row, raw_qkv, jnp.bfloat16(0))
+    if K_ext_pad > K_ext:
+        X_ext = jnp.concat(
+            [prev_16, qkv_clean, jnp.zeros((K_ext_pad - K_ext, dim), jnp.bfloat16)],
+            axis=0,
+        )
+    else:
+        X_ext = jnp.concat([prev_16, qkv_clean], axis=0)
+
+    # Exact 0/1 Toeplitz shift matrix S4: bf16[4C, K_ext_pad] (128-lane aligned).
+    t_idx = jax.lax.broadcasted_iota(jnp.int32, (C, K_ext_pad), 0)
+    k_idx = jax.lax.broadcasted_iota(jnp.int32, (C, K_ext_pad), 1)
+    S_parts = []
+    for d in (0, 1, 2, 3):
+        src_col = jnp.where(t_idx - d >= 0, 16 + r_off + t_idx - d, 16 + t_idx - d)
+        S_parts.append((k_idx == src_col).astype(jnp.bfloat16))
+    S4 = jnp.concat(S_parts, axis=0)
+
+    conv_w_ref = weights_ref.conv.weight
+    conv_b_all = (
+        weights_ref.conv.bias[...].astype(jnp.float32).reshape(1, dim)
+        if weights_ref.conv.bias is not None
+        else None
+    )
+    full_carry_parts: list[jax.Array] = []
+
+    mask_dtype = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
+    iota_c = jax.lax.broadcasted_iota(mask_dtype, (1, C, 1), 1)
+    mask_h = iota_c < r_size.astype(mask_dtype)
+
+    qk_cols = n_kq * d_k
+    q_kq = _conv_silu_heads_bf16(
+        S4,
+        X_ext,
+        conv_w_ref,
+        conv_b_all,
+        0,
+        qk_cols,
+        C,
+        conv_n_block,
+        d_k,
+        full_carry_parts,
+    )
+    k_kq = _conv_silu_heads_bf16(
+        S4,
+        X_ext,
+        conv_w_ref,
+        conv_b_all,
+        qk_cols,
+        qk_cols,
+        C,
+        conv_n_block,
+        d_k,
+        full_carry_parts,
+    )
+    q_kq = jnp.where(mask_h, q_kq.astype(cfg.dtypes.compute), 0.0)
+    k_kq = jnp.where(mask_h, k_kq.astype(cfg.dtypes.compute), 0.0)
+    q_kq = compute_gdn.l2_norm(q_kq) * (d_k**-0.5)
+    k_kq = compute_gdn.l2_norm(k_kq)
+
+    b_large = jnp.expand_dims(vmem_ldst.load_compact_to_large(b_slot_ref), axis=1)[0]
+    a_large = jnp.expand_dims(vmem_ldst.load_compact_to_large(a_slot_ref), axis=1)[0]
+    padding_size = cfg.aligned_num_v_heads - n_v
+    a_log = (
+        jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
+        .reshape(1, 1, -1)
+        .astype(cfg.dtypes.compute)
+    )
+    dt_bias = (
+        jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+        .reshape(1, 1, -1)
+        .astype(cfg.dtypes.compute)
+    )
+
+    beta_s = jax.nn.sigmoid(b_large.astype(cfg.dtypes.compute))
+    g_log_s = -jnp.exp(a_log) * jax.nn.softplus(
+        a_large.astype(cfg.dtypes.compute) + dt_bias
+    )
+    beta_s = jnp.where(mask_h, beta_s, 0.0)
+    g_log_s = jnp.where(mask_h, g_log_s, 0.0)
+
+    g_log2_2d = (g_log_s[0] * jnp.float32(compute_gdn.LOG2E)).astype(jnp.float32)
+    r_c = jax.lax.broadcasted_iota(jnp.int32, (C, C), 0)
+    c_c = jax.lax.broadcasted_iota(jnp.int32, (C, C), 1)
+    tril_f32 = (r_c >= c_c).astype(jnp.float32)
+    g_cs_2d = jax.lax.dot_general(
+        tril_f32,
+        g_log2_2d,
+        (((1,), (0,)), ((), ())),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+    g_cs_all = compute_gdn.fused_transpose_broadcast(
+        g_cs_2d[None, :, :], src_dim=2, dst_dim=0, dst_size=n_v
+    )
+    beta_all = compute_gdn.fused_transpose_broadcast(
+        beta_s, src_dim=2, dst_dim=0, dst_size=n_v
+    )
+
+    def _finish_conv_carry():
+        full_carry_16 = jnp.concat(full_carry_parts, axis=-1)
+
+        def _compute_tail_carry(_):
+            u_idx = jax.lax.broadcasted_iota(jnp.int32, (16, K_ext_pad), 0)
+            k_tail = jax.lax.broadcasted_iota(jnp.int32, (16, K_ext_pad), 1)
+            d_tail = u_idx - 16
+            tail_col = jnp.where(
+                r_size > 0,
+                jnp.where(
+                    r_size + d_tail >= 0,
+                    16 + r_off + r_size + d_tail,
+                    16 + r_size + d_tail,
+                ),
+                u_idx,
+            )
+            S_tail = ((u_idx >= 13) & (k_tail == tail_col)).astype(jnp.bfloat16)
+            tail_parts = [
+                jax.lax.dot_general(
+                    S_tail,
+                    X_ext[:, col : col + conv_n_block],
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                ).astype(jnp.bfloat16)
+                for col in range(0, dim, conv_n_block)
+            ]
+            return jnp.concat(tail_parts, axis=-1)
+
+        new_prev_16 = jax.lax.cond(
+            r_size < C, _compute_tail_carry, lambda _: full_carry_16, None
+        )
+        carry_conv_scratch_ref[...] = new_prev_16
+
+        @pl.when(should_store_state)
+        def _store_final_conv():
+            row16 = jax.lax.broadcasted_iota(jnp.int32, (16, dim), 0)
+            np_f32 = new_prev_16.astype(jnp.float32)
+            c0 = jnp.sum(jnp.where(row16 == 13, np_f32, 0.0), axis=0, keepdims=True)
+            c1 = jnp.sum(jnp.where(row16 == 14, np_f32, 0.0), axis=0, keepdims=True)
+            c2 = jnp.sum(jnp.where(row16 == 15, np_f32, 0.0), axis=0, keepdims=True)
+            new_conv_3 = jnp.stack([c0, c1, c2], axis=0)
+            conv_state_out_slot_ref[0, 0] = new_conv_3.astype(
+                conv_state_out_slot_ref.dtype
+            )
+
+    v_col_base = 2 * qk_cols
+    if head_groups == 1:
+        v_all = _conv_silu_heads_bf16(
+            S4,
+            X_ext,
+            conv_w_ref,
+            conv_b_all,
+            v_col_base,
+            n_v * d_v,
+            C,
+            conv_n_block,
+            d_v,
+            full_carry_parts,
+        )
+        _finish_conv_carry()
+        v_all = jnp.where(mask_h, v_all.astype(cfg.dtypes.compute), 0.0)
+        out_all, new_state = compute_gdn.chunked_gdn_group(
+            q_kq, k_kq, v_all, g_cs_all, beta_all, state_prev, cfg=cfg
+        )
+        out_all_bf16 = out_all.astype(out_slot_ref.dtype)
+    else:
+        assert n_kq % head_groups == 0 and n_v % head_groups == 0
+        kq_per = n_kq // head_groups
+        v_per = n_v // head_groups
+        out_parts: list[jax.Array] = []
+        state_parts: list[jax.Array] = []
+        for g_idx in range(head_groups):
+            kq0, kq1 = g_idx * kq_per, (g_idx + 1) * kq_per
+            v0, v1 = g_idx * v_per, (g_idx + 1) * v_per
+            v_grp = _conv_silu_heads_bf16(
+                S4,
+                X_ext,
+                conv_w_ref,
+                conv_b_all,
+                v_col_base + v0 * d_v,
+                v_per * d_v,
+                C,
+                conv_n_block,
+                d_v,
+                full_carry_parts,
+            )
+            v_grp = jnp.where(mask_h, v_grp.astype(cfg.dtypes.compute), 0.0)
+            out_g, st_g = compute_gdn.chunked_gdn_group(
+                q_kq[kq0:kq1],
+                k_kq[kq0:kq1],
+                v_grp,
+                g_cs_all[v0:v1],
+                beta_all[v0:v1],
+                state_prev[v0:v1],
+                cfg=cfg,
+            )
+            out_parts.append(out_g.astype(out_slot_ref.dtype))
+            state_parts.append(st_g)
+        out_all_bf16 = jnp.concat(out_parts, axis=0)
+        new_state = jnp.concat(state_parts, axis=0)
+        _finish_conv_carry()
+
+    out_slot_ref[0] = out_all_bf16.swapaxes(0, 1)
+    carry_recurrent_scratch_ref[0] = new_state
+
+    @pl.when(should_store_state)
+    def _store_rec():
+        recurrent_out_slot_ref[0, 0] = pltpu.bitcast(
+            new_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+        )
+
+
+def _inner_kernel_batched_bf16(
+    qkv_slot_ref: jax.Ref,  # bf16[seq_tile_size, 16, dim]
+    b_slot_ref: jax.Ref,
+    a_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
+    out_slot_ref: jax.Ref,
+    conv_state_out_slot_ref: jax.Ref,
+    recurrent_out_slot_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    weights_ref: memory_ref.WeightRefs,
+    carry_conv_scratch_ref: jax.Ref | None,
+    carry_recurrent_scratch_ref: jax.Ref | None,
+    *,
+    cfg: config.GDNConfig,
+):
+    """BATCHED inner kernel reading native bf16[T//16, 16, dim] with 1-block dedup."""
+    p_id = pl.program_id(0)
+    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
+        metadata_ref=metadata_ref,
+        p_id=p_id,
+        conv_state_in_slot_ref=conv_state_in_slot_ref,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
+        carry_conv_scratch_ref=carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+        cfg=cfg,
+    )
+
+    r_base_0 = metadata_ref.p_id_to_r_base[p_id, 0]
+    r_size_0 = metadata_ref.p_id_to_r_size[p_id, 0]
+    blk_0 = r_base_0 // 16
+    need_0 = r_size_0 > 0
+    row8 = jax.lax.broadcasted_iota(jnp.int32, (8, cfg.dim_size), 0)
+    row8_hi = row8 + 8
+
+    def _extract_from_blk(
+        top8: jax.Array, bot8: jax.Array, r_off: jax.Array, r_size: jax.Array
+    ) -> jax.Array:
+        valid_s = r_size > 0
+        m_top = (row8 == r_off) & valid_s
+        m_bot = (row8_hi == r_off) & valid_s
+        clean8 = jnp.where(m_top, top8, jnp.where(m_bot, bot8, 0.0))
+        return jnp.expand_dims(jnp.sum(clean8, axis=0, keepdims=True), axis=0)
+
+    def _fast_single_blk(_):
+        blk0_f32 = qkv_slot_ref[0].astype(jnp.float32)
+        top8_0 = blk0_f32[:8]
+        bot8_0 = blk0_f32[8:]
+        tok_list = []
+        for idx in range(cfg.seq_tile_size):
+            r_off = metadata_ref.p_id_to_r_base[p_id, idx] & 15
+            r_size = metadata_ref.p_id_to_r_size[p_id, idx]
+            tok_list.append(_extract_from_blk(top8_0, bot8_0, r_off, r_size))
+        return jnp.stack(tok_list, axis=0)
+
+    if cfg.seq_tile_size == 1:
+        qkv_compact = _fast_single_blk(None)
+    else:
+        all_same = need_0
+        for idx in range(1, cfg.seq_tile_size):
+            rb_i = metadata_ref.p_id_to_r_base[p_id, idx]
+            rs_i = metadata_ref.p_id_to_r_size[p_id, idx]
+            all_same = all_same & ((rs_i == 0) | ((rb_i // 16) == blk_0))
+
+        def _general_multi_blk(_):
+            blk0_f32 = qkv_slot_ref[0].astype(jnp.float32)
+            top8_0 = blk0_f32[:8]
+            bot8_0 = blk0_f32[8:]
+            tok_list = [
+                _extract_from_blk(top8_0, bot8_0, r_base_0 & 15, r_size_0)
+            ]
+            always_true = row8 >= 0
+            for idx in range(1, cfg.seq_tile_size):
+                rb_i = metadata_ref.p_id_to_r_base[p_id, idx]
+                rs_i = metadata_ref.p_id_to_r_size[p_id, idx]
+                same_i = ((rb_i // 16) == blk_0) & need_0
+                same_mask = always_true & same_i
+                blk_i_f32 = qkv_slot_ref[idx].astype(jnp.float32)
+                top8_i = jnp.where(same_mask, top8_0, blk_i_f32[:8])
+                bot8_i = jnp.where(same_mask, bot8_0, blk_i_f32[8:])
+                tok_list.append(_extract_from_blk(top8_i, bot8_i, rb_i & 15, rs_i))
+            return jnp.stack(tok_list, axis=0)
+
+        qkv_compact = jax.lax.cond(
+            all_same, _fast_single_blk, _general_multi_blk, None
+        )
+
+    qkv_lhs = jnp.concat([prev_conv, qkv_compact], axis=1)
+    conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
+    conv_bias = (
+        weights_ref.conv.bias[...].astype(jnp.float32)
+        if weights_ref.conv.bias is not None
+        else None
+    )
+    qkv_out, new_conv_state = compute_conv1d.causal_conv1d(
+        real_sizes=real_sizes,
+        lhs=qkv_lhs,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        cfg=cfg,
+    )
+    conv_state_out_slot_ref[...] = new_conv_state.astype(conv_state_out_slot_ref.dtype)
+
+    qkv_act = jax.nn.silu(qkv_out)
+    padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
+    a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
+    dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+    q_compact, k_compact, v_compact, b_compact, a_compact = (
+        vmem_ldst.load_activation_as_compact(
+            qkv_vreg=qkv_act,
+            qkv_vmem_ref=qkv_slot_ref,
+            b_vmem_ref=b_slot_ref,
+            a_vmem_ref=a_slot_ref,
+            cfgs=cfg,
+        )
+    )
+    out, new_recurrent_state = compute_gdn.recurrent_gdn(
+        q_compact=q_compact,
+        k_compact=k_compact,
+        v_compact=v_compact,
+        b_compact=b_compact,
+        a_compact=a_compact,
+        state_prev=prev_recurrent,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        cfg=cfg,
+        real_sizes=real_sizes,
+    )
+
+    out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+    recurrent_out_slot_ref[...] = pltpu.bitcast(
+        new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+    )
+
+
+def outer_kernel_bf16(
+    metadata_ref: memory_ref.MetadataRef,
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    states_ref: jax.Array | tuple[jax.Array, jax.Array],
+    _: jax.Array,
+    weights_ref: memory_ref.WeightRefs,
+    out_ref: jax.Array,
+    states_out_ref: jax.Array | tuple[jax.Array, jax.Array],
+    carry_conv_scratch_ref: jax.Array | None,
+    carry_recurrent_scratch_ref: jax.Array | None,
+    *,
+    cfg: config.GDNConfig,
+    head_groups: int,
+    conv_n_block: int,
+):
+    """Outer pipeline for native bf16[T//16, 16, dim] QKV input."""
+    if cfg.is_shared:
+        assert not isinstance(states_ref, tuple)
+        assert not isinstance(states_out_ref, tuple)
+        conv_state_ref = recurrent_state_ref = states_ref
+        conv_state_out_ref = recurrent_state_out_ref = states_out_ref
+    else:
+        assert len(states_ref) == 2
+        assert len(states_out_ref) == 2
+        conv_state_ref, recurrent_state_ref = states_ref
+        conv_state_out_ref, recurrent_state_out_ref = states_out_ref
+
+    (
+        qkv_alloc,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    ) = memory_ref.create_allocs_bf16_qkv(
+        metadata_ref=metadata_ref,
+        qkv_ref=qkv_ref,
+        b_ref=b_ref,
+        a_ref=a_ref,
+        out_ref=out_ref,
+        conv_state_ref=conv_state_ref,
+        recurrent_state_ref=recurrent_state_ref,
+        cfg=cfg,
+    )
+    num_tiles = metadata_ref.num_tiles[...]
+    if cfg.mode == config.GDNMode.PER_SEQ:
+        body = functools.partial(
+            _inner_kernel_per_seq_bf16,
+            cfg=cfg,
+            head_groups=head_groups,
+            conv_n_block=conv_n_block,
+        )
+    else:
+        body = functools.partial(_inner_kernel_batched_bf16, cfg=cfg)
+
+    scratches = (
+        metadata_ref,
+        weights_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+    )
+    state_allocs = (conv_in_alloc, recurrent_in_alloc)
+    out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
+    state_out_args = (conv_state_out_ref, recurrent_state_out_ref)
+
+    pipeline_func = pltpu.emit_pipeline(
+        body=body,
+        grid=(num_tiles,),
+        in_specs=(
+            qkv_alloc.spec,
+            b_alloc.spec,
+            a_alloc.spec,
+            *(alloc.spec for alloc in state_allocs),
+        ),
+        out_specs=tuple(alloc.spec for alloc in out_allocs),
+    )
+
+    @pl.with_scoped(
+        allocations=(
+            qkv_alloc,
+            b_alloc,
+            a_alloc,
+            *state_allocs,
+            *out_allocs,
+        ),
+    )
+    def _run(allocations):
+        pipeline_func(
+            qkv_ref,
+            b_ref,
+            a_ref,
+            conv_state_ref,
+            recurrent_state_ref,
+            out_ref,
+            *state_out_args,
+            scratches=scratches,
+            allocations=allocations,
+        )
+
+    _run()
+
+
 FUSED_CONV1D_GDN_STATIC_ARGNAMES: tuple[str, ...] = (
     "n_kq",
     "n_v",
@@ -372,7 +929,7 @@ def fused_conv1d_gdn(
     kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    mixed_tile_size: int | None = None,
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -488,12 +1045,12 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    qkv = qkv.astype(kernel_act_dtype)
+    # Step 1: Validate inputs.
+    is_kda = attention_mode == config.AttentionMode.KDA
+    qkv_input_dtype = qkv.dtype
     b = b.astype(kernel_act_dtype)
     a = a.astype(kernel_act_dtype)
 
-    # Step 1: Validate inputs.
-    is_kda = attention_mode == config.AttentionMode.KDA
     if gate_lower_bound is not None:
         if not is_kda:
             raise ValueError(
@@ -554,9 +1111,6 @@ def fused_conv1d_gdn(
         prefill_ckpt_offsets = prefill_ckpt_offsets.astype(jnp.int32)
         prefill_ckpt_indices = prefill_ckpt_indices.astype(jnp.int32)
 
-    act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
-
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
     num_sublanes = tpu_info.num_sublanes
@@ -574,6 +1128,31 @@ def fused_conv1d_gdn(
         raise NotImplementedError(
             f"A bf16 recurrent state requires d_v <= {num_lanes}; got d_v={d_v}."
         )
+
+    has_64m_vmem = (
+        tpu_info.vmem_capacity_bytes >= config.GDNConfig.CALIBRATED_VMEM_CAPACITY_BYTES
+    )
+    head_groups = compute_gdn.select_head_groups(n_kq, n_v)
+    conv_n_block = 512
+    eligible_bf16_qkv_base = (
+        has_64m_vmem
+        and qkv_input_dtype == jnp.bfloat16
+        and jnp.dtype(kernel_act_dtype) == jnp.float32
+        and batch_size >= 256
+        and batch_size % 16 == 0
+        and num_spec_tokens == 0
+        and not is_kda
+        and kernel_size == 4
+        and d_k == 128
+        and d_v == 128
+        and dim % conv_n_block == 0
+        and (n_kq * d_k) % conv_n_block == 0
+        and ((n_v // head_groups) * d_v) % conv_n_block == 0
+    )
+
+    act_in_dtype = (
+        jnp.bfloat16.dtype if eligible_bf16_qkv_base else jnp.dtype(kernel_act_dtype)
+    )
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
@@ -582,7 +1161,7 @@ def fused_conv1d_gdn(
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
     if envs.TPU_ENABLE_GDN_DYNAMIC_TILING:
-        decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+        decode_tile_size, resolved_mixed_tile_size = tiling.get_tile_sizes(
             batch_size=batch_size,
             num_seqs=num_seqs,
             padded_batch_size=padded_batch_size,
@@ -610,13 +1189,19 @@ def fused_conv1d_gdn(
             batch_size,
             window_size,
             decode_tile_size,
-            mixed_tile_size,
+            resolved_mixed_tile_size,
         )
     else:
+        default_mixed = 128 if eligible_bf16_qkv_base else 64
+        resolved_mixed_tile_size = (
+            default_mixed if mixed_tile_size is None else mixed_tile_size
+        )
         # Round the static clip down to a power of two so a small
         # non-power-of-two token bucket (e.g. TPU_TOKEN_BUCKET_EXTRA or tiny
         # max_num_batched_tokens) stays divisible by triangular_block_size.
-        mixed_tile_size = tiling.clip_mixed_tile_size(mixed_tile_size, batch_size)
+        resolved_mixed_tile_size = tiling.clip_mixed_tile_size(
+            resolved_mixed_tile_size, batch_size
+        )
         # Each sequence holds 1 input state slot plus `window` output
         # checkpoint slots per buffer in VMEM, at every window size. Shrink
         # the tile so the double-buffered windows fit in roughly half the
@@ -644,17 +1229,32 @@ def fused_conv1d_gdn(
             # TPU_ENABLE_GDN_DYNAMIC_TILING is off.
             decode_tile_size = 1
 
+    eligible_bf16_qkv = (
+        eligible_bf16_qkv_base
+        and resolved_mixed_tile_size >= 16
+        and resolved_mixed_tile_size % 16 == 0
+    )
+    if not eligible_bf16_qkv:
+        qkv = qkv.astype(kernel_act_dtype)
+        act_in_dtype = qkv.dtype
+        assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
+        packing = 4 // act_in_dtype.itemsize
+        padded_batch_size = pl.cdiv(batch_size, packing) * packing
+
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
     # KDA's gate carries d_k channels per value head, so it pads out to a
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    if eligible_bf16_qkv:
+        qkv = qkv.reshape(padded_batch_size // 16, 16, dim)
+    else:
+        qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 
@@ -693,7 +1293,7 @@ def fused_conv1d_gdn(
         mode: config.GDNMode,
     ) -> tuple[jax.Array, jax.Array | tuple[jax.Array, jax.Array]]:
         if mode == config.GDNMode.PER_SEQ:
-            tile_size = mixed_tile_size
+            tile_size = resolved_mixed_tile_size
             # Prefill / mixed sequences keep a single state checkpoint.
             window_size = 1
         else:
@@ -772,10 +1372,32 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[act_pos] = 0
 
-        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        if eligible_bf16_qkv:
+            kernel_fn = functools.partial(
+                outer_kernel_bf16,
+                cfg=cfg,
+                head_groups=head_groups,
+                conv_n_block=conv_n_block,
+            )
+            if mode == config.GDNMode.PER_SEQ:
+                scratch_shapes = {
+                    "carry_conv_scratch_ref": pltpu.VMEM((16, dim), jnp.bfloat16),
+                    "carry_recurrent_scratch_ref": pltpu.VMEM(
+                        (1, n_v, d_k, d_v), jnp.float32
+                    ),
+                }
+                vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(
+                    window_size,
+                    vmem_fraction=config.GDNConfig.FAST_GDN_VMEM_FRACTION,
+                )
+            else:
+                vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        else:
+            kernel_fn = functools.partial(outer_kernel, cfg=cfg)
+            vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
         return pl.pallas_call(
-            functools.partial(outer_kernel, cfg=cfg),
+            kernel_fn,
             out_shape=(out_shape, in_states),
             in_specs=(
                 metadata_spec,
