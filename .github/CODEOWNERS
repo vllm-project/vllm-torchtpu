@@ -192,6 +192,12 @@
 /src/vllm_torchtpu/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 /tests/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 
+# Model Layers: Post-Norm MoE
+/src/vllm_torchtpu/layers/core/post_norm_moe.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @QiliangCui
+/src/vllm_torchtpu/layers/adapter/custom_ops/post_norm_moe_op.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @QiliangCui
+/tests/layers/core/post_norm_moe/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @QiliangCui
+/tests/layers/adapter/custom_ops/test_post_norm_moe_op.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @QiliangCui
+
 # Megakernel (root package and shared test setup)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
 /tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
