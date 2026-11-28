@@ -777,53 +777,6 @@ def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
     assert calls == [0]
 
 
-if __name__ == "__mp_main__":
-    # The constructor is the boundary preceding executor and TPU initialization.
-    EngineCoreProc.__init__ = _engine_init
-
-
-def _run_spawn_probes():
-    patch_registry.apply("platform_activation")
-    patch_registry._applied.add(_PARENT_MARKER)
-    context = multiprocessing.get_context("spawn")
-    processes = []
-    connections = []
-    try:
-        for stage, target in (
-            ("engine_core", EngineCoreProc.run_engine_core),
-            ("worker_init", _worker_entry),
-        ):
-            parent, child = context.Pipe(duplex=False)
-            kwargs = {}
-            if stage == "engine_core":
-                kwargs["vllm_config"] = SimpleNamespace(
-                    parallel_config=ParallelConfig(numa_bind=False)
-                )
-            process = context.Process(target=target, args=(child,), kwargs=kwargs)
-            process.start()
-            child.close()
-            processes.append(process)
-            connections.append((stage, parent))
-        for process, (stage, parent) in zip(processes, connections):
-            assert parent.poll(60), f"{stage} did not reach its entrypoint"
-            actual_stage, pid = parent.recv()
-            assert actual_stage == stage and pid != os.getpid()
-            process.join(10)
-            assert process.exitcode == 0, (stage, process.exitcode)
-            print(f"PASS: spawned {stage} applied real patches", flush=True)
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(5)
-        for _, connection in connections:
-            connection.close()
-
-
-if __name__ == "__main__":
-    _run_spawn_probes()
-
-
 class TestLatePollModelRunnerOutput:
     """The late-poll wrapper adds landed loads to the step's output."""
 
@@ -897,8 +850,31 @@ class TestDeferredNoForwardOutput:
         timer = threading.Timer(0.05, worker._note_dummy_batch_done)
         timer.start()
         result = out.get_output()
+        timer.join()
         assert seen_count == [1]
         assert result.kv_connector_output.finished_recving == {"r1"}
+
+    def test_merges_into_the_step_s_connector_output(self):
+        """A disaggregated engine's zero-token step carries its own connector
+        output when the step-start poll or the metadata build found
+        something; the late-polled loads join it and its other fields stay."""
+        from vllm.v1.outputs import KVConnectorOutput
+
+        from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
+
+        worker = self._worker()
+        worker._dummy_batch_count = 1  # The dummy batch has already run.
+        kv = KVConnectorOutput(finished_recving={"r0"}, finished_sending={"s0"})
+        out = _DeferredNoForwardOutput(
+            SimpleNamespace(kv_connector_output=kv),
+            worker,
+            [lambda: {"r1"}, lambda: set()],
+            0,
+        )
+        result = out.get_output()
+        assert result.kv_connector_output is kv
+        assert kv.finished_recving == {"r0", "r1"}
+        assert kv.finished_sending == {"s0"}
 
     def test_timeout_bounds_the_wait(self):
         from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
@@ -1141,3 +1117,50 @@ class TestLatePollSalvage:
             SimpleNamespace(kv_connector_output=kv), object(), [lambda: {"r1"}], 0
         )
         assert deferred.get_kv_connector_output() is kv
+
+
+if __name__ == "__mp_main__":
+    # The constructor is the boundary preceding executor and TPU initialization.
+    EngineCoreProc.__init__ = _engine_init
+
+
+def _run_spawn_probes():
+    patch_registry.apply("platform_activation")
+    patch_registry._applied.add(_PARENT_MARKER)
+    context = multiprocessing.get_context("spawn")
+    processes = []
+    connections = []
+    try:
+        for stage, target in (
+            ("engine_core", EngineCoreProc.run_engine_core),
+            ("worker_init", _worker_entry),
+        ):
+            parent, child = context.Pipe(duplex=False)
+            kwargs = {}
+            if stage == "engine_core":
+                kwargs["vllm_config"] = SimpleNamespace(
+                    parallel_config=ParallelConfig(numa_bind=False)
+                )
+            process = context.Process(target=target, args=(child,), kwargs=kwargs)
+            process.start()
+            child.close()
+            processes.append(process)
+            connections.append((stage, parent))
+        for process, (stage, parent) in zip(processes, connections):
+            assert parent.poll(60), f"{stage} did not reach its entrypoint"
+            actual_stage, pid = parent.recv()
+            assert actual_stage == stage and pid != os.getpid()
+            process.join(10)
+            assert process.exitcode == 0, (stage, process.exitcode)
+            print(f"PASS: spawned {stage} applied real patches", flush=True)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(5)
+        for _, connection in connections:
+            connection.close()
+
+
+if __name__ == "__main__":
+    _run_spawn_probes()
