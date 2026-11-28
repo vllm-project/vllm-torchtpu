@@ -243,6 +243,37 @@ class TestDpLockstepSharded:
             proposer.draft_model = object()
             assert proposer._dp_lockstep_sharded() is True
 
+    def test_moe_runner_without_protocol_pairs(self):
+        # A TPU-native MoE draft without `MixtureOfExperts` still emits EP
+        # collectives and must trigger EP-DP lockstep.
+        from vllm.model_executor.layers.fused_moe import MoERunner
+
+        class _FakeMoERunner(MoERunner):
+            def __init__(self) -> None:
+                torch.nn.Module.__init__(self)
+
+        class _PlainDraftWithMoE(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mlp = _FakeMoERunner()
+
+        class _PlainDenseDraft(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fc = torch.nn.Linear(4, 4)
+
+        moe_proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+        moe_proposer.runner._dp_lockstep_enabled.return_value = True
+        moe_proposer.draft_model = _PlainDraftWithMoE()
+        assert moe_proposer._draft_has_moe() is True
+        assert moe_proposer._dp_lockstep_sharded() is True
+
+        dense_proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+        dense_proposer.runner._dp_lockstep_enabled.return_value = True
+        dense_proposer.draft_model = _PlainDenseDraft()
+        assert dense_proposer._draft_has_moe() is False
+        assert dense_proposer._dp_lockstep_sharded() is False
+
 
 def _make_chunk(
     *,

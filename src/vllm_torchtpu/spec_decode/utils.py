@@ -78,6 +78,24 @@ def dp_lockstep_num_reqs(dp_step_max_reqs: int, local_num_reqs: int) -> int:
     return num_reqs
 
 
+def draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
+    """Whether a draft carries MoE layers, i.e. emits EP collectives.
+
+    Missing an MoE draft here is a hang, not an error: under EP-DP lockstep
+    the busy rank's draft forward waits on all-to-alls that idle ranks never
+    issue. Checking `MoERunner` modules alongside `is_mixture_of_experts`
+    catches TPU-native drafts that do not subclass `MixtureOfExperts`.
+    """
+    from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.models.interfaces import is_mixture_of_experts
+
+    if is_mixture_of_experts(draft_model):
+        return True
+    if not isinstance(draft_model, torch.nn.Module):
+        return False
+    return any(isinstance(m, MoERunner) for m in draft_model.modules())
+
+
 @dataclass
 class DraftChunkInputs:
     # Full padded request-major token ids for this draft chunk, captured before a
