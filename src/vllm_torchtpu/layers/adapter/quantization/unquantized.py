@@ -70,6 +70,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
+    VllmQuantLinearConfig,
     should_quantize_on_load,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
@@ -209,7 +210,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
                 linear_cfg = (
                     self.get_linear_config(layer)
                     if isinstance(layer, LinearBase)
-                    else None
+                    else VllmQuantLinearConfig(self.vllm_config)
                 )
                 return VllmFp8LinearMethodTPU(fp8_config, linear_cfg, prefix=prefix)
 
