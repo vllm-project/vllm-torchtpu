@@ -78,6 +78,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.core.tpu_scheduler import blocks_to_allocate, next_unblocked_waiting
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -380,14 +381,7 @@ class SrptPrefillScheduler(AsyncScheduler):
 
     def _next_waiting(self) -> Request | None:
         """The request upstream's WAITING pass admits next."""
-        return next(
-            (
-                r
-                for r in chain(self.kv_holding_waiting, self.waiting)
-                if not self._is_blocked_waiting_status(r.status)
-            ),
-            None,
-        )
+        return next_unblocked_waiting(self)
 
     def _prefix_hit(self, request: Request) -> tuple[KVCacheBlocks, int]:
         if request.num_computed_tokens > 0:
@@ -475,7 +469,6 @@ class SrptPrefillScheduler(AsyncScheduler):
         """Whether free KV blocks cover ``kept`` running requests plus
         ``target``, counted as KVCacheManager.allocate_slots() counts them,
         so a hold never forces a preemption."""
-        coordinator = self.kv_cache_manager.coordinator
         empty_blocks = self.kv_cache_manager.empty_kv_cache_blocks.blocks
 
         def blocks_for(
@@ -485,17 +478,13 @@ class SrptPrefillScheduler(AsyncScheduler):
             computed_blocks: tuple,
         ) -> int:
             num_tokens_main = computed_tokens + num_new_tokens
-            return coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=min(
-                    num_tokens_main + self.num_lookahead_tokens, self.max_model_len
-                ),
-                new_computed_blocks=computed_blocks,
-                num_encoder_tokens=0,
-                total_computed_tokens=computed_tokens,
-                num_local_computed_tokens=computed_tokens,
+            return blocks_to_allocate(
+                self,
+                request,
+                computed_tokens,
+                min(num_tokens_main + self.num_lookahead_tokens, self.max_model_len),
+                computed_blocks,
                 num_tokens_main_model=num_tokens_main,
-                prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
             )
 
         needed = sum(
@@ -509,16 +498,13 @@ class SrptPrefillScheduler(AsyncScheduler):
             full_num_tokens = min(target.num_tokens, self.max_model_len)
             target_blocks = max(
                 target_blocks,
-                coordinator.get_num_blocks_to_allocate(
-                    request_id=target.request_id,
-                    num_tokens=full_num_tokens,
-                    new_computed_blocks=hit_blocks.blocks,
-                    num_encoder_tokens=0,
-                    total_computed_tokens=hit_tokens,
-                    num_local_computed_tokens=hit_tokens,
-                    num_tokens_main_model=full_num_tokens,
+                blocks_to_allocate(
+                    self,
+                    target,
+                    hit_tokens,
+                    full_num_tokens,
+                    hit_blocks.blocks,
                     apply_admission_cap=True,
-                    prefill_end=max(target.num_prompt_tokens, target.num_tokens - 1),
                 ),
             )
         needed += target_blocks
