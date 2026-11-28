@@ -19,7 +19,11 @@ from unittest.mock import patch
 import pytest
 
 from vllm_torchtpu.compilation import tpu_compiler
-from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
+from vllm_torchtpu.core.pp_chunk_scheduler import (
+    PREFIX_AWARE_PP_SCHEDULER_CLS,
+    SCHEDULER_CLS,
+    uses_dynamic_chunks,
+)
 from vllm_torchtpu.platforms import tpu_platform
 
 
@@ -118,3 +122,12 @@ def test_pipeline_knobs_do_not_change_the_compile_cache_key():
     assert "TPU_PP_EQUAL_COST_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_CHUNK_SLACK" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_HANDOFF_DEPTH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+
+
+def test_pipeline_preserves_prefix_aware_pipeline_chunk_scheduler(monkeypatch):
+    _env(monkeypatch)
+    config = _config(cls=PREFIX_AWARE_PP_SCHEDULER_CLS)
+    hook = _configure(config)
+    assert config.scheduler_config.scheduler_cls == PREFIX_AWARE_PP_SCHEDULER_CLS
+    assert uses_dynamic_chunks(config) is True
+    hook.assert_called_once_with(config)
