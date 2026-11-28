@@ -293,6 +293,7 @@ ignore-missing-imports = [
     "sympy", "sympy.*",
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
+    "torchvision", "torchvision.*",
     "runai_model_streamer", "runai_model_streamer.*",
     "tpu_sync", "tpu_sync.*",
     "tqdm", "tqdm.*",

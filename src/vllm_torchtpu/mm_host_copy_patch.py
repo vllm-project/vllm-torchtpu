@@ -31,7 +31,8 @@ out its 8 slots in turn, so each of a fresh server's first 8 large items paid
 that: 12.5 ms to write a 32 MB item into a new slot against 1.3-1.5 into a
 used one. The slots keep upstream's order, so a slot freed by its readers is
 written again only after the 7 others: TPU slots are not pinned, and the arena
-gates a release on an upload's completion only for pinned ones.
+gates a release on an upload's completion only for pinned ones. The pool also
+runs the API server's image resizes (`mm_resize_patch`).
 
 `write_tensor` is a drop-in for its namesake in `vllm.distributed.
 device_communicators.shm_tensor_arena` of vLLM 0.33.0 (the tests pin the

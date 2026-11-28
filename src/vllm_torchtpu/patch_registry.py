@@ -148,6 +148,10 @@ PATCHES = (
     # workers copy the pixels.
     Patch("vllm_torchtpu.video_decode_patch:patch_opencv_one_pass_decode", _ACTIVE),
     Patch("vllm_torchtpu.video_decode_patch:patch_opencv_decode_threads", _ACTIVE),
+    Patch(
+        "vllm_torchtpu.mm_processor_threads_patch:patch_mm_processor_threads", _ACTIVE
+    ),
+    Patch("vllm_torchtpu.mm_resize_patch:patch_mm_resize_strips", _ACTIVE),
     Patch("vllm_torchtpu.mm_host_copy_patch:patch_mm_host_copies", _ENGINE),
     # Platform runtime configuration.
     Patch(
@@ -169,6 +173,16 @@ PATCHES = (
     ),
     Patch(
         "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl_video_prompt",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl_image_hf_text",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl_video_hf_text",
         ("platform_activation", "model_load"),
         model_config=True,
     ),

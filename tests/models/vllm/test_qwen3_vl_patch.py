@@ -11,14 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the Qwen3-VL video prompt patch."""
+"""Tests for the Qwen3-VL processor patches."""
 
 import functools
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from huggingface_hub import snapshot_download
+from PIL import Image
 from transformers import (
     Cosmos3OmniConfig,
     Qwen3_5Config,
@@ -28,6 +30,7 @@ from transformers import (
 from vllm.config import ModelConfig
 from vllm.model_executor.models import qwen3_vl
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.processing.context import InputProcessingContext
 
 from vllm_torchtpu.models.vllm import qwen3_vl_patch
 
@@ -129,3 +132,115 @@ def test_upstream_expands_trained_video_layout():
     """Upstream canary: passes once vLLM expands the trained layout itself; then
     delete the whole patch."""
     assert _expanded_text(QWEN3_VL, f"{FULL_VIDEO}Hi") == f"{FRAME_GROUPS}Hi"
+
+
+def _processor(limits):
+    path = snapshot_download(
+        "Qwen/Qwen3-VL-8B-Instruct", allow_patterns=["*.json", "*.txt"]
+    )
+    model_config = ModelConfig(model=path, limit_mm_per_prompt=limits)
+    return model_config, MULTIMODAL_REGISTRY.create_processor(model_config)
+
+
+def _assert_same_outputs(got, want, modalities):
+    assert got["prompt_token_ids"] == want["prompt_token_ids"]
+    for modality in modalities:
+        for got_item, want_item in zip(
+            got["mm_kwargs"][modality], want["mm_kwargs"][modality], strict=True
+        ):
+            assert got_item.keys() == want_item.keys()
+            for key, elem in want_item.items():
+                if isinstance(elem.data, torch.Tensor):
+                    assert torch.equal(got_item[key].data, elem.data)
+                else:
+                    assert got_item[key].data == elem.data
+
+
+def test_maybe_patch_qwen3_vl_image_hf_text_keeps_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Images skip the HF dummy prompt; the prompt ids and image fields stay."""
+    processor_cls = qwen3_vl.Qwen3VLMultiModalProcessor
+    monkeypatch.setattr(processor_cls, "_get_hf_mm_text", processor_cls._get_hf_mm_text)
+    monkeypatch.setattr(
+        processor_cls, "_tpu_image_hf_text_skipped", False, raising=False
+    )
+    model_config, processor = _processor({"image": 2, "video": 1})
+    rng = np.random.default_rng(0)
+    images = [
+        Image.fromarray(rng.integers(0, 256, (h, w, 3), dtype=np.uint8))
+        for h, w in ((64, 96), (128, 64))
+    ]
+    prompt = "<|vision_start|><|image_pad|><|vision_end|>" * 2 + "Hi"
+
+    def run():
+        mm_items = processor.info.parse_mm_data({"image": images})
+        return processor(prompt, mm_items=mm_items, hf_processor_mm_kwargs={})
+
+    want = run()
+    assert qwen3_vl_patch.maybe_patch_qwen3_vl_image_hf_text(model_config) is None
+    assert processor._get_hf_mm_text({"image": 2}) is None
+    assert processor._get_hf_mm_text({"image": 1, "video": 1})
+    got = run()
+    hf_processor_cls = type(processor.info.get_hf_processor())
+    monkeypatch.setattr(hf_processor_cls, "__call__", lambda self, **kw: None)
+    assert processor._get_hf_mm_text({"image": 2})  # its own call keeps the text
+    _assert_same_outputs(got, want, ["image"])
+
+
+def test_maybe_patch_qwen3_vl_video_hf_text_keeps_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Videos skip the HF text vLLM drops; the prompt ids and video fields stay."""
+    processor_cls = qwen3_vl.Qwen3VLMultiModalProcessor
+    monkeypatch.setattr(
+        processor_cls,
+        "_apply_hf_processor_main",
+        processor_cls._apply_hf_processor_main,
+    )
+    monkeypatch.setattr(
+        processor_cls, "_tpu_video_hf_text_skipped", False, raising=False
+    )
+    monkeypatch.setattr(
+        InputProcessingContext,
+        "call_hf_processor",
+        InputProcessingContext.call_hf_processor,
+    )
+    model_config, processor = _processor({"image": 1, "video": 1})
+    rng = np.random.default_rng(0)
+    video = rng.integers(0, 256, (4, 64, 96, 3), dtype=np.uint8)
+    metadata = {
+        "fps": 2.0,
+        "duration": 2.0,
+        "total_num_frames": 4,
+        "frames_indices": [0, 1, 2, 3],
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+    }
+    image = Image.fromarray(rng.integers(0, 256, (64, 96, 3), dtype=np.uint8))
+    prompt = (
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "<|vision_start|><|video_pad|><|vision_end|>Hi"
+    )
+
+    def run():
+        mm_items = processor.info.parse_mm_data(
+            {"image": [image], "video": [(video, metadata)]}
+        )
+        return processor(prompt, mm_items=mm_items, hf_processor_mm_kwargs={})
+
+    tokenized = []
+    tokenizer_cls = type(processor.info.get_tokenizer())
+    upstream_tokenize = tokenizer_cls.__call__
+
+    def tokenize(self, text=None, *args, **kwargs):
+        tokenized.append(text)
+        return upstream_tokenize(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(tokenizer_cls, "__call__", tokenize)
+    want = run()
+    calls = len(tokenized)
+    assert qwen3_vl_patch.maybe_patch_qwen3_vl_video_hf_text(model_config) is None
+    got = run()
+    assert len(tokenized) - calls == calls - 1  # the video's text is not tokenized
+    _assert_same_outputs(got, want, ["image", "video"])

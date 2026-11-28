@@ -244,6 +244,8 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["model_load"] == [
         "maybe_patch_qwen3_vl",
         "maybe_patch_qwen3_vl_video_prompt",
+        "maybe_patch_qwen3_vl_image_hf_text",
+        "maybe_patch_qwen3_vl_video_hf_text",
         "maybe_patch_qwen3_next",
         "maybe_patch_qwen2",
         "maybe_patch_qwen3_5_attn_moe_overlap",
