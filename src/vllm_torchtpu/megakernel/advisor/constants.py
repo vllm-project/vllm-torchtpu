@@ -304,3 +304,35 @@ LAYER_GROUP_PRICING_NOTE: str = (
     "model, layer_group cost depends on group count rather than individual "
     "group sizes."
 )
+DEFAULT_CHIP = "tpu7x"
+DEFAULT_PREFILL_ISL = 4096
+DEFAULT_SPEC_TOKENS = 3
+RECOMMEND_DEFAULT_BATCH = 16
+RECOMMEND_HIGH_BATCH = 64
+RECOMMEND_HIGH_CTX = 32768
+SATURATION_BASE_BATCH = 256
+SATURATION_BATCH_CAP = 600
+INVALID_CONFIG_EXIT_CODE = 2
+DEFAULT_PREFILL_OSL = 0
+DEFAULT_DECODE_OSL = 1024
+TP_CANDIDATE_DEGREES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+MAX_DCP_POWER_BITS = 16
+DECODE_MED_REF_INDEX = 2
+MIN_PROVENANCE_BAND_LEN = 2
+MOE_MODE_SHORT_HINTS: Mapping[str, str] = {
+    "masked_on_chip": "Routed experts stream into VMEM; token rows are masked "
+    "per expert inside the fused call; no reordering",
+    "grouped_on_chip": "Tokens are grouped by expert inside VMEM, then each "
+    "expert runs on its rows inside the fused call",
+    "grouped_in_hbm": "Tokens are sorted by expert in HBM; the MoE is its own "
+    "call, so the kernel boundary falls at each MoE",
+    "dense_mlp": "Dense feed-forward; no routed experts",
+}
+SCOPE_HINTS: Mapping[str, str] = {
+    "whole_step": "one call for the whole step; [T, H] stays in VMEM. Rows past "
+    "max_rows_per_call run as separate calls that stream weights again; "
+    "tiling inside each layer past the VMEM ceiling is not implemented",
+    "layer_group": "one call per group of N layers, tiled like whole_step",
+    "single_layer": "one call per layer",
+    "per_op": "one call per operator; activations hand off through HBM",
+}

@@ -15,8 +15,26 @@
 
 from __future__ import annotations
 
-from . import chips, constants, models, roofline, spec_bridge, specs, verdict, vmem
+from . import (
+    chips,
+    cli,
+    constants,
+    models,
+    regimes,
+    roofline,
+    spec_bridge,
+    specs,
+    text_format,
+    verdict,
+    vmem,
+)
 from .chips import TPU7X_TOPOLOGIES, ChipSpec, resolve_chip_spec
+from .cli import (
+    build_parser,
+    derive_decoding_sequences,
+    format_model_listing,
+    main,
+)
 from .constants import CORE_LIMITS, CoreLimits
 from .models import (
     DEPLOYMENT_PRESETS,
@@ -27,10 +45,18 @@ from .models import (
     model_profile_from_hf_config,
     resolve_model_profile,
 )
+from .regimes import (
+    ParallelismSearchOptions,
+    RegimeSweepOptions,
+    advise_regimes,
+    recommend_parallelism,
+)
 from .roofline import evaluate_scopes, experts_hit_busiest
 from .spec_bridge import verify_core_limits_sync
 from .specs import (
     AdvisorReport,
+    AdvisorSweepReport,
+    DisaggHandoffSpec,
     EfficiencySpec,
     FusionScope,
     LayerGroupCandidate,
@@ -38,11 +64,19 @@ from .specs import (
     MoEMode,
     ObjectiveMode,
     ParallelismComparisonRow,
+    ParallelismRecommendation,
     Phase,
+    RegimeEntry,
     RingPlan,
     ScopeEstimate,
     WorkloadSpec,
     load_measurements,
+)
+from .text_format import (
+    format_advisor_summary,
+    format_layer_group_search,
+    format_regime_table,
+    vector_register_load_cap_line,
 )
 from .verdict import advise, compare_parallelism_candidates, search_layer_groups
 from .vmem import (
@@ -60,8 +94,10 @@ __all__ = [
     "MODEL_PRESETS",
     "TPU7X_TOPOLOGIES",
     "AdvisorReport",
+    "AdvisorSweepReport",
     "ChipSpec",
     "CoreLimits",
+    "DisaggHandoffSpec",
     "EfficiencySpec",
     "FusionScope",
     "LayerGroupCandidate",
@@ -71,32 +107,49 @@ __all__ = [
     "ObjectiveMode",
     "ParallelLayout",
     "ParallelismComparisonRow",
+    "ParallelismRecommendation",
+    "ParallelismSearchOptions",
     "Phase",
+    "RegimeEntry",
+    "RegimeSweepOptions",
     "RingPlan",
     "ScopeEstimate",
     "UnsupportedArchitectureError",
     "WorkloadSpec",
     "advise",
+    "advise_regimes",
+    "build_parser",
     "chips",
+    "cli",
     "compare_parallelism_candidates",
     "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
     "constants",
+    "derive_decoding_sequences",
     "evaluate_core_legality",
     "evaluate_scopes",
     "exceeds_default_buckets",
     "experts_hit_busiest",
     "fit_vmem_budget_bytes",
+    "format_advisor_summary",
+    "format_layer_group_search",
+    "format_model_listing",
+    "format_regime_table",
     "load_measurements",
+    "main",
     "model_profile_from_hf_config",
     "models",
+    "recommend_parallelism",
+    "regimes",
     "resolve_chip_spec",
     "resolve_model_profile",
     "roofline",
     "search_layer_groups",
     "spec_bridge",
     "specs",
+    "text_format",
     "validate_advise_inputs",
+    "vector_register_load_cap_line",
     "verdict",
     "verify_core_limits_sync",
     "vmem",

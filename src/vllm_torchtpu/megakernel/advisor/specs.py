@@ -48,6 +48,9 @@ from .constants import (
 if TYPE_CHECKING:
     from vllm_torchtpu.megakernel.core.exec_spec import Tiles
 
+    from .chips import ChipSpec
+    from .models import ModelProfile, ParallelLayout
+
 FusionScope = Literal["per_op", "single_layer", "layer_group", "whole_step"]
 Phase = Literal["decode", "verify", "prefill", "mixed"]
 MoEMode = Literal["masked_on_chip", "grouped_on_chip", "grouped_in_hbm", "dense_mlp"]
@@ -65,7 +68,9 @@ __all__ = [
     "SUPPORTED_ONCHIP_FAMILIES",
     "VALID_SOURCE_SCOPES",
     "AdvisorReport",
+    "AdvisorSweepReport",
     "CollectiveCall",
+    "DisaggHandoffSpec",
     "DispatchRegime",
     "EfficiencySpec",
     "FusionScope",
@@ -76,9 +81,11 @@ __all__ = [
     "MoEMode",
     "ObjectiveMode",
     "ParallelismComparisonRow",
+    "ParallelismRecommendation",
     "Phase",
     "ProvenanceMetric",
     "ProvenanceTag",
+    "RegimeEntry",
     "RingPlan",
     "ScopeEstimate",
     "SupportStatus",
@@ -87,6 +94,7 @@ __all__ = [
     "as_scalar_number",
     "as_sequence",
     "default_double_buffer_ring_plan",
+    "format_parallel_layout_label",
     "int_tuple",
     "load_measurements",
     "public_calibration_path",
@@ -815,3 +823,140 @@ class LayerGroupSearchReport:
     def to_dict(self) -> dict[str, object]:
         """Serialize layer-group search summary to a JSON-ready dictionary."""
         return asdict(self)
+
+
+def format_parallel_layout_label(
+    layout: WorkloadSpec | ParallelismRecommendation | ParallelLayout,
+) -> str:
+    """Return layout axes as `TP8 x EP8 x DCP4`, omitting degree-1 axes."""
+    axes = (
+        ("TP", layout.tp),
+        ("DP", layout.dp),
+        ("EP", layout.ep),
+        ("PP", layout.pp),
+        ("PCP", layout.pcp),
+        ("DCP", layout.dcp),
+    )
+    return " x ".join(f"{name}{deg}" for name, deg in axes if deg > 1) or "TP1"
+
+
+@dataclass(frozen=True)
+class ParallelismRecommendation:
+    """Auto-derived balanced TPU parallelism layout for bare-minimum queries."""
+
+    tp: int
+    ep: int
+    dp: int
+    pp: int
+    topology: str
+    hbm_used_gb: float
+    hbm_capacity_gb: float
+    step_weight_gb: float
+    auto_selected: bool = True
+    dcp: int = 1
+    pcp: int = 1
+    source: str = ""
+    layer_groups: tuple[int, ...] = ()
+
+    def label(self) -> str:
+        """Return the layout as `TP8 x EP8 x DCP4`, omitting degree-1 axes."""
+        return format_parallel_layout_label(self)
+
+
+@dataclass(frozen=True)
+class DisaggHandoffSpec:
+    """Per-request KV and recurrent state wire payload and DCN transfer floor."""
+
+    isl: int
+    kv_wire_mb: float
+    state_wire_mb: float
+    total_wire_mb: float
+    dcn_bw_gbps: float
+    dcn_bw_gbps_bracket: tuple[float, float]
+    dcn_xfer_ms: float
+    dcn_xfer_bracket_ms: tuple[float, float]
+    dcn_provenance: Literal["ASSUMED", "MEASURED"] = "ASSUMED"
+
+
+@dataclass(frozen=True)
+class RegimeEntry:
+    """Evaluation summary for one canonical serving request regime."""
+
+    label: str
+    phase: Phase
+    active_tokens: int
+    effective_context: int
+    step_arithmetic_intensity: float
+    max_vmem_tokens: int
+    num_vmem_splits: int
+    recommended_scope: FusionScope
+    recommended_moe_mode: str
+    step_bound_us: float
+    rationale: str
+    layout: str = ""
+    step_upper_us: float = 0.0
+    verdict: str = "separate_likely"
+    confidence: str = "prior_only"
+    hbm_fits: bool = True
+    hbm_pool_overflow: bool = False
+    flags: tuple[str, ...] = ()
+    metrics: dict[str, ProvenanceMetric] = field(default_factory=dict)
+    unresolved_assumptions: tuple[dict[str, object], ...] = ()
+    # Serialized ScopeEstimate dicts across all evaluated fusion scopes.
+    scopes: tuple[dict[str, object], ...] = ()
+    workload: dict[str, object] = field(default_factory=dict)
+    fastest_scope: FusionScope = "per_op"
+    fastest_verdict: str = "separate_likely"
+    # Flat JSON alias mirroring `core_support`.
+    evidence: SupportStatus = "baseline"
+    step_achievable_us: float = 0.0
+    step_achievable_upper_us: float = 0.0
+    step_floor_strict_us: float = 0.0
+    # Flat JSON alias mirroring `core_blockers`.
+    blockers: tuple[str, ...] = ()
+    gain_basis: GainBasis = "fused_scope_device_estimate"
+    ranking_metric: str = "step_bound_us"
+    binding_unit: str = "hbm"
+    core_support: SupportStatus = "baseline"
+    core_blockers: tuple[str, ...] = ()
+    core_ready: bool = False
+    core_ready_scope: FusionScope = "per_op"
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize `RegimeEntry` to a JSON-compatible dictionary."""
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AdvisorSweepReport:
+    """Multi-regime physics crossover report across canonical request regimes."""
+
+    model: str
+    chip: str
+    parallelism: ParallelismRecommendation
+    vmem_budget_mib: float
+    vmem_static_mib: float
+    per_token_vmem_bytes: int
+    vmem_breakdown_bytes: dict[str, int]
+    max_vmem_tokens: int
+    ridge_dense_flop_per_byte: float
+    ridge_tokens: int
+    regimes: tuple[RegimeEntry, ...]
+    tailoring_guide: tuple[str, ...]
+    dma_buffers: int = 2
+    vmem_reference_scope: FusionScope = "whole_step"
+    prefill_parallelism: ParallelismRecommendation | None = None
+    saturation_parallelism: ParallelismRecommendation | None = None
+    disagg_handoff: DisaggHandoffSpec | None = None
+    chip_sources: Mapping[str, str] = field(default_factory=dict)
+    model_sources: Mapping[str, str] = field(default_factory=dict)
+    chip_spec: ChipSpec | None = None
+    layer_group_search: LayerGroupSearchReport | None = None
+    model_profile: ModelProfile | None = None
+    submodule_labels: Mapping[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize `AdvisorSweepReport` to a JSON-compatible dictionary."""
+        payload = asdict(self)
+        payload["regimes"] = [entry.to_dict() for entry in self.regimes]
+        return payload
