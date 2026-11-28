@@ -18,9 +18,11 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.config import DeviceConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     get_offloading_group_ids,
 )
+from vllm.forward_context import set_forward_context
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
@@ -39,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu import rope_in_graph
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     RunLocalStateSpec,
     VllmCompressorStateCache,
@@ -425,3 +428,72 @@ def test_transpose_wkv_wgate_allocates_fresh_buffer():
 
     compressor.transpose_wkv_wgate()  # A second call must not flip it back.
     assert compressor.fused_wkv_wgate.weight is w
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 4, 16])
+def test_compressor_forward_passes_compressed_per_token_cos_sin(
+    monkeypatch, compress_ratio: int
+):
+    """Verify VllmDeepseekCompressor passes compressed per-token cos_sin."""
+    compressor = VllmDeepseekCompressor.__new__(VllmDeepseekCompressor)
+    torch.nn.Module.__init__(compressor)
+    compressor.head_dim = 128
+    compressor.overlap = True
+    compressor.compress_ratio = compress_ratio
+    compressor._wkv_wgate_transposed = True
+    compressor.fused_wkv_wgate = SimpleNamespace(weight=torch.zeros(2, 2))
+    compressor.ape = torch.zeros(compress_ratio, 2)
+    compressor.norm = SimpleNamespace(weight=torch.ones(8))
+    compressor.state_cache = SimpleNamespace(prefix="state")
+    compressor.k_cache = SimpleNamespace(
+        prefix="k_cache", kv_cache=torch.zeros(2, 4, dtype=torch.uint8)
+    )
+    compressor.k_cache_prefix = "k_cache"
+
+    captured: list[torch.Tensor] = []
+
+    def _fake_op(*args):
+        captured.append(args[4])
+        return args[-1].clone()
+
+    monkeypatch.setattr(compressor, "_build_compressor_op", lambda: _fake_op)
+
+    num_tokens = 20
+    rotary_dim = 8
+    positions = torch.arange(num_tokens, dtype=torch.int32)
+    inv_freq = tuple(
+        float(x)
+        for x in 1.0 / (10000.0 ** (torch.arange(0, rotary_dim, 2) / rotary_dim))
+    )
+    seg = rope_in_graph.CosSinSegment(0, 64, inv_freq, 1.0)
+    in_graph_cache = rope_in_graph.InGraphCosSinCache(
+        (seg,), torch.float32, 64, rotary_dim, cache_dtype=torch.float32
+    )
+    tensor_cache = in_graph_cache[:]
+
+    attn_meta = {
+        "state": SimpleNamespace(
+            block_tables=torch.zeros(1, 2, dtype=torch.int32),
+            query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        ),
+        "k_cache": SimpleNamespace(
+            block_tables=torch.zeros(1, 2, dtype=torch.int32),
+        ),
+    }
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    hidden = torch.zeros(num_tokens, 2)
+    with set_forward_context(attn_meta, cfg):
+        compressor.forward(
+            hidden, positions, SimpleNamespace(cos_sin_cache=tensor_cache)
+        )
+        compressor.forward(
+            hidden, positions, SimpleNamespace(cos_sin_cache=in_graph_cache)
+        )
+
+    compressed_pos = (
+        torch.div(positions, compress_ratio, rounding_mode="floor") * compress_ratio
+    )
+    expected = tensor_cache.index_select(0, compressed_pos)
+    assert torch.equal(captured[0], expected)
+    assert torch.equal(captured[1], expected)

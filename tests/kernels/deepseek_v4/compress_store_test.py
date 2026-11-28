@@ -25,6 +25,7 @@ from jax._src import test_util as jtu
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout, streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     compress_store_ref,
+    compressor_v1,
     config,
 )
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
@@ -305,8 +306,10 @@ class CompressStoreTest(jtu.JaxTestCase):
         rms_weight = jax.random.normal(k4, (head_dim,))
 
         max_pos = int(jnp.max(positions)) + 1 if len(positions) > 0 else 0
-        cos_sin_cache_len = max(max_pos, num_tokens)
+        cos_sin_cache_len = max(max_pos, num_tokens, 1)
         cos_sin_cache = jax.random.normal(k5, (cos_sin_cache_len, rope_head_dim))
+        compressed_pos = jnp.maximum((positions // compress_ratio) * compress_ratio, 0)
+        cos_sin = cos_sin_cache[compressed_pos]
 
         if cfgs.dims.has_rope_cache:
             num_rope_pages, rope_rows, _, lanes = cfgs.rope_cache_shape(num_pages)
@@ -346,7 +349,7 @@ class CompressStoreTest(jtu.JaxTestCase):
             token_to_req_indices=token_to_req_indices,
             kv_slot_mapping=kv_slot_mapping,
             rms_weight=rms_weight,
-            cos_sin_cache=cos_sin_cache,
+            cos_sin=cos_sin,
             block_table_stride=block_table_stride,
             state_block_size=state_block_size,
             head_dim=head_dim,
@@ -375,7 +378,7 @@ class CompressStoreTest(jtu.JaxTestCase):
             state_block_size=state_block_size,
             state_cache=(jnp.copy(populated_state_cache) if separate_state else None),
             rope_cache=jnp.copy(init_rope_cache),
-            cos_sin_cache=cos_sin_cache,
+            cos_sin=cos_sin,
             compress_ratio=cfgs.dims.compress_ratio,
             overlap=cfgs.dims.overlap,
             quant_block=cfgs.dims.quant_block,
@@ -434,7 +437,7 @@ class CompressStoreTest(jtu.JaxTestCase):
                 state_block_size=state_block_size,
                 state_cache=poisoned_state_cache,
                 rope_cache=jnp.copy(init_rope_cache),
-                cos_sin_cache=cos_sin_cache,
+                cos_sin=cos_sin,
                 compress_ratio=cfgs.dims.compress_ratio,
                 overlap=cfgs.dims.overlap,
                 quant_block=cfgs.dims.quant_block,
@@ -848,6 +851,9 @@ class CompressStoreTest(jtu.JaxTestCase):
         cos_sin_cache = jax.random.normal(
             k5, (max(int(positions_np.max()) + 1, num_tokens), rope_head_dim)
         )
+        boundary_cos_sin = cos_sin_cache[
+            jnp.maximum((boundary_positions // compress_ratio) * compress_ratio, 0)
+        ]
 
         def run(cache, seq_along_lane):
             out, _ = compress_store.compress_norm_rope_store(
@@ -860,7 +866,7 @@ class CompressStoreTest(jtu.JaxTestCase):
                 block_table_stride=table.shape[1],
                 state_block_size=state_block_size,
                 rope_cache=jnp.zeros((num_pages, 1, 1, 128), dtype=jnp.uint8),
-                cos_sin_cache=cos_sin_cache,
+                cos_sin=boundary_cos_sin,
                 compress_ratio=compress_ratio,
                 overlap=True,
                 quant_block=quant_block,
@@ -919,6 +925,42 @@ class CompressStoreTest(jtu.JaxTestCase):
     )
     def test_compress_store_seq_along_lane(self, cfg):
         self.run_seq_along_lane_matches_head_along_sublane(**cfg)
+
+    def test_prepare_boundary_batch_scatters_cos_sin(self):
+        # Token 0: decode boundary -> dest 0 (K=1 -> K_aligned=4, pads 1..3).
+        # Token 1: non-boundary decode -> dropped.
+        # Tokens 2, 3: prefill same tile (kv 0, 1) -> dest 4, 5.
+        # Token 4: prefill next tile (kv 4) -> dest 8 (pads 6..7).
+        # Token 5: prefill tile 3 (kv 12) -> dest 12 (pads 9..11, 13..).
+        positions = jnp.array([3, 1, 7, 3, 7, 11], dtype=jnp.int32)
+        token_to_req = jnp.array([0, 1, 2, 2, 2, 2], dtype=jnp.int32)
+        kv_slot_mapping = jnp.array([8, -1, 0, 1, 4, 12], dtype=jnp.int32)
+        is_boundary = jnp.array([True, False, True, True, True, True])
+        is_decode_token = jnp.array([True, True, False, False, False, False])
+        cos_sin = jnp.arange(1, 6 * 8 + 1, dtype=jnp.float32).reshape(6, 8) / 10.0
+
+        _, _, _, boundary_cos_sin = compressor_v1.prepare_boundary_batch(
+            positions=positions,
+            token_to_req_indices=token_to_req,
+            kv_slot_mapping=kv_slot_mapping,
+            is_boundary=is_boundary,
+            is_decode_token=is_decode_token,
+            compress_ratio=4,
+            num_reqs=3,
+            rope_pack=4,
+            cos_sin=cos_sin,
+        )
+        assert boundary_cos_sin is not None
+        expected_dest = {0: 0, 4: 2, 5: 3, 8: 4, 12: 5}
+        for row_idx in range(boundary_cos_sin.shape[0]):
+            if row_idx in expected_dest:
+                self.assertArraysEqual(
+                    boundary_cos_sin[row_idx], cos_sin[expected_dest[row_idx]]
+                )
+            else:
+                self.assertArraysEqual(
+                    boundary_cos_sin[row_idx], jnp.zeros((8,), dtype=jnp.float32)
+                )
 
 
 if __name__ == "__main__":

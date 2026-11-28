@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4 import compressor as dsv4_compressor
 from vllm.models.deepseek_v4.compressor import CompressorStateCache, DeepseekCompressor
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+from vllm_torchtpu import rope_in_graph
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
@@ -56,7 +57,7 @@ def _run_compressor(
     wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     positions: jax.Array,
     state_block_tables: jax.Array,
     query_start_loc: jax.Array,
@@ -81,7 +82,7 @@ def _run_compressor(
         wkv_wgate=wkv_wgate,
         ape=ape,
         norm_weight=norm_weight,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         positions=positions,
         block_table=state_block_tables,
         query_start_loc=query_start_loc,
@@ -107,7 +108,7 @@ def _compressor_jax_csa(
     wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     positions: jax.Array,
     state_block_tables: jax.Array,
     query_start_loc: jax.Array,
@@ -131,7 +132,7 @@ def _compressor_jax_csa(
         wkv_wgate=wkv_wgate,
         ape=ape,
         norm_weight=norm_weight,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         positions=positions,
         state_block_tables=state_block_tables,
         query_start_loc=query_start_loc,
@@ -157,7 +158,7 @@ def _compressor_jax_hca(
     wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     positions: jax.Array,
     state_block_tables: jax.Array,
     query_start_loc: jax.Array,
@@ -181,7 +182,7 @@ def _compressor_jax_hca(
         wkv_wgate=wkv_wgate,
         ape=ape,
         norm_weight=norm_weight,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         positions=positions,
         state_block_tables=state_block_tables,
         query_start_loc=query_start_loc,
@@ -207,7 +208,7 @@ def _compressor_jax_indexer(
     wkv_wgate: jax.Array,
     ape: jax.Array,
     norm_weight: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     positions: jax.Array,
     state_block_tables: jax.Array,
     query_start_loc: jax.Array,
@@ -230,7 +231,7 @@ def _compressor_jax_indexer(
         wkv_wgate=wkv_wgate,
         ape=ape,
         norm_weight=norm_weight,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         positions=positions,
         state_block_tables=state_block_tables,
         query_start_loc=query_start_loc,
@@ -524,7 +525,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             P(),  # wkv_wgate
             P(),  # ape
             P(),  # norm_weight
-            P(),  # cos_sin_cache
+            P(attn_data_axis, None),  # cos_sin
             P(attn_data_axis),  # positions
             P(batch_axis),  # state_block_tables
             P(),  # query_start_loc
@@ -552,7 +553,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 wkv_wgate,
                 ape,
                 norm_weight,
-                cos_sin_cache,
+                cos_sin,
                 positions,
                 state_block_tables,
                 query_start_loc,
@@ -570,7 +571,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 wkv_wgate,
                 ape,
                 norm_weight,
-                cos_sin_cache,
+                cos_sin,
                 positions,
                 state_block_tables,
                 query_start_loc,
@@ -680,12 +681,17 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             "quant_config=None, so it never reaches a TPU linear method and "
             "the canonical (k, n) flip does not apply to it."
         )
+        compressed_positions = (
+            torch.div(positions, self.compress_ratio, rounding_mode="floor")
+            * self.compress_ratio
+        )
+        cos_sin = rope_in_graph.cos_sin_at(rotary_emb, compressed_positions)
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,
             self.ape,
             self.norm.weight,
-            rotary_emb.cos_sin_cache,
+            cos_sin,
             positions,
             state_block_tables,
             state_metadata.query_start_loc,
