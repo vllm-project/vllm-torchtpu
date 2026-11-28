@@ -349,14 +349,16 @@ class TestVideoEncoderChunking:
         for i, call_kwargs in enumerate(item0_calls):
             expected = pixel_slabs[0][i * 2 * rows_per_t : (i + 1) * 2 * rows_per_t]
             assert torch.equal(call_kwargs["pixel_values_videos"], expected)
+            assert len(call_kwargs["timestamps"]) == 1
             assert torch.equal(
-                call_kwargs["timestamps"], ts_list[0][i * 2 : (i + 1) * 2]
+                call_kwargs["timestamps"][0], ts_list[0][i * 2 : (i + 1) * 2]
             )
         for i, call_kwargs in enumerate(item1_calls):
             expected = pixel_slabs[1][i * 2 * rows_per_t : (i + 1) * 2 * rows_per_t]
             assert torch.equal(call_kwargs["pixel_values_videos"], expected)
+            assert len(call_kwargs["timestamps"]) == 1
             assert torch.equal(
-                call_kwargs["timestamps"], ts_list[1][i * 2 : (i + 1) * 2]
+                call_kwargs["timestamps"][0], ts_list[1][i * 2 : (i + 1) * 2]
             )
 
         # Two per-item outputs, each the concat of its own chunks.
@@ -399,6 +401,48 @@ class TestVideoEncoderChunking:
         # item0 (t=2 <= chunk_t=2) -> one call; item1 (t=8) -> 4 chunks.
         assert chunk_ts == [2, 2, 2, 2, 2]
         assert len(out) == 2
+
+    def test_multi_item_subbatches_short_videos(self):
+        """Short videos whose total exceeds max_patches are grouped into
+        multi-item sub-batches up to max_patches rather than encoded one item
+        per pass."""
+        # Patch counts: [8, 8, 12, 4] (total 32 > budget 16).
+        # Sub-batch 0 packs items 0..2 (8 + 8 = 16); sub-batch 1 packs
+        # items 2..4 (12 + 4 = 16).
+        specs = [(2, 2, 2), (2, 2, 2), (3, 2, 2), (1, 2, 2)]
+        kwargs, pixel_slabs, ts_list = _make_multi_video_kwargs(specs)
+        kwargs["extra_per_item"] = torch.tensor([10, 20, 30, 40])
+        calls = []
+
+        def fake_encode(**mm_kwargs):
+            calls.append(mm_kwargs)
+            grid_rows = mm_kwargs["video_grid_thw"].tolist()
+            return tuple(
+                torch.full((t * h * w, 6), float(len(calls)), dtype=torch.float32)
+                for t, h, w in grid_rows
+            )
+
+        out = mvc.embed_multimodal_chunked(fake_encode, kwargs, max_patches=16)
+
+        assert len(calls) == 2
+        assert calls[0]["video_grid_thw"].tolist() == [[2, 2, 2], [2, 2, 2]]
+        assert torch.equal(
+            calls[0]["pixel_values_videos"],
+            torch.cat(pixel_slabs[0:2], dim=0),
+        )
+        assert calls[0]["timestamps"] == ts_list[0:2]
+        assert torch.equal(calls[0]["extra_per_item"], torch.tensor([10, 20]))
+
+        assert calls[1]["video_grid_thw"].tolist() == [[3, 2, 2], [1, 2, 2]]
+        assert torch.equal(
+            calls[1]["pixel_values_videos"],
+            torch.cat(pixel_slabs[2:4], dim=0),
+        )
+        assert calls[1]["timestamps"] == ts_list[2:4]
+        assert torch.equal(calls[1]["extra_per_item"], torch.tensor([30, 40]))
+
+        assert isinstance(out, list) and len(out) == 4
+        assert [t.shape for t in out] == [(8, 6), (8, 6), (12, 6), (4, 6)]
 
     def test_ragged_last_chunk(self):
         """When t is not a multiple of chunk_t the last chunk is smaller, and
@@ -459,16 +503,9 @@ class TestSliceTimestamps:
         assert slice_fn(list(range(10)), 2, 5) == [2, 3, 4]
         # nested single-item list
         assert slice_fn([list(range(10))], 2, 5) == [[2, 3, 4]]
+        # single-item list wrapping a 1D tensor
+        sliced_list_tensor = slice_fn([torch.arange(10)], 2, 5)
+        assert len(sliced_list_tensor) == 1
+        assert torch.equal(sliced_list_tensor[0], torch.tensor([2, 3, 4]))
         # non-sliceable -> passthrough
         assert slice_fn(None, 2, 5) is None
-
-    def test_select_item_timestamps_variants(self):
-        """``_select_item_timestamps`` picks item ``i`` out of a batched
-        group."""
-        select_fn = mvc._select_item_timestamps
-
-        batched = torch.arange(6).reshape(2, 3)
-        assert torch.equal(select_fn(batched, 1), batched[1:2])
-        per_item = [torch.arange(3), torch.arange(4)]
-        assert torch.equal(select_fn(per_item, 1), per_item[1])
-        assert select_fn(None, 1) is None
