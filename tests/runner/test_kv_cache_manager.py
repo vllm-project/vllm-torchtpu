@@ -2983,6 +2983,7 @@ def test_dsv4_request_caps_match_runner_refresh():
             ),
             _attention_capacity={"stale": object()},
             _decode_device_cache_key=("stale",),
+            _uses_rpa_smem_page_table=True,
         )
         return runner
 

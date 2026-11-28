@@ -745,6 +745,7 @@ class TPUModelRunner(GPUModelRunner):
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
+    _uses_rpa_smem_page_table: bool = True
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -1162,6 +1163,7 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_capacity: dict[
             tuple[int, int], dict[str, tuple[int, int, int]]
         ] = {}
+        self._uses_rpa_smem_page_table: bool = True
         self._refresh_smem_request_caps()
 
         self.sample_from_logits_func = self.sample_from_logits
@@ -6453,6 +6455,10 @@ class TPUModelRunner(GPUModelRunner):
         self._prompt_logprobs_unsupported = self._prompt_logprobs_unsupported_reason()
         if self.is_pooling_model:
             self._resolve_static_pooler()
+        if isinstance(self.model, utils.RpaSmemPageTableModel):
+            self._uses_rpa_smem_page_table = self.model.uses_rpa_smem_page_table
+            if not self._uses_rpa_smem_page_table:
+                self._refresh_smem_request_caps()
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -9415,7 +9421,10 @@ class TPUModelRunner(GPUModelRunner):
         raise NotImplementedError(f"Unsupported KV cache spec: {type(kv_cache_spec)!r}")
 
     def _refresh_smem_request_caps(
-        self, kv_cache_config: KVCacheConfig | None = None
+        self,
+        kv_cache_config: KVCacheConfig | None = None,
+        *,
+        uses_rpa_smem_page_table: bool | None = None,
     ) -> None:
         """Use the widest attention table each kernel invocation will prefetch.
 
@@ -9473,9 +9482,18 @@ class TPUModelRunner(GPUModelRunner):
                 return self.max_num_blocks_per_req
             return cdiv(model_len, self.block_size)
 
+        use_smem = (
+            self._uses_rpa_smem_page_table
+            if uses_rpa_smem_page_table is None
+            else uses_rpa_smem_page_table
+        )
         max_num_local_reqs = self.max_num_local_reqs
         self.num_reqs_max_model_len = min(
-            PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None)),
+            (
+                PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None))
+                if use_smem
+                else max_num_local_reqs
+            ),
             max_num_local_reqs,
             self.max_num_tokens,
         )
@@ -9483,7 +9501,11 @@ class TPUModelRunner(GPUModelRunner):
         if self.most_model_len is not None:
             pages = widest_table(self.most_model_len)
             self.num_reqs_most_model_len = min(
-                PallasAttentionBackend.get_max_num_seqs_for_pages(pages),
+                (
+                    PallasAttentionBackend.get_max_num_seqs_for_pages(pages)
+                    if use_smem
+                    else max_num_local_reqs
+                ),
                 max_num_local_reqs,
                 self.max_num_tokens,
             )
