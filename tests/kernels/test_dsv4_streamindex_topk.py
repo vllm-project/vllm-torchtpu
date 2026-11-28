@@ -59,7 +59,6 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
 # =====================================================================
 
 pytestmark = [
-    pytest.mark.tpu_test,
     pytest.mark.filterwarnings("ignore::DeprecationWarning"),
 ]
 
@@ -127,6 +126,7 @@ def streamindex_topk_ref(
     return expected_topk
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "B, num_tokens, page_size, max_blocks, H_I, H_KV, D, k, compression_ratio,"
     " bq_sz, bkv_p, seq_lens_list, cu_q_lens_list",
@@ -238,6 +238,7 @@ def test_streamindex_topk_shape(
     print("Result: PASS")
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "B, T_list, S_list, page_size, H_I, H_KV, D, k, comp_ratio, bq_sz, bkv_p,"
     " block_table_list",
@@ -451,6 +452,7 @@ def test_streamindex_topk_numerical_correctness(
     )
 
 
+@pytest.mark.tpu_test
 def test_streamindex_topk_quantized():
     """Verifies correctness of streamindex_topk on FP8 packed cache."""
     np.random.seed(42)
@@ -710,6 +712,7 @@ def _ee_assert_full_rows(actual, q_lens, seq_lens, k):
         )
 
 
+@pytest.mark.tpu_test
 def test_streamindex_topk_early_exit_all_short():
     """Whole batch under k: the global fast path answers on its own."""
     q_lens, seq_lens, k = (1, 1, 1), (64, 96, 128), 512
@@ -719,6 +722,7 @@ def test_streamindex_topk_early_exit_all_short():
     _ee_assert_same_selection(early, baseline)
 
 
+@pytest.mark.tpu_test
 def test_streamindex_topk_early_exit_no_short_is_inert():
     """Every sequence over k: nothing is skipped, so nothing may change.
 
@@ -732,6 +736,7 @@ def test_streamindex_topk_early_exit_no_short_is_inert():
     np.testing.assert_array_equal(early, baseline)
 
 
+@pytest.mark.tpu_test
 def test_streamindex_topk_early_exit_is_batch_wide():
     """The guard is batch-wide, not per sequence.
 
@@ -745,6 +750,7 @@ def test_streamindex_topk_early_exit_is_batch_wide():
     np.testing.assert_array_equal(early, baseline)
 
 
+@pytest.mark.tpu_test
 def test_streamindex_topk_early_exit_keeps_causal_mask():
     """The shortcut is still causal: a prefill token sees only its past.
 
@@ -761,6 +767,7 @@ def test_streamindex_topk_early_exit_keeps_causal_mask():
     assert kept == [61, 62, 63, 64], kept
 
 
+@pytest.mark.tpu_test
 def test_streamindex_topk_sees_only_complete_groups():
     """A token never selects a group that a later token of its forward completes.
 
@@ -782,6 +789,7 @@ def test_streamindex_topk_sees_only_complete_groups():
     _ee_assert_same_selection(early, baseline)
 
 
+@pytest.mark.tpu_test
 def test_pallas_smem_oom_when_unclamped(monkeypatch):
     """Verifies that Pallas compilation of _scores_kernel fails with SMEM OOM"""
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
@@ -834,6 +842,7 @@ def test_pallas_smem_oom_when_unclamped(monkeypatch):
     assert "smem" in err_str, f"Expected SMEM OOM error, got: {exc_info.value}"
 
 
+@pytest.mark.tpu_test
 def test_streamindex_topk_buffer_count():
     """Verifies configurable buffer_count parameter behavior."""
     B = 2
@@ -916,6 +925,7 @@ def test_streamindex_topk_buffer_count():
         )
 
 
+@pytest.mark.tpu_test
 def test_streamindex_topk_return_scores_and_validation():
     q_dtype = jnp.float8_e4m3fn
     kv_dtype = jnp.uint8
@@ -1188,6 +1198,7 @@ def _chunk_call_kwargs(
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("chunk_tokens", [32, 64])
 @pytest.mark.parametrize(
     "T_list",
@@ -1247,6 +1258,7 @@ def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
     )
 
 
+@pytest.mark.tpu_test
 class TestChunkedPipelining:
     """Chunking the token axis must not change which candidates are selected.
 
@@ -1487,6 +1499,463 @@ class TestChunkedPipelining:
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
 
+    @pytest.mark.parametrize("kv_layout", [_HAS, _SAL], ids=["has", "sal"])
+    @pytest.mark.parametrize(
+        "num_decodes, prefill_len, chunk_tokens",
+        [
+            # max_num_seqs (35) < chunk_tokens (128): only chunk 0 runs the
+            # static_q_len == 1 decode passes; chunks 1..3 skip them.
+            (34, 478, 128),
+            # max_num_seqs (141) > chunk_tokens (128): chunks 0 and 1 run the
+            # static_q_len == 1 decode passes; chunks 2..3 skip them.
+            (140, 372, 128),
+        ],
+        ids=["seqs_within_first_chunk", "seqs_spanning_two_chunks"],
+    )
+    def test_mixed_decode_prefill_skips_dead_decode_chunks(
+        self, num_decodes, prefill_len, chunk_tokens, kv_layout
+    ):
+        """Mixed decode+prefill with `chunk_tokens=128` omits `static_q_len==1`
+        kernel calls on chunks starting at or past `max_num_seqs` while keeping
+        selections identical to the unchunked pass."""
+        T_list = (1,) * num_decodes + (prefill_len,)
+        B = len(T_list)
+        S_list = (512,) * B
+        inputs = _chunk_inputs(T_list, _fragmented_pages(B), 128, 4, 128)
+        common = (inputs, T_list, S_list, 128, 1, 8, 2, kv_layout)
+        chunked_kwargs = _chunk_call_kwargs(*common, chunk_tokens)
+
+        lowered = streamindex_topk.lower(**chunked_kwargs)
+        assert "_scheduling_group_id" in lowered.as_text()
+        compiled_hlo = lowered.compile().as_text()
+        num_chunks = sum(T_list) // chunk_tokens
+        expected_decode_chunks = (B + chunk_tokens - 1) // chunk_tokens
+        expected_custom_calls = 2 * expected_decode_chunks + 2 * num_chunks
+        custom_calls = compiled_hlo.count('custom_call_target="tpu_custom_call"')
+        assert custom_calls == expected_custom_calls, (
+            f"expected {expected_custom_calls} tpu_custom_call sites "
+            f"(2 * {expected_decode_chunks} decode + 2 * {num_chunks} "
+            f"mixed/topk), got {custom_calls}"
+        )
+
+        chunked = np.array(streamindex_topk(**chunked_kwargs))
+        unchunked = np.array(
+            streamindex_topk(**_chunk_call_kwargs(*common, None))
+        )
+        _verify_padding_at_end(chunked)
+        np.testing.assert_array_equal(
+            np.sort(chunked, axis=-1),
+            np.sort(unchunked, axis=-1),
+        )
+
+
+def test_early_exit_hoists_schedule_metadata_outside_cond(monkeypatch):
+    """With `enable_early_exit=True`, per-pass schedule metadata and
+    effective row lengths are hoisted outside the `jax.lax.cond` branches
+    so multi-layer callers can CSE them across layers."""
+    if jax.default_backend() != "tpu":
+        monkeypatch.setattr(
+            "jax._src.pallas.mosaic.tpu_info.get_device_kind",
+            lambda *args, **kwargs: "TPU7x",
+        )
+        monkeypatch.setattr(
+            "jax._src.pallas.mosaic.tpu_info.get_num_device_cores",
+            lambda *args, **kwargs: 2,
+        )
+    T_list, S_list = (1, 1, 1, 1), (512, 512, 512, 512)
+    inputs = _chunk_inputs(T_list, _fragmented_pages(4), 128, 4, 128)
+    kwargs = _chunk_call_kwargs(inputs, T_list, S_list, 128, 1, 8, 2, _HAS, None)
+
+    closed_jaxpr = jax.make_jaxpr(
+        lambda q, w, kv, sl, pi, cu, dist: streamindex_topk(
+            q=q,
+            indexer_weights=w,
+            cache_kv=kv,
+            seq_lens=sl,
+            page_indices=pi,
+            cu_q_lens=cu,
+            distribution=dist,
+            k=kwargs["k"],
+            compression_ratio=kwargs["compression_ratio"],
+            num_kv_pages_per_block=kwargs["num_kv_pages_per_block"],
+            num_queries_per_block=kwargs["num_queries_per_block"],
+            enable_early_exit=True,
+            kv_layout=_HAS,
+            chunk_tokens=None,
+        )
+    )(
+        kwargs["q"],
+        kwargs["indexer_weights"],
+        kwargs["cache_kv"],
+        kwargs["seq_lens"],
+        kwargs["page_indices"],
+        kwargs["cu_q_lens"],
+        kwargs["distribution"],
+    )
+
+    jit_eqn = next(e for e in closed_jaxpr.jaxpr.eqns if e.primitive.name == "jit")
+    inner_jaxpr = jit_eqn.params["jaxpr"].jaxpr
+    outer_prims = {e.primitive.name for e in inner_jaxpr.eqns}
+    assert {"scatter-add", "cummax", "cond"} <= outer_prims
+
+    cond_eqn = next(e for e in inner_jaxpr.eqns if e.primitive.name == "cond")
+    for branch in cond_eqn.params["branches"]:
+        branch_prims = {e.primitive.name for e in branch.jaxpr.eqns}
+        assert "scatter-add" not in branch_prims
+        assert "cummax" not in branch_prims
+        assert "gather" not in branch_prims
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL], ids=["has", "sal"])
+def test_asymmetric_bkv_pages_tuple_narrows_scores_width_without_uniform_pass(
+    kv_layout,
+):
+    """With `num_kv_pages_per_block=(32, 64, 32)` and `uniform_q_len=None`,
+    only the decode (`32`) and mixed (`32`) passes exist, so `num_sublanes_total`
+    narrows from `align_to(20, 64) == 64` to `align_to(20, 32) == 32` while
+    matching the naive reference."""
+    page_size, pages_per_seq, H_I, D, comp_ratio = 128, 20, 4, 128, 1
+    T_list = (1, 7)
+    S_list = (2048, 2048)
+    # k == S avoids boundary score ties between bf16 MXU and fp32 NumPy while
+    # still exercising causal masking on rows 1..6 and full selection on 0, 7.
+    k = 2048
+    inputs = _chunk_inputs(
+        T_list, _fragmented_pages(len(T_list), pages_per_seq), page_size, H_I, D
+    )
+    kwargs = _chunk_call_kwargs(
+        inputs,
+        T_list,
+        S_list,
+        k,
+        comp_ratio,
+        (1, 128, 8),
+        (32, 64, 32),
+        kv_layout,
+        None,
+    )
+
+    jpr = str(jax.make_jaxpr(lambda: streamindex_topk(**kwargs))())
+    assert "ShapedArray(int32[8,32,128])" in jpr
+    assert "ShapedArray(int32[8,64,128])" not in jpr
+
+    actual = np.array(streamindex_topk(**kwargs))
+    expected = streamindex_topk_ref(
+        q=inputs.q,
+        weights=inputs.weights,
+        kv=inputs.dequantized_kv,
+        block_table=inputs.block_table,
+        T_list=list(T_list),
+        S_list=list(S_list),
+        cu_q_lens=np.concatenate([[0], np.cumsum(T_list)]).astype(np.int32),
+        k=k,
+        comp_ratio=comp_ratio,
+        H_I=H_I,
+        H_KV=1,
+    )
+    _verify_padding_at_end(actual)
+    np.testing.assert_array_equal(
+        np.sort(actual, axis=-1),
+        np.sort(expected, axis=-1),
+    )
+
+
+_JAX_OP_HLO_PROBE_SCRIPT = """
+import json
+import re
+import sys
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import torch
+import torch_tpu  # noqa: F401
+from jax._src import mesh as mesh_lib
+from torch_tpu._internal import pallas
+from torch_tpu._internal.utils import hardware as tpu_hardware
+
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    streamindex_topk,
+)
+
+num_layers = int(sys.argv[1])
+dump_dir = Path(sys.argv[2])
+dump_dir.mkdir(parents=True, exist_ok=True)
+
+# Claim the TPU exclusively via TorchTPU; JAX stays on CPU (`JAX_PLATFORMS=cpu`)
+# and lowers Pallas against an AbstractDevice matching the attached TPU.
+torch.empty((1,), device="tpu").cpu()
+hw_name = tpu_hardware.get_tpu_device_name()
+jax_kind = {"TPU v7": "TPU7x"}.get(hw_name, hw_name)
+abs_mesh = mesh_lib.AbstractMesh(
+    (),
+    (),
+    abstract_device=mesh_lib.AbstractDevice(
+        device_kind=jax_kind, num_cores=1, platform="tpu"
+    ),
+)
+
+num_seqs, num_tokens, page_size, pages_per_seq = 4, 4, 128, 8
+num_pages = num_seqs * pages_per_seq
+h_i, head_dim, k = 4, 128, 256
+width = 256
+fp8_one = 0x38  # float8_e4m3fn(1.0)
+ue8m0_one = 0x7F  # float8_e8m0fnu(1.0)
+
+ops = []
+for idx in range(num_layers):
+
+    def _make_op(layer_idx: int):
+        def _jax_fn(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_row: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            cache_kv = jax.lax.dynamic_update_slice(cache_kv, k_row, (0, 0, 0, 0))
+            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            topk_idx = streamindex_topk(
+                q,
+                weights,
+                cache_kv,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                k=k,
+                compression_ratio=1,
+                num_kv_pages_per_block=2,
+                num_queries_per_block=4,
+                enable_early_exit=True,
+                kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+            )
+            return cache_kv, topk_idx
+
+        jax_op = pallas.jax_op(
+            f"pallas::streamidx_cse_probe_l{layer_idx}",
+            _jax_fn,
+            donate_argnums=(2,),
+        )
+
+        def _fake(q_bytes, weights, cache_kv, *args):
+            return torch.empty_like(cache_kv), torch.empty(
+                (q_bytes.shape[0], k), dtype=torch.int32, device=q_bytes.device
+            )
+
+        jax_op.register_fake(_fake)
+
+        def _call(*args):
+            new_cache, topk_idx = jax_op(*args)
+            args[2].copy_(new_cache)
+            return topk_idx
+
+        return _call
+
+    ops.append(_make_op(idx))
+
+
+def _step(qs, ws, caches, k_rows, seq_lens, page_indices, cu_q_lens, dist):
+    outs = []
+    for i, op in enumerate(ops):
+        outs.append(
+            op(
+                qs[i],
+                ws[i],
+                caches[i],
+                k_rows[i],
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                dist,
+            )
+        )
+    return tuple(outs)
+
+
+compiled = torch.compile(_step, fullgraph=True, dynamic=False, backend="tpu")
+
+kernel_seq_len = 512
+qs_np = []
+ws_np = []
+caches_np = []
+k_rows_np = []
+expected_kernel_sorted = []
+
+for i in range(num_layers):
+    qs_np.append(np.full((num_tokens, h_i, head_dim), fp8_one, dtype=np.uint8))
+    ws_np.append(
+        np.full((num_tokens, h_i), 1.0 + 0.1 * i, dtype=np.float32)
+    )
+    cache_i = np.zeros(
+        (num_pages, page_size // 4, 4, width), dtype=np.uint8
+    )
+    layer_expected = np.empty((num_seqs, k), dtype=np.int32)
+    k_row_i = np.zeros((1, 1, 1, width), dtype=np.uint8)
+    for b in range(num_seqs):
+        # Always include token 0 on seq 0 via k_row_i so dynamic_update_slice
+        # is exercised, plus a layer/seq-distinct window of k active columns.
+        start = 0 if b == 0 else ((i * 64 + b * 32) % (kernel_seq_len - k))
+        active = np.arange(start, start + k, dtype=np.int32)
+        layer_expected[b] = active
+        for pos in active:
+            p = b * pages_per_seq + int(pos) // page_size
+            slot = int(pos) % page_size
+            if p == 0 and slot == 0:
+                k_row_i[0, 0, 0, :head_dim] = fp8_one
+                k_row_i[0, 0, 0, head_dim] = ue8m0_one
+            else:
+                cache_i[p, slot // 4, slot % 4, :head_dim] = fp8_one
+                cache_i[p, slot // 4, slot % 4, head_dim] = ue8m0_one
+    caches_np.append(cache_i)
+    k_rows_np.append(k_row_i)
+    expected_kernel_sorted.append(layer_expected)
+
+page_indices_np = np.arange(num_pages, dtype=np.int32)
+cu_q_lens_np = np.arange(num_seqs + 1, dtype=np.int32)
+dist_np = np.array([num_seqs, num_seqs, num_seqs], dtype=np.int32)
+
+with mesh_lib.use_abstract_mesh(abs_mesh):
+    for seq_len_val in (64, kernel_seq_len):
+        seq_lens_np = np.full((num_seqs,), seq_len_val, dtype=np.int32)
+        qs_t = [torch.tensor(x, device="tpu") for x in qs_np]
+        ws_t = [torch.tensor(x, device="tpu") for x in ws_np]
+        caches_t = [torch.tensor(x, device="tpu") for x in caches_np]
+        k_rows_t = [torch.tensor(x, device="tpu") for x in k_rows_np]
+        sl_t = torch.tensor(seq_lens_np, device="tpu")
+        pi_t = torch.tensor(page_indices_np, device="tpu")
+        cu_t = torch.tensor(cu_q_lens_np, device="tpu")
+        dist_t = torch.tensor(dist_np, device="tpu")
+
+        outs_t = compiled(qs_t, ws_t, caches_t, k_rows_t, sl_t, pi_t, cu_t, dist_t)
+        outs_cpu = [o.cpu().numpy() for o in outs_t]
+
+        for i in range(num_layers):
+            if seq_len_val <= k:
+                exp_row = np.concatenate(
+                    [
+                        np.arange(seq_len_val, dtype=np.int32),
+                        np.full((k - seq_len_val,), -1, dtype=np.int32),
+                    ]
+                )
+                exp = np.broadcast_to(exp_row, (num_seqs, k))
+                np.testing.assert_array_equal(outs_cpu[i], exp)
+            else:
+                np.testing.assert_array_equal(
+                    np.sort(outs_cpu[i], axis=-1),
+                    expected_kernel_sorted[i],
+                )
+
+before_files = sorted(
+    (
+        p
+        for p in dump_dir.glob("*.before_optimizations.txt")
+        if "tpu_custom_call" in p.read_text()
+    ),
+    key=lambda p: p.stat().st_size,
+    reverse=True,
+)
+after_files = sorted(
+    (
+        p
+        for p in dump_dir.glob("*.after_optimizations.txt")
+        if "tpu_custom_call" in p.read_text()
+    ),
+    key=lambda p: p.stat().st_size,
+    reverse=True,
+)
+assert before_files and after_files, (
+    f"missing XLA HLO dumps with tpu_custom_call in {list(dump_dir.iterdir())}"
+)
+before_text = before_files[0].read_text()
+after_text = after_files[0].read_text()
+print(
+    "PROBE_JSON:"
+    + json.dumps(
+        {
+            "tpu_custom_calls": after_text.count(
+                'custom_call_target="tpu_custom_call"'
+            ),
+            "conditionals": len(re.findall(r"(?<!-)\\bconditional\\(", after_text)),
+            "before_scatters": len(re.findall(r"(?<!-)\\bscatter\\(", before_text)),
+            "after_scatters": len(re.findall(r"(?<!-)\\bscatter\\(", after_text)),
+        }
+    )
+)
+"""
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_multi_layer_jax_op_torch_compile_cses_hoisted_schedule_metadata(tmp_path):
+    """Multiple per-layer `pallas.jax_op` wrappers compiled in one
+    `torch.compile(backend="tpu")` graph inline into a single HLO module and
+    CSE the hoisted schedule metadata across layers."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    pytest.importorskip("torch_tpu")
+
+    def _run_probe(num_layers: int) -> dict[str, int]:
+        dump_dir = tmp_path / f"hlo_l{num_layers}"
+        env = os.environ.copy()
+        extra_xla = f"--xla_dump_to={dump_dir}"
+        prev_xla = env.get("XLA_FLAGS", "").strip()
+        env["XLA_FLAGS"] = f"{prev_xla} {extra_xla}".strip()
+        env["JAX_PLATFORMS"] = "cpu"
+        env["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "0"
+        env["VLLM_USE_AOT_COMPILE"] = "0"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _JAX_OP_HLO_PROBE_SCRIPT,
+                str(num_layers),
+                str(dump_dir),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=240,
+            check=False,
+        )
+        assert proc.returncode == 0, (
+            f"probe for {num_layers} layers failed (rc={proc.returncode}):\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+        marker = next(
+            line for line in proc.stdout.splitlines() if line.startswith("PROBE_JSON:")
+        )
+        return json.loads(marker.removeprefix("PROBE_JSON:"))
+
+    stats_1 = _run_probe(1)
+    stats_4 = _run_probe(4)
+
+    assert stats_1["conditionals"] == 1, stats_1
+    assert stats_4["conditionals"] == 4, stats_4
+    assert stats_4["tpu_custom_calls"] == 4 * stats_1["tpu_custom_calls"], (
+        stats_1,
+        stats_4,
+    )
+    assert stats_1["before_scatters"] > 0, stats_1
+    assert stats_4["before_scatters"] == 4 * stats_1["before_scatters"], (
+        stats_1,
+        stats_4,
+    )
+    assert stats_1["after_scatters"] > 0, stats_1
+    assert stats_4["after_scatters"] == stats_1["after_scatters"], (
+        f"expected hoisted schedule scatters to CSE across 4 jax_op layers, "
+        f"got 1-layer={stats_1} vs 4-layer={stats_4}"
+    )
+
 
 def main(argv):
     del argv
@@ -1500,6 +1969,7 @@ if __name__ == "__main__":
     app.run(main)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("kv_layout", [_HAS, _SAL], ids=["has", "sal"])
 @pytest.mark.parametrize(
     "bq_sz, bkv_p",
