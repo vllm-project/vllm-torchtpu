@@ -292,6 +292,36 @@ class TopKEntry(TypedDict):
     point: Mapping[str, object]
 
 
+class BoundFamilyEntry(TypedDict):
+    """Bound-ordered structural layout family summary at one concurrency."""
+
+    rank: int
+    family: tuple[str, ...]
+    min_bound_tpot_ms: float | None
+    min_bound_ttft_ms: float | None
+    binding: str
+    any_not_ruled_out: bool
+    member_count: int
+    members: list[dict[str, object]]
+    min_envelope_tpot_ms: NotRequired[float | None]
+    min_envelope_ttft_ms: NotRequired[float | None]
+
+
+class ReferenceLayoutReport(TypedDict):
+    """Ranking and diagnostic report for a requested reference layout."""
+
+    layout: str
+    found: bool
+    ruled_out: bool
+    concurrency: int | None
+    candidates: int
+    rank_by_tpot_bound: int | None
+    rank_by_estimated_throughput: int | None
+    in_top_k: bool
+    point: Mapping[str, object] | None
+    rejected_by: str
+
+
 class SolvePayload(TypedDict):
     """Versioned solve JSON payload with provenance and ordered per-pool lists."""
 
@@ -324,11 +354,11 @@ class SolvePayload(TypedDict):
     chip_budget: Mapping[str, object]
     dtypes: NotRequired[Mapping[str, object]]
     concurrency_top_k: NotRequired[dict[str, list[TopKEntry]]]
-    bound_families_by_concurrency: NotRequired[dict[str, list[dict[str, object]]]]
+    bound_families_by_concurrency: NotRequired[dict[str, list[BoundFamilyEntry]]]
     solver_assumptions: NotRequired[list[dict[str, object]]]
     winner_prefix_hit_range: NotRequired[tuple[float, float] | None]
     prefix_hit_crossover_rate: NotRequired[float | None]
-    reference: NotRequired[Mapping[str, object]]
+    reference: NotRequired[ReferenceLayoutReport | Mapping[str, object]]
     activation_regime: NotRequired[str]
     spec_tokens: NotRequired[int]
     mtp_layers: NotRequired[int]
@@ -502,3 +532,24 @@ def _point_struct_key(
 ) -> tuple[str, PoolStructKey | None, PoolStructKey | None]:
     """Build composite structural identity key across mixed or prefill/decode pools."""
     return (point.mode, _pool_key(point.prefill_pool), _pool_key(point.decode_pool))
+
+
+def candidate_sort_key(
+    point: ParetoPoint,
+    sort_by: SortBy,
+) -> tuple[bool, bool, float, float, int, str]:
+    """Build unified candidate sort key shared by solver, emit, and families."""
+    not_ruled_out = effective_slo_verdict(point) != SLO_VERDICT_RULED_OUT
+    primary, secondary = (
+        (point.est_interactivity_tok_s, point.token_throughput_per_chip)
+        if sort_by == "interactivity"
+        else (point.token_throughput_per_chip, point.est_interactivity_tok_s)
+    )
+    return (
+        not point.slo_met,
+        not not_ruled_out,
+        -primary,
+        -secondary,
+        point.total_chips,
+        str(_point_struct_key(point)),
+    )
