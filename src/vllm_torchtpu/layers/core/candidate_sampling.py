@@ -426,11 +426,8 @@ def verify_local(
     def gather(a):
         return lax.all_gather(a, axis, axis=1, tiled=True)
 
-    c_vals, c_ids = gather(vals), gather(ids)
-    c_bound, c_top, c_first = (
-        gather(boundary[:, None]),
-        gather(top[:, None]),
-        gather(first[:, None]),
+    c_vals, c_ids, c_bound, c_top, c_first = _gather_candidates(
+        vals, ids, boundary, top, first, axis
     )
     # First shard holding the row maximum: its first id is the global argmax.
     shard_ids = lax.broadcasted_iota(jnp.int32, c_top.shape, 1)
@@ -503,6 +500,41 @@ def verify_local(
 
     out_bonus, out_acc, out_rec = lax.cond(exact, candidates, full)
     return out_bonus, out_acc, out_rec, exact.astype(jnp.int32), ib, it
+
+
+def _bf16_bits(x: jax.Array) -> jax.Array:
+    return lax.bitcast_convert_type(x, jnp.int16).astype(jnp.int32)
+
+
+def _bits_bf16(x: jax.Array) -> jax.Array:
+    return lax.bitcast_convert_type(x.astype(jnp.int16), jnp.bfloat16)
+
+
+def _gather_candidates(vals, ids, boundary, top, first, axis):
+    """Every rank's candidates (vals / ids [R, kc] -> [R, kc x tp], shard-
+    major) and per-row scalars (boundary / top / first [R] -> [R, tp]),
+    exchanged as their int32 bits in one all-gather. The payloads are a few
+    KiB, so each collective costs its latency: one gather instead of five."""
+    kc = vals.shape[1]
+    packed = jnp.concatenate(
+        [
+            _bf16_bits(vals),
+            ids,
+            _bf16_bits(boundary)[:, None],
+            _bf16_bits(top)[:, None],
+            first[:, None],
+        ],
+        axis=1,
+    )
+    g = lax.all_gather(packed, axis, axis=1)  # [R, tp, 2 kc + 3]
+    rows = g.shape[0]
+    return (
+        _bits_bf16(g[:, :, :kc]).reshape(rows, -1),
+        g[:, :, kc : 2 * kc].reshape(rows, -1),
+        _bits_bf16(g[:, :, 2 * kc]),
+        _bits_bf16(g[:, :, 2 * kc + 1]),
+        g[:, :, 2 * kc + 2],
+    )
 
 
 def full_vocab_uniforms(seed, num_bonus, num_targets, vocab_size, bonus_dtype):
