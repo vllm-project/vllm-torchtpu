@@ -42,6 +42,7 @@ from vllm.config import VllmConfig
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -166,12 +167,49 @@ class DSparkProposer(DFlashProposer):
         confidences, self._draft_confidences = self._draft_confidences, None
         return confidences
 
+    def _maybe_eager_embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Materialize draft embeddings outside ``@torch.compile`` on DP > 1.
+
+        Under ``data_parallel_size > 1`` on TPU with ``libtpu < 0.0.52``
+        (currently pinned to ``libtpu==0.0.50``), XLA post-fusion tiling on a
+        ``VocabParallelEmbedding`` custom gather feeding mixed ``T(16, 128)``
+        and ``T(8, 128)`` consumers silently scrambles BF16 sublane rows across
+        token pairs. Removable once ``libtpu >= 0.0.52``.
+        """
+        if (
+            self.draft_model is None
+            or input_ids.device.type != "tpu"
+            or self.vllm_config.parallel_config.data_parallel_size <= 1
+        ):
+            return None
+        inputs_embeds = self.draft_model.model.embed_input_ids(input_ids)
+        synchronize_tensors((inputs_embeds,), wait=False)
+        return inputs_embeds
+
+    def _forward_and_sample_draft_block(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run DSpark draft forward and sampling with eager DP embedding."""
+        inputs_embeds = self._maybe_eager_embed_input_ids(input_ids)
+        if inputs_embeds is None:
+            return self._dflash_forward_and_sample(input_ids, positions, block_size)
+        return self._dflash_forward_and_sample(
+            input_ids, positions, block_size, inputs_embeds
+        )
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         block_size: int,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Backbone forward + sequential greedy Markov sampling, in-graph.
 
@@ -188,10 +226,17 @@ class DSparkProposer(DFlashProposer):
         token, never the token it drafts.
         """
         assert self.draft_model is not None
-        hidden = self.draft_model.model(
-            input_ids=input_ids,
-            positions=positions,
-        )
+        if inputs_embeds is None:
+            hidden = self.draft_model.model(
+                input_ids=input_ids,
+                positions=positions,
+            )
+        else:
+            hidden = self.draft_model.model(
+                input_ids,
+                positions,
+                inputs_embeds,
+            )
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]

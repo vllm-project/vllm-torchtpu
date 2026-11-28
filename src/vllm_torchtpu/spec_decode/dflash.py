@@ -685,7 +685,7 @@ class DFlashProposer:
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
             ):
-                draft_tokens_chunk, draft_aux = self._dflash_forward_and_sample(
+                draft_tokens_chunk, draft_aux = self._forward_and_sample_draft_block(
                     input_ids, positions, block_size
                 )
 
@@ -907,10 +907,19 @@ class DFlashProposer:
                 mesh=self.runner.mesh, vllm_config=self.vllm_config
             ),
         ):
-            draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+            draft_tokens_chunk, _ = self._forward_and_sample_draft_block(
                 input_ids, positions, block_size
             )
             synchronize_tensors(draft_tokens_chunk, wait=sync)
+
+    def _forward_and_sample_draft_block(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dispatch one draft block forward and sampling step."""
+        return self._dflash_forward_and_sample(input_ids, positions, block_size)
 
     def profile_draft_ms(self, num_tokens: int) -> float:
         """Wall time in ms of one draft forward at this draft-forward bucket,
