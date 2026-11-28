@@ -35,6 +35,7 @@ from vllm.model_executor.layers.attention import (
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.deepseek_v4.attention import (
     DeepseekV4Attention,
@@ -64,6 +65,7 @@ from vllm.v1.worker.utils import (
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import (
+    BlockMajorPoolBindable,
     BlockMajorPoolLayout,
     unified_block_major_enabled,
 )
@@ -1553,14 +1555,15 @@ class KVCacheManager:
     def _bind_block_major_pool_layers(self, layout: BlockMajorPoolLayout) -> None:
         """Binds each unified-pool layer to its region index within the merged pool.
 
-        Full-attention and GDN layers remap their block IDs before invoking the
-        underlying kernels; any other layer type lacks region-offset remapping
-        and is rejected to prevent cross-region aliasing.
+        Full-attention layers (through their Pallas impl) and GDN layers
+        (`GatedDeltaNetAttention`) that subclass `BlockMajorPoolBindable` (the
+        shared GDN op, and copies of the GDN op that live in a model
+        directory) remap their block IDs before
+        invoking the underlying kernels; any other layer type lacks
+        region-offset remapping and is rejected to prevent cross-region
+        aliasing.
         """
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
-        from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
-            VllmGatedDeltaNetAttention,
-        )
 
         pool_index = dict(layout.pool_index_by_layer)
         for name, target in self.runner.shared_kv_cache_layers.items():
@@ -1570,7 +1573,17 @@ class KVCacheManager:
         )
         for name, index in pool_index.items():
             layer = layers[name]
-            if isinstance(layer, VllmGatedDeltaNetAttention):
+            # A GDN layer that remaps its own block IDs (the shared GDN op, or
+            # a model directory's copy of it) opts in by subclassing
+            # BlockMajorPoolBindable and binds itself. It must still be a
+            # GatedDeltaNetAttention, so the non-unified and export paths that
+            # key on the GDN type keep working.
+            if isinstance(layer, BlockMajorPoolBindable):
+                if not isinstance(layer, GatedDeltaNetAttention):
+                    raise TypeError(
+                        f"{type(layer).__name__} ({name}) subclasses "
+                        "BlockMajorPoolBindable but is not a GatedDeltaNetAttention"
+                    )
                 layer.set_block_major_pool(index, layout)
             elif isinstance(layer.impl, PallasAttentionBackendImpl):
                 layer.impl.set_block_major_pool(index, layout)

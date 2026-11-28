@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -808,4 +809,64 @@ def test_bind_block_major_pool_layers_rejects_other_layer_types(monkeypatch):
         MAMBA[1]: MagicMock(spec=VllmGatedDeltaNetAttention),
     }
     with pytest.raises(NotImplementedError, match=ATTN[2].replace(".", r"\.")):
+        _bind_layers(monkeypatch, layers)
+
+
+def test_bind_block_major_pool_layers_binds_any_bindable_layer(monkeypatch):
+    """A model directory's own GDN copy is not a VllmGatedDeltaNetAttention;
+    subclassing BlockMajorPoolBindable is enough."""
+    from vllm_torchtpu.block_major_pool import BlockMajorPoolBindable
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+    class ModelOwnedGdn(GatedDeltaNetAttention, BlockMajorPoolBindable):
+        def __init__(self):
+            self.bound = None
+
+        def set_block_major_pool(self, index, layout):
+            self.bound = (index, layout)
+
+    ModelOwnedGdn.__abstractmethods__ = frozenset()  # a stand-in: no state built
+    gdn = ModelOwnedGdn()
+    layers = {
+        ATTN[2]: SimpleNamespace(impl=MagicMock(spec=PallasAttentionBackendImpl)),
+        MAMBA[1]: gdn,
+    }
+    layout = _bind_layers(monkeypatch, layers)
+    assert gdn.bound == (1, layout)
+
+
+def test_bind_block_major_pool_layers_rejects_unbindable_set_block_major_pool(
+    monkeypatch,
+):
+    """A method named set_block_major_pool alone does not opt a layer in."""
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+    class NotBindable:
+        impl = None
+
+        def set_block_major_pool(self, index, layout):
+            raise AssertionError("must not be called")
+
+    layers = {
+        ATTN[2]: SimpleNamespace(impl=MagicMock(spec=PallasAttentionBackendImpl)),
+        MAMBA[1]: NotBindable(),
+    }
+    with pytest.raises(NotImplementedError, match=MAMBA[1].replace(".", r"\.")):
+        _bind_layers(monkeypatch, layers)
+
+
+def test_bind_block_major_pool_layers_rejects_a_bindable_non_gdn_layer(monkeypatch):
+    """A bindable layer must still be a GatedDeltaNetAttention."""
+    from vllm_torchtpu.block_major_pool import BlockMajorPoolBindable
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+    class NotGdn(BlockMajorPoolBindable):
+        def set_block_major_pool(self, index, layout):
+            raise AssertionError("must not be called")
+
+    layers = {
+        ATTN[2]: SimpleNamespace(impl=MagicMock(spec=PallasAttentionBackendImpl)),
+        MAMBA[1]: NotGdn(),
+    }
+    with pytest.raises(TypeError, match="not a GatedDeltaNetAttention"):
         _bind_layers(monkeypatch, layers)

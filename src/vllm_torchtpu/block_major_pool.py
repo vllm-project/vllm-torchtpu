@@ -79,6 +79,24 @@ class BlockMajorPoolLayout:
         return self.num_pools * self.split
 
 
+class BlockMajorPoolBindable:
+    """Base class for layers that remap their own block IDs into the merged pool.
+
+    `KVCacheManager` binds a unified-pool layer that subclasses this by calling
+    `set_block_major_pool(pool_index, layout)`; the shared GDN op and a model
+    directory's own copy of it subclass it to opt in explicitly. The layer
+    must also be a vLLM `GatedDeltaNetAttention`; the binder checks both.
+    """
+
+    def set_block_major_pool(
+        self, pool_index: int, layout: BlockMajorPoolLayout
+    ) -> None:
+        """Binds this layer to its region index within the merged block-major pool."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement set_block_major_pool"
+        )
+
+
 def kernel_view(pool):
     """Folds the merged pool's leading `(num_blocks, rows_per_block)` axes into dim 0.
 
