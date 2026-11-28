@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU unit tests for the Qwen3-Omni Thinker audio encoder patch."""
+"""CPU unit tests for Qwen3-Omni Thinker audio and vision encoder patches."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from itertools import pairwise
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -25,25 +25,32 @@ import pytest
 import torch
 import torch.nn as nn
 from transformers import Qwen3OmniMoeAudioEncoderConfig
-from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.attention import mm_encoder_attention
-from vllm.v1.attention.ops.vit_attn_wrappers import torch_sdpa_wrapper
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeVisionEncoderConfig,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+    Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeAudioEncoder,
     _get_feat_extract_output_lengths,
 )
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 
-from tests_omni.omni_test_utils import restore_class_attrs
+from tests_omni.omni_test_utils import (
+    init_test_weights,
+    isolate_thinker_patch_targets,
+    native_ops_on_cpu,
+)
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_BUCKETS,
     _CU_SEQLENS_BLOCK_SIZE,
     _QWEN3_OMNI_ARCHS,
+    _VISION_PATCH_BUCKETS,
     _build_bucket_inputs,
     _get_compiled_bucket_fn,
     _pad_cu_seqlens,
     _padded_audio_forward,
     _run_static_bucket_pass,
+    _select_bucket,
     maybe_patch_qwen3_omni_thinker,
 )
 
@@ -51,7 +58,6 @@ pytestmark = pytest.mark.omni
 
 THINKER_ARCHS = ["Qwen3OmniMoeForConditionalGeneration"]
 STANDALONE_THINKER_ARCHS = ["Qwen3OmniMoeThinkerForConditionalGeneration"]
-_PATCHED_ATTRS = ("forward", "_tpu_enforce_eager")
 
 TINY_AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
     num_mel_bins=128,
@@ -65,11 +71,27 @@ TINY_AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
     n_window_infer=400,
 )
 
+TINY_VISION_CONFIG = Qwen3OmniMoeVisionEncoderConfig(
+    depth=2,
+    hidden_size=64,
+    intermediate_size=128,
+    num_heads=4,
+    in_channels=3,
+    image_size=256,
+    patch_size=16,
+    spatial_merge_size=2,
+    temporal_patch_size=2,
+    out_hidden_size=64,
+    num_position_embeddings=256,
+    apply_vit_abs_pos_embed=True,
+    deepstack_visual_indexes=[0, 1],
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_thinker_patch_targets() -> Iterator[None]:
-    """Snapshot and restore Qwen3OmniMoeAudioEncoder attributes across each test."""
-    with restore_class_attrs(Qwen3OmniMoeAudioEncoder, _PATCHED_ATTRS):
+    """Snapshot and restore Thinker patch targets across each test."""
+    with isolate_thinker_patch_targets():
         yield
 
 
@@ -84,12 +106,7 @@ def tiny_audio_encoder(omni_ctx: None) -> Iterator[Qwen3OmniMoeAudioEncoder]:
     """Build a tiny real Qwen3OmniMoeAudioEncoder running native ops on CPU."""
     torch.manual_seed(0)
     enc = Qwen3OmniMoeAudioEncoder(TINY_AUDIO_CONFIG).eval()
-    for module in enc.modules():
-        if isinstance(module, CustomOp):
-            module._forward_method = module.forward_native
-    with patch.object(
-        mm_encoder_attention, "vit_torch_sdpa_wrapper", torch_sdpa_wrapper
-    ):
+    with native_ops_on_cpu(enc):
         yield enc
 
 
@@ -417,3 +434,66 @@ def test_enforce_eager_controls_tpu_bucket_compilation(
     assert out.shape == (33, TINY_AUDIO_CONFIG.output_dim)
     assert compiled_buckets == ([] if enforce_eager else [8])
     assert sync_waits == [False]
+
+
+def test_select_bucket_falls_back_to_aligned_size() -> None:
+    assert _select_bucket(2048, _VISION_PATCH_BUCKETS, align=512) == 2048
+    assert _select_bucket(2049, _VISION_PATCH_BUCKETS, align=512) == 4096
+    assert _select_bucket(16384, _VISION_PATCH_BUCKETS, align=512) == 16384
+    assert _select_bucket(16385, _VISION_PATCH_BUCKETS, align=512) == 16896
+
+
+@pytest.mark.parametrize(
+    ("grid", "expected_chunks"),
+    [
+        ([[1, 20, 30]], [2048]),  # one small image: 600 patches
+        ([[1, 50, 60]], [4096]),  # one medium image: 3000 patches
+        ([[8, 20, 30]], [8192]),  # one video: 4800 patches
+        ([[5, 64, 64]], [16384, 4096]),  # 20480 patches split into 4 + 1 frames
+        ([[1, 20, 30]] * 30, [16384, 2048]),  # 30 images packed as 27 + 3
+        # A split video's last frame shares a pass with the next image.
+        ([[5, 64, 64], [1, 20, 30]], [16384, 8192]),
+        ([[130, 8, 8]], [8192, 2048]),  # 126 + 4 frames: cu_seqlens budget split
+    ],
+)
+@torch.no_grad()
+def test_qwen3_omni_vit_frame_chunking_and_parity(
+    omni_ctx: None,
+    grid: list[list[int]],
+    expected_chunks: list[int],
+) -> None:
+    """Verify ViT bucketing, greedy item packing, frame chunking, and parity."""
+    assert maybe_patch_qwen3_omni_thinker(THINKER_ARCHS) is True
+
+    torch.manual_seed(0)
+    cfg = TINY_VISION_CONFIG
+    vit_patched = Qwen3Omni_VisionTransformer(cfg, norm_eps=1e-6).eval()
+    init_test_weights(vit_patched, seed=0)
+    vit_ref = Qwen3Omni_VisionTransformer(cfg, norm_eps=1e-6).eval()
+    vit_ref.load_state_dict(vit_patched.state_dict())
+    vit_ref.forward = MethodType(Qwen3Omni_VisionTransformer._tpu_orig_forward, vit_ref)
+
+    seen_shapes: list[int] = []
+    vit_patched.blocks[0].register_forward_hook(
+        lambda _mod, args, _out: seen_shapes.append(int(args[0].shape[0]))
+    )
+    total_patches = sum(t * h * w for t, h, w in grid)
+    patch_dim = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
+    generator = torch.Generator().manual_seed(total_patches)
+    x = torch.randn(total_patches, patch_dim, generator=generator)
+    grid_tensor = torch.tensor(grid, dtype=torch.int32)
+
+    with (
+        native_ops_on_cpu(vit_patched, vit_ref),
+        patch.object(
+            nn.Module,
+            "cpu",
+            side_effect=AssertionError("Unexpected Module.cpu() host mutation"),
+        ),
+    ):
+        out_patched = vit_patched(x, grid_tensor)
+        out_ref = vit_ref(x, grid_tensor)
+
+    assert seen_shapes == expected_chunks
+    assert out_patched.shape == out_ref.shape
+    assert torch.allclose(out_patched, out_ref, atol=1e-5, rtol=1e-5)
