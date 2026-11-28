@@ -30,6 +30,8 @@ from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.core.profiles import default as default_profile
 from vllm_torchtpu.megakernel.core.profiles.default import (
     DEFAULT_CHIP,
+    TPU_8I,
+    TPU_8T,
     TPU_V7X,
     ChipBudget,
     chip_budget,
@@ -200,6 +202,23 @@ def test_chip_budget_follows_device_kind_and_rejects_unsupported_tpu(monkeypatch
     assert chip_budget() is small
     # The tile rule itself never queries devices (profiles run it at import).
     assert default_tiles(8) == default_tiles(8, chip=DEFAULT_CHIP)
+
+
+@pytest.mark.parametrize(
+    ("device_kind", "budget", "vmem_mib", "smem_mib"),
+    [
+        ("TPU7x", TPU_V7X, 62, 1),  # 64 MiB VMEM per core.
+        ("TPU8i", TPU_8I, 190, 1),  # 192 MiB VMEM per core.
+        ("TPU8t", TPU_8T, 126, 1),  # 128 MiB VMEM per core.
+    ],
+)
+def test_chip_budget_is_the_chip_capacity_less_the_compiler_reserve(
+    device_kind, budget, vmem_mib, smem_mib
+):
+    """Budgets come from the chip's `TpuInfo`, 2 MiB of VMEM kept free."""
+    assert chip_budget(device_kind) is budget
+    assert (budget.vmem_mib, budget.smem_mib) == (vmem_mib, smem_mib)
+    assert default_tiles(8, chip=budget).vmem_mib == vmem_mib
 
 
 def test_resolved_tiles_agree_with_resolve_tiles_for_tp_geometry():
