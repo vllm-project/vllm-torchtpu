@@ -250,6 +250,68 @@ steps:
         commands:
           - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-pro-dp16-ep --run-lm-eval
 
+      # GLM-5.2-FP8 AgentX on one v7x-16 slice (2x2x2), aggregated: the
+      # InferenceX submission configuration (TP16 x DCP8, MTP 3; see
+      # configs/glm-5.2-fp8-tp16-dcp8-mtp3-agentx.sh). Two steps, two slices,
+      # because perf and accuracy need different servers: the replay uses
+      # InferenceX's synthetic MTP acceptance and GSM8K has to verify drafts for
+      # real. agentx_sweep.sh boots the server on the Ray head and runs the
+      # AgentX client there; its gates turn a bad result red, not just a crash:
+      #   perf   1 h replay at concurrency 16 with InferenceX's full warmup
+      #          (--fast 0: fast mode cuts the window to 20 min and the warmup
+      #          to one request per lane, whatever --duration says); red if the
+      #          point has no successful requests (the client alone exits 0 then)
+      #   gsm8k  the full 1319-question split with InferenceX's 16384-token
+      #          answer budget (GLM-5.2 reasons at length); red below 0.90 on
+      #          strict-match or flexible-extract, InferenceX's floor for this
+      #          submission
+      # Results stay in the step's artifacts (summary.md, the per-point aggregate
+      # JSON); nothing uploads AgentX numbers to BigQuery yet.
+      - label: "Perf: Nightly GLM-5.2 AgentX c16 (TPU v7x-16)"
+        depends_on:
+          - "build_docker"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
+        plugins:
+          - *kube_plugin
+        commands:
+          - |
+            .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 \
+              bash scripts/vllm/benchmark/inferencex/agentx_sweep.sh \
+                --config glm-5.2-fp8-tp16-dcp8-mtp3-agentx --chips 8 \
+                --duration 3600 --fast 0 --gsm8k-limit 0 --min-requests-ok 1 \
+                --results-dir perf_eval_results/glm52-agentx-c16
+
+      - label: "Eval: Nightly GLM-5.2 AgentX GSM8K (TPU v7x-16)"
+        depends_on:
+          - "build_docker"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
+        plugins:
+          - *kube_plugin
+        commands:
+          - |
+            .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 \
+              bash scripts/vllm/benchmark/inferencex/agentx_sweep.sh \
+                --config glm-5.2-fp8-tp16-dcp8-mtp3-agentx-eval --chips 8 \
+                --gsm8k-limit 1319 --gsm8k-conc 16 --gsm8k-max-tokens 16384 \
+                --gsm8k-min-score 0.90 \
+                --results-dir perf_eval_results/glm52-agentx-gsm8k
+
       # Qwen3.5-397B as one prefill and one decode engine with KV transfer between
       # them. Its pods load their results into BigQuery (BQ_UPLOAD), in the same
       # table and through the same parse_gke_results.py as before, tagged

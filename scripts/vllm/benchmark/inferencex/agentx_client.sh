@@ -25,7 +25,7 @@
 #       [--engine-url URL] [--runner-type tpu7x-32] [--results-dir DIR]
 #       [--duration 1800] [--fast 1|0] [--ix-ref SHA] [--tokenizer-dir DIR]
 #       [--model NAME] [--max-model-len N] [--gsm8k-limit 100]
-#       [--gsm8k-conc 8[,16,...]]
+#       [--gsm8k-conc 8[,16,...]] [--gsm8k-max-tokens 4096]
 #       [--gcs-root gs://...] [--port 8000]
 #
 # It starts no server, and it is not told how one is deployed. agentx_sweep.sh
@@ -64,6 +64,10 @@ FAST=1
 IX_REF=""              # empty = IX_DEFAULT_REF, the pin in sweep_lib.sh
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"         # comma list allowed: one GSM8K run per value
+# Generation budget per GSM8K answer, reasoning included. 4096 holds a short
+# chain of thought; a model that thinks at length needs more or its answers are
+# cut off and scored wrong (InferenceX's own GSM8K run gives 16384).
+GSM8K_MAX_TOKENS=4096
 TOK_DIR_ARG=""         # a local tokenizer directory, when the caller pulled the weights
 MODEL_ARG=""           # served model name; read from the server when empty
 MAX_MODEL_LEN_ARG=""   # context window; read from the server when empty
@@ -103,6 +107,7 @@ while [[ $# -gt 0 ]]; do
         --ix-ref)        IX_REF="$2"; shift 2 ;;
         --gsm8k-limit)   GSM8K_LIMIT="$2"; shift 2 ;;
         --gsm8k-conc)    GSM8K_CONC="$2"; shift 2 ;;
+        --gsm8k-max-tokens) GSM8K_MAX_TOKENS="$2"; shift 2 ;;
         --tokenizer-dir) TOK_DIR_ARG="$2"; shift 2 ;;
         --model)         MODEL_ARG="$2"; shift 2 ;;
         --max-model-len) MAX_MODEL_LEN_ARG="$2"; shift 2 ;;
@@ -317,7 +322,7 @@ for gc in "${GSM8K_CONCS[@]}"; do
     lm_eval --tasks "$IX_EVALS/gsm8k.yaml" --limit "$GSM8K_LIMIT" --seed "0,1234,None,1234" \
         --model local-chat-completions --apply_chat_template --log_samples \
         --model_args "model=$MODEL,base_url=$(ix_server_url)/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=$gc,timeout=1800,tokenized_requests=False,max_length=$MAX_MODEL_LEN" \
-        --gen_kwargs "max_tokens=4096,temperature=0,top_p=1" \
+        --gen_kwargs "max_tokens=$GSM8K_MAX_TOKENS,temperature=0,top_p=1" \
         --output_path "$EVAL_DIR" > "$EVAL_DIR/lm_eval.log" 2>&1
     rc=$?
     tail -25 "$EVAL_DIR/lm_eval.log" | cut -c1-300

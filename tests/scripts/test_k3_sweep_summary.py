@@ -173,6 +173,63 @@ def test_gsm8k_row(tmp_path):
     )
 
 
+def _write_gsm8k(root, strict, flexible, effective=1319):
+    d = root / "m"
+    d.mkdir(parents=True, exist_ok=True)
+    gsm8k = {}
+    if strict is not None:
+        gsm8k["exact_match,strict-match"] = strict
+    if flexible is not None:
+        gsm8k["exact_match,flexible-extract"] = flexible
+    (d / "results_a.json").write_text(
+        json.dumps(
+            {
+                "results": {"gsm8k": gsm8k},
+                "n-samples": {"gsm8k": {"original": 1319, "effective": effective}},
+            }
+        )
+    )
+
+
+def test_gsm8k_gate_passes_when_both_filters_clear_the_floor(tmp_path):
+    _write_gsm8k(tmp_path, 0.9674, 0.9674)
+    passed, line = summary.gsm8k_gate(str(tmp_path), 0.90, 1319)
+    assert passed
+    assert line.endswith("PASS") and "strict-match=0.9674" in line and "n=1319" in line
+
+
+@pytest.mark.parametrize(
+    "strict, flexible, effective, why",
+    [
+        (0.85, 0.97, 1319, "strict-match 0.8500 < 0.9"),
+        (0.97, 0.85, 1319, "flexible-extract 0.8500 < 0.9"),
+        (None, 0.97, 1319, "exact_match,strict-match missing"),
+        (0.97, 0.97, 100, "scored 100 questions < 1319"),
+    ],
+)
+def test_gsm8k_gate_fails(tmp_path, strict, flexible, effective, why):
+    _write_gsm8k(tmp_path, strict, flexible, effective)
+    passed, line = summary.gsm8k_gate(str(tmp_path), 0.90, 1319)
+    assert not passed
+    assert why in line
+
+
+def test_gsm8k_gate_fails_without_results(tmp_path):
+    passed, line = summary.gsm8k_gate(str(tmp_path / "missing"), 0.90)
+    assert not passed and "no results_*.json" in line
+
+
+def test_gsm8k_gate_cli_exit_status(tmp_path, capsys):
+    _write_gsm8k(tmp_path, 0.97, 0.97)
+    args = ["gsm8k-gate", "--output-dir", str(tmp_path), "--min-samples", "1319"]
+    assert summary.main(args + ["--min-score", "0.90"]) == 0
+    assert summary.main(args + ["--min-score", "0.98"]) == 1
+    out = capsys.readouterr().out.splitlines()
+    assert (
+        out[0].endswith("PASS") and out[1].startswith("GATE gsm8k") and "FAIL" in out[1]
+    )
+
+
 def _aggregate(per_gpu_out, requests_ok, chips=32, hw="tpu7x-32"):
     # Shape of InferenceX's aggregate JSON (process_agentic_result.py). Its own
     # per_gpu is whatever the parallelism it was told implies; the table does not
@@ -274,3 +331,29 @@ def test_dotted_get_ignores_bools_and_missing():
     assert summary.dotted_get({"a": {"b": True}}, "a.b") is None
     assert summary.dotted_get({"a": 1}, "a.b") is None
     assert summary.dotted_get({}, "a") is None
+
+
+def test_agentx_gate(tmp_path):
+    base = "agentx_glm"
+    (tmp_path / f"{base}_c16.json").write_text(json.dumps(_aggregate(1.0, 393)))
+    (tmp_path / f"{base}_c32.json").write_text(json.dumps(_aggregate(1.0, 0)))
+    passed, lines = summary.agentx_gate(str(tmp_path), base, [16], 1)
+    assert passed and lines == ["GATE agentx c16: PASS requests ok 393"]
+    passed, lines = summary.agentx_gate(str(tmp_path), base, [16, 32, 64], 1)
+    assert not passed
+    assert lines[1] == "GATE agentx c32: FAIL requests ok 0 < 1"
+    assert lines[2].startswith("GATE agentx c64: FAIL no aggregate")
+    assert (
+        summary.main(
+            [
+                "agentx-gate",
+                "--results-dir",
+                str(tmp_path),
+                "--base",
+                base,
+                "--concs",
+                "16",
+            ]
+        )
+        == 0
+    )

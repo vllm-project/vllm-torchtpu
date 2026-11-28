@@ -26,6 +26,12 @@ AgentX replay) and eval_conc_sweep.sh (the lm_eval ladder) can be unit tested
          concurrency so that N requests are really in flight.
   gsm8k-row      --output-dir DIR --conc N
       -> "| N | <strict-match> | <flexible-extract> |"
+  gsm8k-gate     --output-dir DIR --min-score X [--min-samples N]
+      -> one "GATE gsm8k ... PASS|FAIL ..." line; exit 1 unless strict-match
+         and flexible-extract are both >= X over >= N questions.
+  agentx-gate    --results-dir DIR --base NAME --concs N... --min-requests-ok K
+      -> one "GATE agentx ..." line per point; exit 1 unless every point
+         wrote an aggregate with >= K successful requests.
   agentx-table   --results-dir DIR --base NAME --concs N... --chips N
       -> markdown table over DIR/NAME_c<N>.json, the aggregate JSON that
          InferenceX's process_agentic_result.py writes per point. A point whose
@@ -155,6 +161,77 @@ def gsm8k_row(output_dir: str, conc: int) -> str:
     )
 
 
+GSM8K_GATE_KEYS = ("exact_match,strict-match", "exact_match,flexible-extract")
+
+
+def gsm8k_gate(
+    output_dir: str, min_score: float, min_samples: int = 0
+) -> tuple[bool, str]:
+    """(passed, one-line verdict) for the newest GSM8K results file under DIR.
+
+    Both exact-match filters must clear the floor, as InferenceX's AgentX
+    submission gate requires, and the run must have scored at least
+    min_samples questions: a probe cut short is not the gate's eval.
+    """
+    path = newest_results_file(output_dir)
+    if path is None:
+        return False, f"GATE gsm8k {output_dir}: FAIL no results_*.json"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        results = data["results"]
+    except (OSError, KeyError, json.JSONDecodeError) as e:
+        return False, f"GATE gsm8k {path}: FAIL unreadable ({type(e).__name__})"
+    task = "gsm8k" if "gsm8k" in results else next(iter(results), None)
+    r = results.get(task, {}) if task else {}
+    failures = []
+    scores = []
+    for key in GSM8K_GATE_KEYS:
+        v = r.get(key)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            failures.append(f"{key} missing")
+            scores.append(f"{key.split(',')[1]}=-")
+            continue
+        scores.append(f"{key.split(',')[1]}={v:.4f}")
+        if v < min_score:
+            failures.append(f"{key.split(',')[1]} {v:.4f} < {min_score}")
+    n = dotted_get(data, f"n-samples.{task}.effective") if task else None
+    if min_samples > 0 and (n is None or n < min_samples):
+        failures.append(
+            f"scored {n if n is not None else '?'} questions < {min_samples}"
+        )
+    verdict = "FAIL " + "; ".join(failures) if failures else "PASS"
+    n_txt = "?" if n is None else f"{n:.0f}"
+    return not failures, (
+        f"GATE gsm8k {' '.join(scores)} n={n_txt} floor={min_score}: {verdict}"
+    )
+
+
+def agentx_gate(
+    results_dir: str, base: str, concs: list[int], min_requests_ok: int
+) -> tuple[bool, list[str]]:
+    """(passed, verdict lines): every point needs an aggregate with at least
+    min_requests_ok successful requests. The client exits 0 when every request
+    failed, so without this a dead server reads as a green run."""
+    ok = True
+    lines = []
+    for c in concs:
+        path = os.path.join(results_dir, f"{base}_c{c}.json")
+        try:
+            with open(path) as f:
+                n = dotted_get(json.load(f), "num_requests_successful")
+        except (OSError, json.JSONDecodeError) as e:
+            ok = False
+            lines.append(f"GATE agentx c{c}: FAIL no aggregate ({type(e).__name__})")
+            continue
+        if n is None or n < min_requests_ok:
+            ok = False
+            lines.append(f"GATE agentx c{c}: FAIL requests ok {n} < {min_requests_ok}")
+        else:
+            lines.append(f"GATE agentx c{c}: PASS requests ok {n:.0f}")
+    return ok, lines
+
+
 def accelerator_usd_per_hour(hw: Any) -> float | None:
     """The rate for an aggregate's "hw" label, or None when it is not known."""
     if not isinstance(hw, str):
@@ -224,6 +301,15 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("gsm8k-row")
     s.add_argument("--output-dir", required=True)
     s.add_argument("--conc", type=int, required=True)
+    s = sub.add_parser("gsm8k-gate")
+    s.add_argument("--output-dir", required=True)
+    s.add_argument("--min-score", type=float, required=True)
+    s.add_argument("--min-samples", type=int, default=0)
+    s = sub.add_parser("agentx-gate")
+    s.add_argument("--results-dir", required=True)
+    s.add_argument("--base", required=True)
+    s.add_argument("--concs", type=int, nargs="+", required=True)
+    s.add_argument("--min-requests-ok", type=int, default=1)
     s = sub.add_parser("agentx-table")
     s.add_argument("--results-dir", required=True)
     s.add_argument("--base", required=True)
@@ -254,6 +340,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{limit} {total}")
     elif a.cmd == "gsm8k-row":
         print(gsm8k_row(a.output_dir, a.conc))
+    elif a.cmd == "gsm8k-gate":
+        passed, line = gsm8k_gate(a.output_dir, a.min_score, a.min_samples)
+        print(line)
+        return 0 if passed else 1
+    elif a.cmd == "agentx-gate":
+        passed, lines = agentx_gate(a.results_dir, a.base, a.concs, a.min_requests_ok)
+        print("\n".join(lines))
+        return 0 if passed else 1
     elif a.cmd == "agentx-table":
         print(agentx_table(a.results_dir, a.base, a.concs, a.chips))
     return 0
