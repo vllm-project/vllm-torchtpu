@@ -27,6 +27,9 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     schedule_cp,
     utils,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def prepare_inputs(
@@ -864,6 +867,21 @@ def ragged_paged_attention(
             cu_q_lens=cu_q_lens,
             distribution=distribution,
         )
+        need = configs.worst_case_schedule_chunks(cfgs)
+        if need > configs.MAX_SCHEDULE_CHUNKS:
+            logger.warning_once(
+                "Batched RPA %s: a full batch at the longest context needs %d "
+                "schedule chunks of %d steps, but the HBM schedule holds %d. A "
+                "step whose schedule runs past it drops the steps beyond the "
+                "cap: the sequences they cover get no attention output, and "
+                "(unless skip_kv_update is set) the new tokens of those steps "
+                "are not written to the KV cache, so their later steps are "
+                "wrong too.",
+                mode,
+                need,
+                cfgs.max_steps_ub,
+                configs.MAX_SCHEDULE_CHUNKS,
+            )
         # Select metadata computer class.
         if cp_group_size is not None:
             computer_cls = schedule_cp.CPMetadataComputer
