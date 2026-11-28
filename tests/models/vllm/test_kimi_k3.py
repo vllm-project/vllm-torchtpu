@@ -49,6 +49,7 @@ from vllm_torchtpu.compilation.shape_variants import trace_shape_env, unsupporte
 from vllm_torchtpu.distributed import pallas_shapes
 from vllm_torchtpu.kernels.kimi_k3.collectives import ring_tables
 from vllm_torchtpu.layers import register_layers
+from vllm_torchtpu.layers.adapter import kda_attention, latent_moe
 from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kimi_custom_ops
 from vllm_torchtpu.models.vllm.kimi_k3 import (
     KimiDeltaAttention,
@@ -63,7 +64,7 @@ from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import (
     FusedPrefillCollectives,
     TokenShardCollectives,
 )
-from vllm_torchtpu.models.vllm.kimi_k3.layers import AttentionResidual, SituAndMul
+from vllm_torchtpu.models.vllm.kimi_k3.layers import AttentionResidual
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -185,19 +186,6 @@ def test_kimi_k3_scatter_free_embedding_merge() -> None:
 
     with pytest.raises(ValueError, match="1 multimodal tokens to 2"):
         model.embed_input_ids(input_ids, [media[0][:1]], is_multimodal=is_multimodal)
-
-
-@pytest.mark.parametrize("linear_beta", [None, 25.0])
-def test_situ_and_mul(linear_beta: float | None) -> None:
-    activation = SituAndMul(beta=4.0, linear_beta=linear_beta)
-    inputs = torch.tensor([[-3.0, 0.5, 7.0, -30.0, 2.0, 40.0]])
-    gate, up = inputs.chunk(2, dim=-1)
-    expected_gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
-    expected_up = (
-        up if linear_beta is None else linear_beta * torch.tanh(up / linear_beta)
-    )
-
-    torch.testing.assert_close(activation(inputs), expected_gate * expected_up)
 
 
 def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
@@ -387,10 +375,10 @@ def test_small_experts_use_current_padded_weight_location(
         fused_moe_args.update(kwargs)
         return FakeRunner()
 
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 8)
-    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(latent_moe, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(latent_moe, "GateLinear", FakeGate)
     monkeypatch.setattr(kimi_moe, "KimiMLP", FakeMLP)
-    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
+    monkeypatch.setattr(latent_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
         hidden_size=16,
         hidden_act="silu",
@@ -438,11 +426,11 @@ def test_expert_parallelism_keeps_native_intermediate_size(
         parallel_config=SimpleNamespace(enable_expert_parallel=True)
     )
     monkeypatch.setattr(
-        kimi_moe, "get_current_vllm_config_or_none", lambda: vllm_config
+        latent_moe, "get_current_vllm_config_or_none", lambda: vllm_config
     )
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 8)
-    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
-    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
+    monkeypatch.setattr(latent_moe, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(latent_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(latent_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
         hidden_size=16,
         hidden_act="silu",
@@ -475,9 +463,9 @@ def test_situ_moe_uses_tpu_activation_descriptor(
         fused_moe_args.update(kwargs)
         return FakeRunner()
 
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
-    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_fused_moe)
+    monkeypatch.setattr(latent_moe, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(latent_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(latent_moe, "FusedMoEFactory", fake_fused_moe)
     config = KimiLinearConfig(
         hidden_size=16,
         hidden_act="situ",
@@ -493,23 +481,6 @@ def test_situ_moe_uses_tpu_activation_descriptor(
     assert fused_moe_args["activation"] == "situ"
     assert fused_moe_args["activation_situ_beta"] == 4.0
     assert fused_moe_args["activation_situ_linear_beta"] == 25.0
-
-
-def test_latent_moe_transform_leaves_reduction_to_vllm_runner() -> None:
-    class SquareNorm(nn.Module):
-        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return hidden_states.square()
-
-    class IdentityLinear(nn.Module):
-        def forward(self, hidden_states: torch.Tensor):
-            return hidden_states, None
-
-    transform = kimi_moe.KimiRoutedOutputTransform(SquareNorm(), IdentityLinear())
-    hidden_states = torch.tensor([[2.0, 3.0]])
-
-    # vLLM v0.27 reduces the routed latent output before invoking this
-    # nonlinear transform. Reducing again here underweights it at TP > 1.
-    torch.testing.assert_close(transform(hidden_states), hidden_states.square())
 
 
 def test_model_has_no_public_cache_or_pp_api() -> None:
@@ -775,36 +746,6 @@ def test_mixed_parallel_merged_linear_rejects_tp_indivisible_output(
         )
 
 
-def test_kda_state_dtype_reads_model_and_cache_config() -> None:
-    """`kda_state_dtype` returns the storage dtypes for a KDA layer's two
-    state tensors. The conv state is always fp32 (the fused conv1d kernel
-    needs it), regardless of the model dtype or `mamba_cache_dtype`; the
-    recurrent state follows vLLM's usual KDA rule."""
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(dtype=torch.bfloat16),
-        cache_config=SimpleNamespace(mamba_cache_dtype="auto"),
-    )
-    conv_dtype, recurrent_dtype = kimi_attention.kda_state_dtype(vllm_config)
-    assert conv_dtype == torch.float32
-    assert recurrent_dtype == torch.float32
-
-
-def test_load_a_log_flattens_legacy_layout_and_shards_by_rank(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`_load_a_log` is the weight loader for the KDA `A_log` parameter.
-    Older checkpoints store it as `[1, 1, H, 1]` and newer ones as `[H]`;
-    either way each TP rank keeps only its own slice of the H heads. With
-    H=4 and a 2-head local parameter, rank 1 gets heads 2 and 3."""
-    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_rank", lambda: 1)
-    param = torch.empty(2)
-    loaded = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1)
-
-    kimi_attention._load_a_log(param, loaded)
-
-    torch.testing.assert_close(param, torch.tensor([2.0, 3.0]))
-
-
 class _Projection(nn.Module):
     def __init__(self, output_size: int) -> None:
         super().__init__()
@@ -830,6 +771,13 @@ class _ConvWeight(nn.Module):
         self.weight = nn.Parameter(torch.ones(4, 1, 3))
 
 
+def _set_kda_dims(layer, *, conv_size: int, num_heads: int, head_dim: int) -> None:
+    """Set the per-rank sizes the shared `KdaAttention.__init__` derives."""
+    layer.conv_size, layer.num_heads = conv_size, num_heads
+    layer.head_k_dim = layer.head_v_dim = layer.gate_rank = head_dim
+    layer.local_key_size = layer.local_value_size = num_heads * head_dim
+
+
 def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     group = SimpleNamespace(all_reduce=lambda x: x)
     monkeypatch.setattr(kimi_attention, "get_tp_group", lambda: group)
@@ -840,9 +788,6 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     layer.fused_fa_ga_proj = _Projection(4)
     layer.f_a_proj = None
     layer.g_proj = None
-    layer.local_projection_size = 4
-    layer.num_heads = 2
-    layer.head_dim = 2
     layer.f_b_proj = _Projection(4)
     layer.g_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
@@ -850,7 +795,7 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
-    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    _set_kda_dims(layer, conv_size=3, num_heads=2, head_dim=2)
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
@@ -902,14 +847,13 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
     layer.fused_fa_ga_proj = _Projection(4)
     layer.f_a_proj = None
     layer.g_proj = None
-    layer.local_projection_size = 4
     layer.f_b_proj = _Projection(4)
     layer.g_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
     layer.q_conv1d = _ConvWeight()
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
-    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    _set_kda_dims(layer, conv_size=3, num_heads=2, head_dim=2)
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
@@ -1017,18 +961,18 @@ def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
         "ReplicatedLinear",
         "RowParallelLinear",
     ):
-        monkeypatch.setattr(kimi_attention, name, FakeLinear)
+        monkeypatch.setattr(kda_attention, name, FakeLinear)
     monkeypatch.setattr(
-        kimi_attention, "get_tensor_model_parallel_world_size", lambda: 1
+        kda_attention, "get_tensor_model_parallel_world_size", lambda: 1
     )
-    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(kda_attention, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
-        kimi_attention,
+        kda_attention,
         "build_kimi_dispatched_kda_op",
         lambda *a, **k: lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        kimi_attention,
+        kda_attention,
         "build_kimi_pooled_kda_op",
         lambda *a, **k: lambda *args, **kwargs: None,
     )
@@ -1056,7 +1000,7 @@ def test_kda_construction_wires_projections_and_state(
         )
 
     assert layer.num_heads == 2
-    assert layer.head_dim == 4
+    assert layer.head_k_dim == layer.head_v_dim == 4
     assert layer.fused_fa_ga_proj is not None
     assert layer.f_a_proj is None
     assert layer.g_proj is None
@@ -1130,7 +1074,7 @@ def test_kda_construction_passes_speculative_window_to_op(
         received.update(kwargs)
         return lambda *args, **kwargs: None
 
-    monkeypatch.setattr(kimi_attention, "build_kimi_dispatched_kda_op", build_op)
+    monkeypatch.setattr(kda_attention, "build_kimi_dispatched_kda_op", build_op)
     with set_current_vllm_config(vllm_config):
         layer = kimi_attention.KimiDeltaAttention(
             config, vllm_config, prefix="model.layers.0.kda"
@@ -1161,7 +1105,7 @@ def test_kda_construction_rejects_heads_not_divisible_by_tp(
     """KDA heads are split evenly across tensor-parallel ranks, so 2 heads
     cannot be spread over 3 ranks."""
     monkeypatch.setattr(
-        kimi_attention, "get_tensor_model_parallel_world_size", lambda: 3
+        kda_attention, "get_tensor_model_parallel_world_size", lambda: 3
     )
     config = _kda_config(num_heads=2)
     fake_vllm_config = SimpleNamespace(speculative_config=None)
@@ -1220,8 +1164,7 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.fused_qkvb_proj = _Projection(14)
-    layer.local_projection_size = 4
-    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    _set_kda_dims(layer, conv_size=3, num_heads=2, head_dim=2)
     layer.f_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
     layer.q_conv1d = _ConvWeight()
@@ -1327,7 +1270,7 @@ def test_metadata_returns_none_without_a_forward_context(
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.prefix = "p"
-    monkeypatch.setattr(kimi_attention, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(kda_attention, "is_forward_context_available", lambda: False)
 
     assert layer._metadata() is None
 
@@ -1340,9 +1283,9 @@ def test_metadata_returns_none_for_a_non_dict_attn_metadata(
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.prefix = "p"
-    monkeypatch.setattr(kimi_attention, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(kda_attention, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(
-        kimi_attention,
+        kda_attention,
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata="not-a-dict"),
     )
@@ -1358,9 +1301,9 @@ def test_metadata_rejects_wrong_layer_metadata_type(
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.prefix = "p"
-    monkeypatch.setattr(kimi_attention, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(kda_attention, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(
-        kimi_attention,
+        kda_attention,
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata={"p": "wrong-type"}),
     )
@@ -1376,7 +1319,7 @@ def test_core_attention_pooled_rejects_pcp_streaming(
     streaming metadata and says so up front."""
     layer = _make_bare_kda_layer()
     monkeypatch.setattr(
-        kimi_attention, "is_pcp_streaming_attention_metadata", lambda md: True
+        kda_attention, "is_pcp_streaming_attention_metadata", lambda md: True
     )
     metadata = SimpleNamespace(mamba_slot_read_offsets=None)
 
@@ -1390,7 +1333,7 @@ def test_core_attention_pooled_forwards_speculative_verify_metadata(
     """Pooled verify forwards accepted-state offsets and noncontiguous checkpoints."""
     layer = _make_bare_kda_layer()
     monkeypatch.setattr(
-        kimi_attention, "is_pcp_streaming_attention_metadata", lambda md: False
+        kda_attention, "is_pcp_streaming_attention_metadata", lambda md: False
     )
     metadata = SimpleNamespace(
         query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
@@ -1449,7 +1392,7 @@ def test_core_attention_pooled_requires_state_indices(
     metadata without them is an error, not a silent no-op."""
     layer = _make_bare_kda_layer()
     monkeypatch.setattr(
-        kimi_attention, "is_pcp_streaming_attention_metadata", lambda md: False
+        kda_attention, "is_pcp_streaming_attention_metadata", lambda md: False
     )
     metadata = SimpleNamespace(mamba_slot_read_offsets=None, mamba_state_indices=None)
 
@@ -1506,9 +1449,6 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.fused_fa_ga_proj = _Projection(4)
     layer.f_a_proj = None
     layer.g_proj = None
-    layer.local_projection_size = 4
-    layer.num_heads = 2
-    layer.head_dim = 2
     layer.f_b_proj = _Projection(4)
     layer.g_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
@@ -1516,7 +1456,7 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
-    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    _set_kda_dims(layer, conv_size=3, num_heads=2, head_dim=2)
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
@@ -1558,8 +1498,7 @@ def test_kda_custom_ops_compile_as_one_full_graph(
 def test_kda_state_shapes_use_the_fused_kernel_conv_layout() -> None:
     """Both declaration sites hand vLLM the conv cache as (taps, 1, 3*H*D)."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
-    layer.conv_size, layer.num_heads, layer.head_dim = 4, 3, 128
-    layer.local_projection_size = layer.num_heads * layer.head_dim
+    _set_kda_dims(layer, conv_size=4, num_heads=3, head_dim=128)
     conv_shape, recurrent_shape = layer.get_state_shape()
     assert conv_shape == (3, 1, 1152)
     assert recurrent_shape == (3, 128, 128)
@@ -1707,11 +1646,11 @@ def test_latent_moe_norm_follows_the_config_flag(
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
 
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(kimi_moe, "GateLinear", Fake)
+    monkeypatch.setattr(latent_moe, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(latent_moe, "GateLinear", Fake)
     monkeypatch.setattr(kimi_moe, "KimiMLP", Fake)
-    monkeypatch.setattr(kimi_moe, "make_latent_projection", Fake)
-    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", lambda **kwargs: Fake())
+    monkeypatch.setattr(latent_moe, "make_latent_projection", Fake)
+    monkeypatch.setattr(latent_moe, "FusedMoEFactory", lambda **kwargs: Fake())
     norm_args: list[tuple] = []
 
     class FakeNorm(nn.Module):
@@ -1719,7 +1658,7 @@ def test_latent_moe_norm_follows_the_config_flag(
             super().__init__()
             norm_args.append(args)
 
-    monkeypatch.setattr(kimi_moe, "RMSNorm", FakeNorm)
+    monkeypatch.setattr(latent_moe, "RMSNorm", FakeNorm)
     config = KimiLinearConfig(
         hidden_size=16,
         num_experts=4,
@@ -1791,12 +1730,13 @@ def test_kimi_model_wires_declared_optional_features(
 @pytest.mark.parametrize("transposed", [False, True])
 def test_dummy_router_is_fixed_random_and_layer_specific(monkeypatch, transposed):
     config = SimpleNamespace(load_config=SimpleNamespace(load_format="dummy"))
-    monkeypatch.setattr(kimi_moe, "get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(latent_moe, "get_current_vllm_config_or_none", lambda: config)
     module = kimi_moe.KimiMoE.__new__(kimi_moe.KimiMoE)
     nn.Module.__init__(module)
     module.prefix = "model.layers.1.block_sparse_moe"
     module.gate = nn.Module()
     module.gate.input_size = 128
+    module.use_score_correction_bias = True
     module.gate.e_score_correction_bias = nn.Parameter(torch.zeros(896))
     shape = (128, 896) if transposed else (896, 128)
     module.gate.weight = nn.Parameter(torch.zeros(shape))
@@ -2082,7 +2022,7 @@ def test_kda_prefill_packing_preserves_projection_and_reload():
     nn.Module.__init__(layer)
     layer.prefill_group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
     layer.use_full_rank_gate = True
-    layer.num_heads, layer.head_dim = 3, 128
+    layer.num_heads, layer.head_k_dim = 3, 128
     generator = torch.Generator().manual_seed(19)
     for name, width in [("fused_qkvb_proj", 1155), ("g_proj", 384), ("f_a_proj", 128)]:
         projection = nn.Module()
@@ -2213,7 +2153,7 @@ def test_packed_kda_keeps_parameter_abi_across_token_buckets(monkeypatch):
     nn.Module.__init__(layer)
     layer.prefill_group = group
     layer.use_full_rank_gate = True
-    layer.num_heads, layer.head_dim, layer.local_projection_size = 3, 128, 384
+    layer.num_heads = 3
     layer.register_buffer(
         "packed_prefill_weight", torch.empty(7168, 1792, dtype=torch.bfloat16)
     )

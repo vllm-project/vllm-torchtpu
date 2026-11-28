@@ -846,6 +846,11 @@
       "concise_description": "Class member `GdnInterleavedColumnParallelLinear.weight_loader` overrides parent class `MergedColumnParallelLinear` in an inconsistent manner"
     },
     {
+      "path": "src/vllm_torchtpu/layers/adapter/kda_attention.py",
+      "name": "bad-assignment",
+      "concise_description": "`None` is not assignable to attribute `kv_cache` with type `tuple[Tensor, ...]`"
+    },
+    {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a16.py",
       "name": "bad-assignment",
       "concise_description": "`str | Any` is not assignable to attribute `strategy` with type `QuantizationStrategy | None`"
@@ -1009,11 +1014,6 @@
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `None` is not assignable to parameter `value` with type `Module | Tensor` in function `torch.nn.modules.module.Module.__setattr__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-assignment",
-      "concise_description": "`None` is not assignable to attribute `kv_cache` with type `tuple[Tensor, ...]`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/dspark.py",
