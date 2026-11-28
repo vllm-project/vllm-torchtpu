@@ -1024,6 +1024,7 @@ def sparse_mla_attention(
             query_start_loc_,
             nope_spec=nope_spec,
             rope_spec=rope_spec,
+            num_seqs=request_distribution_[2],
         )
 
         # Opt-in masked-dense routing builds Q inside each device branch.
@@ -1231,6 +1232,7 @@ def sparse_mla_attention_dcp(
             rope_spec=rope_spec,
             dcp_size=dcp_size,
             interleave_size=interleave_size,
+            num_seqs=request_distribution_[2],
         )
 
         # A rank owning none of a token's top-k still has to be handed one

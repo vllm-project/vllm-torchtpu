@@ -317,6 +317,7 @@ def attention_from_parts(
         query_start_loc,
         page_size=kv_cache_nope.shape[1],
         total_num_pages=kv_cache_nope.shape[0],
+        num_seqs=request_distribution[2],
     )
 
     def sparse_chunk(q, start_pos, token_end, *, preserve_suffix=False):

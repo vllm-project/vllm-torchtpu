@@ -23,14 +23,18 @@ import numpy as np
 from absl.testing import parameterized
 
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    OOB_PAGE,
     SKIP_ROW,
     WORD_BYTES,
     KVCacheLayout,
     KVCacheType,
     SparseMLAKVCacheSpec,
+    _row_positions,
     as_token_bytes,
     get_dst_rows,
+    get_page_and_slot,
     pack_tokens,
+    token_seq_ids,
     update_sparse_mla_kv_cache_dcp_jax,
     update_sparse_mla_kv_cache_jax,
 )
@@ -854,3 +858,147 @@ class SparseCoreRopePackingTest(parameterized.TestCase):
         # The attention body bitcasts each row to four tokens' uint8 rows.
         tokens_u8 = unpack4(got["packed"]).reshape(-1, 128)
         np.testing.assert_array_equal(tokens_u8, expected_u8)
+
+
+class RaggedAddressingMembershipMaskTest(parameterized.TestCase):
+    """Membership-mask token->sequence mapping matches searchsorted/repeat
+    without lowering to HLO while loops."""
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="single_seq_padded",
+            num_tokens=16,
+            seq_lens=[45],
+            cu_q_lens=[0, 9],
+        ),
+        dict(
+            testcase_name="mixed_decode_and_chunked_prefill",
+            num_tokens=32,
+            seq_lens=[120, 7, 300, 18],
+            cu_q_lens=[0, 1, 5, 25, 28],
+        ),
+        dict(
+            testcase_name="empty_leading_middle_trailing_slots",
+            num_tokens=24,
+            seq_lens=[0, 64, 0, 128, 0],
+            cu_q_lens=[0, 0, 6, 6, 17, 17],
+        ),
+        dict(
+            testcase_name="all_padding_dummy_step",
+            num_tokens=16,
+            seq_lens=[0, 0, 0, 0],
+            cu_q_lens=[0, 0, 0, 0, 0],
+        ),
+    )
+    def test_row_positions_and_token_seq_ids_match_reference(
+        self,
+        num_tokens: int,
+        seq_lens: list[int],
+        cu_q_lens: list[int],
+    ):
+        seq_lens_jnp = jnp.asarray(seq_lens, jnp.int32)
+        cu_q_lens_jnp = jnp.asarray(cu_q_lens, jnp.int32)
+        num_seqs = len(seq_lens)
+
+        tok, seq_id, pos, valid = _row_positions(
+            num_tokens, seq_lens_jnp, cu_q_lens_jnp
+        )
+        ref_tok = np.arange(num_tokens, dtype=np.int32)
+        ref_valid = ref_tok < cu_q_lens[-1]
+        ref_seq = np.minimum(
+            np.searchsorted(cu_q_lens[1:], ref_tok, side="right"), num_seqs - 1
+        ).astype(np.int32)
+        cu_np = np.asarray(cu_q_lens, np.int32)
+        seq_np = np.asarray(seq_lens, np.int32)
+        ref_q_len = cu_np[ref_seq + 1] - cu_np[ref_seq]
+        ref_pos = seq_np[ref_seq] - ref_q_len + (ref_tok - cu_np[ref_seq])
+
+        np.testing.assert_array_equal(np.asarray(tok), ref_tok)
+        np.testing.assert_array_equal(np.asarray(valid), ref_valid)
+        np.testing.assert_array_equal(np.asarray(seq_id)[ref_valid], ref_seq[ref_valid])
+        np.testing.assert_array_equal(np.asarray(pos)[ref_valid], ref_pos[ref_valid])
+        self.assertTrue(
+            np.all((np.asarray(seq_id) >= 0) & (np.asarray(seq_id) < num_seqs))
+        )
+
+        # Unused padding rows must map to OOB_PAGE in get_page_and_slot.
+        block_tables = jnp.arange(num_seqs * PAGES_PER_SEQ, dtype=jnp.int32)
+        page, _ = get_page_and_slot(
+            num_tokens, seq_lens_jnp, block_tables, cu_q_lens_jnp, PAGE_SIZE
+        )
+        np.testing.assert_array_equal(
+            np.asarray(page)[~ref_valid],
+            np.full(int(np.sum(~ref_valid)), OOB_PAGE, np.int32),
+        )
+
+        # token_seq_ids must agree on every active token and stay in bounds.
+        got_seq_ids = np.asarray(token_seq_ids(cu_q_lens_jnp, num_tokens))
+        tokens_per_seq = cu_np[1:] - cu_np[:-1]
+        ref_repeat = np.repeat(np.arange(num_seqs, dtype=np.int32), tokens_per_seq)
+        np.testing.assert_array_equal(got_seq_ids[: len(ref_repeat)], ref_repeat)
+        self.assertTrue(np.all((got_seq_ids >= 0) & (got_seq_ids < num_seqs)))
+
+    def test_token_seq_ids_ignores_stale_trailing_cu_q_lens(self):
+        # Active sequences [0, 5) and [5, 10); slots 2..3 hold stale [10, 6), [6, 8)
+        # from a previous step where only cu_q_lens[:num_seqs + 1] was refreshed.
+        cu_q_lens = jnp.asarray([0, 5, 10, 6, 8], jnp.int32)
+        got = np.asarray(token_seq_ids(cu_q_lens, 16, num_seqs=jnp.int32(2)))
+        expected = np.asarray([0] * 5 + [1] * 5 + [0] * 6, dtype=np.int32)
+        np.testing.assert_array_equal(got, expected)
+
+    def test_get_page_and_slot_ignores_stale_trailing_query_start_loc(self):
+        # Same stale layout as above: only query_start_loc[:num_seqs + 1] is live.
+        num_tokens, num_seqs = 16, 2
+        query_start_loc = jnp.asarray([0, 5, 10, 6, 8], jnp.int32)
+        seq_lens = jnp.asarray([5, 9, 7, 3], jnp.int32)
+        block_tables = jnp.arange(4 * PAGES_PER_SEQ, dtype=jnp.int32)
+        page, slot = get_page_and_slot(
+            num_tokens,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            PAGE_SIZE,
+            num_seqs=jnp.int32(num_seqs),
+        )
+        # Reference: the same live sequences with monotonic tail padding.
+        page_ref, slot_ref = get_page_and_slot(
+            num_tokens,
+            seq_lens,
+            block_tables,
+            jnp.asarray([0, 5, 10, 10, 10], jnp.int32),
+            PAGE_SIZE,
+        )
+        np.testing.assert_array_equal(np.asarray(page), np.asarray(page_ref))
+        np.testing.assert_array_equal(np.asarray(slot), np.asarray(slot_ref))
+        self.assertTrue(np.all(np.asarray(page)[10:] == OOB_PAGE))
+
+    def test_overlapping_intervals_keep_seq_id_in_bounds(self):
+        # Malformed (overlapping) intervals must not sum seq_id past the last slot.
+        query_start_loc = jnp.asarray([0, 8, 8, 4, 8], jnp.int32)
+        _, seq_id, _, _ = _row_positions(
+            8, jnp.asarray([8, 0, 4, 4], jnp.int32), query_start_loc
+        )
+        self.assertTrue(np.all((np.asarray(seq_id) >= 0) & (np.asarray(seq_id) < 4)))
+
+    def test_compiled_hlo_contains_no_while_loops(self):
+        @jax.jit
+        def fn(seq_lens, cu_q_lens, num_seqs):
+            _, seq_id, pos, valid = _row_positions(1024, seq_lens, cu_q_lens)
+            seg_all = token_seq_ids(cu_q_lens, 1024)
+            seg_bounded = token_seq_ids(cu_q_lens, 1024, num_seqs=num_seqs)
+            return seq_id, pos, valid, seg_all, seg_bounded
+
+        lowered = fn.lower(
+            jax.ShapeDtypeStruct((64,), jnp.int32),
+            jax.ShapeDtypeStruct((65,), jnp.int32),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        )
+        stablehlo = lowered.as_text()
+        hlo = lowered.compile().as_text()
+        # Covers both regressions on CPU: jnp.searchsorted compiles to while(,
+        # while jnp.repeat(..., total_repeat_length=...) lowers via cumsum
+        # (stablehlo.reduce_window) + non-unique scatter.
+        self.assertNotIn("reduce_window", stablehlo)
+        self.assertNotIn("scatter", stablehlo)
+        self.assertNotIn("while(", hlo)
+        self.assertNotIn("scatter", hlo)
