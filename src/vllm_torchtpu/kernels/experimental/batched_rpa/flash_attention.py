@@ -23,7 +23,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 def flash_attention_qk_softmax(
     step: jax.Array,
     q: jax.Array,  # [B, KV, TQ, H]
-    k: jax.Array,  # [B, KV, S, H] or [B, KV, H, S]
+    k: jax.Array,  # [B, KV, S, D_k] or [B, KV, D_k, S]; D_k is H_rot in Subspace-RPA
     m_prev: jax.Array,  # [KV, TQ, 128]
     l_prev: jax.Array,  # [KV, TQ, 128]
     is_last_k: SmemWrapper,  # [steps, B]
@@ -32,46 +32,94 @@ def flash_attention_qk_softmax(
     cfgs: configs.RpaConfigs,
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]
+    v: jax.Array | None = None,
+    v_scale: jax.Array | float | None = None,
 ):
     """Flash attention kernel."""
     b, k_heads, tq, h_size = q.shape
 
-    if cfgs.serve.scale_q is not None:
-        q = q / cfgs.serve.scale_q
-        if jnp.issubdtype(k.dtype, jnp.floating):
-            dtype_info = jnp.finfo(k.dtype)
-            minval = float(dtype_info.min)
-            maxval = float(dtype_info.max)
-            q = jnp.clip(q, min=minval, max=maxval)
-        q = q.astype(k.dtype)
-
-    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        s = k.shape[-1]
-        qk = lax.dot(
-            q.reshape(-1, tq, h_size),
-            k.reshape(-1, h_size, s),
-            dimension_numbers=(([2], [1]), ([0], [0])),
-            preferred_element_type=jnp.float32,
-        )
+    if cfgs.serve.subspace_k_rot_dim is not None:
+        assert v is not None
+        rot_dim = cfgs.serve.subspace_k_rot_dim
+        nope_dim = h_size - rot_dim
+        q_rot = q[..., :rot_dim]
+        q_nope = q[..., rot_dim:]
+        if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            s = k.shape[-1]
+            v_nope = v[:, :, rot_dim:, :]
+            qk_rot = lax.dot(
+                q_rot.reshape(-1, tq, rot_dim),
+                k.reshape(-1, rot_dim, s),
+                dimension_numbers=(([2], [1]), ([0], [0])),
+                preferred_element_type=jnp.float32,
+            ).reshape(b, k_heads, tq, s)
+            # SEQ_ALONG_LANE quantizes K_rot to FP8 alongside V.
+            if k_scale is not None:
+                qk_rot *= k_scale
+            qk_nope = lax.dot(
+                q_nope.reshape(-1, tq, nope_dim),
+                v_nope.reshape(-1, nope_dim, s),
+                dimension_numbers=(([2], [1]), ([0], [0])),
+                preferred_element_type=jnp.float32,
+            ).reshape(b, k_heads, tq, s)
+        else:
+            # HEAD_ALONG_SUBLANE packs K_rot unquantized as BF16, so k_scale
+            # is not applied to qk_rot.
+            s = k.shape[-2]
+            v_nope = v[:, :, :, rot_dim:]
+            qk_rot = lax.dot(
+                q_rot.astype(k.dtype).reshape(-1, tq, rot_dim),
+                k.reshape(-1, s, rot_dim),
+                dimension_numbers=(([2], [2]), ([0], [0])),
+                preferred_element_type=jnp.float32,
+            ).reshape(b, k_heads, tq, s)
+            qk_nope = lax.dot(
+                q_nope.reshape(-1, tq, nope_dim),
+                v_nope.reshape(-1, s, nope_dim),
+                dimension_numbers=(([2], [2]), ([0], [0])),
+                preferred_element_type=jnp.float32,
+            ).reshape(b, k_heads, tq, s)
+        if v_scale is not None:
+            qk_nope *= v_scale
+        qk = (qk_rot + qk_nope) * cfgs.model.sm_scale
+        qk = qk.astype(cfgs.serve.dtype_out)
     else:
-        s = k.shape[-2]
-        qk = lax.dot(
-            q.reshape(-1, tq, h_size),
-            k.reshape(-1, s, h_size),
-            dimension_numbers=(([2], [2]), ([0], [0])),
-            preferred_element_type=jnp.float32,
-        )
-    qk = qk.reshape(b, k_heads, tq, s)
+        if cfgs.serve.scale_q is not None:
+            q = q / cfgs.serve.scale_q
+            if jnp.issubdtype(k.dtype, jnp.floating):
+                dtype_info = jnp.finfo(k.dtype)
+                minval = float(dtype_info.min)
+                maxval = float(dtype_info.max)
+                q = jnp.clip(q, min=minval, max=maxval)
+            q = q.astype(k.dtype)
 
-    qk *= cfgs.model.sm_scale
-    if cfgs.serve.scale_q is not None:
-        qk *= cfgs.serve.scale_q
-    if k_scale is not None:
-        qk *= k_scale
+        if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            s = k.shape[-1]
+            qk = lax.dot(
+                q.reshape(-1, tq, h_size),
+                k.reshape(-1, h_size, s),
+                dimension_numbers=(([2], [1]), ([0], [0])),
+                preferred_element_type=jnp.float32,
+            )
+        else:
+            s = k.shape[-2]
+            qk = lax.dot(
+                q.reshape(-1, tq, h_size),
+                k.reshape(-1, s, h_size),
+                dimension_numbers=(([2], [2]), ([0], [0])),
+                preferred_element_type=jnp.float32,
+            )
+        qk = qk.reshape(b, k_heads, tq, s)
 
-    # We convert to the output dtype after scaling, because especially for very
-    # low precision, we want to have 32-bit scale factors and do scaling in fp32.
-    qk = qk.astype(cfgs.serve.dtype_out)
+        qk *= cfgs.model.sm_scale
+        if cfgs.serve.scale_q is not None:
+            qk *= cfgs.serve.scale_q
+        if k_scale is not None:
+            qk *= k_scale
+
+        # We convert to the output dtype after scaling, because especially for very
+        # low precision, we want to have 32-bit scale factors and do scaling in fp32.
+        qk = qk.astype(cfgs.serve.dtype_out)
 
     if cfgs.model.soft_cap is not None:
         qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)

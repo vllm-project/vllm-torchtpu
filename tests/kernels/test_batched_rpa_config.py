@@ -93,7 +93,6 @@ def test_prepared_inputs_rejects_dynamic_scales(scale):
     q = jnp.zeros((8, 2, 128), jnp.bfloat16)
     kv = jnp.zeros((8, 1, 128), jnp.float8_e4m3fn)
     tpu_info = _create_mock_tpu_info(7, chip_version="v7x")
-    tpu_info.num_sublanes = 8
     with patch("jax.experimental.pallas.tpu.get_tpu_info", return_value=tpu_info):
         prepared = wrapper.prepare_inputs(q, kv, kv, q.dtype, kv.dtype)
         cache = jnp.zeros(
@@ -246,3 +245,126 @@ def test_rpa_configs_rejects_unaligned_bkv_sz_both_layouts(kv_layout):
                 jnp.arange(5, dtype=jnp.int32),
                 jnp.array([4, 4, 4], dtype=jnp.int32),
             )
+
+
+def test_infer_subspace_k_rot_dim_ignores_packed_fp4():
+    """Packed FP4 (uint8) packs both K and V to head_dim // 2 (not Subspace-RPA)."""
+    k_fp4 = jnp.zeros((16, 8, 64), jnp.uint8)
+    v_fp4 = jnp.zeros((16, 8, 64), jnp.uint8)
+    assert wrapper.infer_subspace_k_rot_dim(k_fp4, v_fp4) is None
+
+    k_sub = jnp.zeros((16, 1, 128), jnp.bfloat16)
+    v_sub = jnp.zeros((16, 1, 512), jnp.float8_e4m3fn)
+    assert wrapper.infer_subspace_k_rot_dim(k_sub, v_sub) == 128
+
+
+def test_subspace_rpa_aligned_kv_head_dim_and_cache_shape():
+    """Verify Subspace-RPA page geometry helper across both KV layouts."""
+    assert (
+        configs.get_subspace_aligned_kv_head_dim(
+            512, 128, configs.KVLayout.HEAD_ALONG_SUBLANE, 4, 128, 8
+        )
+        == 256
+    )
+    assert (
+        configs.get_subspace_aligned_kv_head_dim(
+            512, 128, configs.KVLayout.SEQ_ALONG_LANE, 4, 128, 8
+        )
+        == 640
+    )
+    assert wrapper.get_kv_cache_shape(
+        10,
+        256,
+        1,
+        512,
+        jnp.float8_e4m3fn,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        subspace_k_rot_dim=128,
+    ) == (10, 256, 1, 4, 256)
+    assert wrapper.get_kv_cache_shape(
+        10,
+        128,
+        1,
+        512,
+        jnp.float8_e4m3fn,
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        subspace_k_rot_dim=128,
+    ) == (10, 1, 160, 4, 128)
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"dtype_kv": jnp.bfloat16}, "dtype_kv"),
+        ({"dtype_kv": jnp.int8}, "dtype_kv"),
+        ({"dtype_kv": jnp.uint8}, "dtype_kv"),
+        (
+            {
+                "kv_layout": configs.KVLayout.SEQ_ALONG_LANE,
+                "per_token_scale": True,
+            },
+            "per_token_scale",
+        ),
+        ({"scale_q": 1.0}, "scale_q"),
+        ({"cp_group_size": 2}, "cp_group_size"),
+        ({"subspace_k_rot_dim": 0}, "subspace_k_rot_dim"),
+        ({"subspace_k_rot_dim": 64, "num_lanes": 128}, "aligned to num_lanes"),
+        ({"subspace_k_rot_dim": 512, "head_dim": 512}, "subspace_k_rot_dim"),
+        (
+            {
+                "subspace_k_rot_dim": 128,
+                "head_dim": 896,
+                "num_lanes": 128,
+                "num_sublanes": 8,
+            },
+            "aligned_kv_head_dim",
+        ),
+    ],
+)
+def test_subspace_rpa_admission_guards(kwargs, match):
+    """Unsupported Subspace-RPA dtypes, scales, and widths raise NotImplementedError."""
+    base = {
+        "subspace_k_rot_dim": 128,
+        "dtype_kv": jnp.float8_e4m3fn,
+        "kv_layout": configs.KVLayout.HEAD_ALONG_SUBLANE,
+    }
+    base.update(kwargs)
+    with pytest.raises(NotImplementedError, match=match):
+        configs.validate_subspace_rpa_config(**base)
+
+
+@pytest.mark.parametrize(
+    "kv_layout",
+    [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
+)
+def test_subspace_rpa_calculate_block_sizes(kv_layout):
+    """Subspace-RPA's smaller KV buffers allow a larger decode bkv_sz."""
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=512,
+        mask_value=-1e9,
+    )
+    base_serve = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=128,
+        total_q_tokens=512,
+        num_page_indices=32 * 8,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+        kv_layout=kv_layout,
+    )
+    sub_serve = dataclasses.replace(base_serve, subspace_k_rot_dim=128)
+    # Tight VMEM budget where KV buffer bytes cap decode bkv_sz below max_seq_len.
+    vmem_limit = 32 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        base_dec, _ = wrapper.calculate_block_sizes(model_cfg, base_serve, vmem_limit)
+        sub_dec, sub_pre = wrapper.calculate_block_sizes(
+            model_cfg, sub_serve, vmem_limit
+        )
+    assert sub_dec.bkv_sz % 128 == 0 and sub_dec.bkv_sz > base_dec.bkv_sz
+    assert sub_pre.bkv_sz % 128 == 0 and sub_pre.bkv_sz >= 256

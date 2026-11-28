@@ -622,6 +622,7 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_SUBSPACE_RPA",
     ]
 
     @classmethod
@@ -1015,6 +1016,8 @@ class TpuPlatform(Platform):
         from vllm_torchtpu.layers.adapter.attention import (
             PallasAttentionBackend,
             PallasBatchedRPAAttentionBackend,
+            is_fp8_kv_cache_dtype,
+            is_subspace_rpa_model_config,
         )
 
         # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
@@ -1036,6 +1039,37 @@ class TpuPlatform(Platform):
             backend = PallasBatchedRPAAttentionBackend
         else:
             backend = PallasAttentionBackend
+        if envs.TPU_SUBSPACE_RPA and vllm_config.model_config is not None:
+            if backend is not PallasBatchedRPAAttentionBackend:
+                raise NotImplementedError(
+                    "TPU_SUBSPACE_RPA=1 requires BatchedRPA; "
+                    "pass --attention-backend CUSTOM."
+                )
+            if not is_subspace_rpa_model_config(vllm_config.model_config):
+                raise NotImplementedError(
+                    "TPU_SUBSPACE_RPA=1 requires a Gemma 4 checkpoint with "
+                    "attention_k_eq_v=True, num_kv_shared_layers=0, 512-dim "
+                    "global layers with 25% proportional RoPE, and no "
+                    "attention bias."
+                )
+            if not is_fp8_kv_cache_dtype(vllm_config.cache_config.cache_dtype):
+                raise NotImplementedError(
+                    "TPU_SUBSPACE_RPA=1 requires an FP8 KV cache; "
+                    "pass --kv-cache-dtype fp8 "
+                    f"(got {vllm_config.cache_config.cache_dtype!r})."
+                )
+            if (
+                parallel_config.prefill_context_parallel_size > 1
+                or parallel_config.decode_context_parallel_size > 1
+                or envs.VLLM_TPU_BLOCK_MAJOR_KV
+                or rope_in_graph_flag.in_graph_enabled(vllm_config)
+                or vllm_config.speculative_config is not None
+            ):
+                raise NotImplementedError(
+                    "TPU_SUBSPACE_RPA=1 does not support context parallelism "
+                    "(PCP/DCP), VLLM_TPU_BLOCK_MAJOR_KV=1, "
+                    "tpu_rope_in_graph=True, or speculative decoding."
+                )
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
         if (
             vllm_config.model_config is not None

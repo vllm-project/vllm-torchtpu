@@ -1182,3 +1182,167 @@ def test_batched_rpa_on_shared_packed_pool_matches_separate_caches_and_ref(
         np.asarray(sep_full[full_ids].astype(jnp.float32)),
     )
     assert not bool(jnp.any(shared_pool[jnp.asarray([0, 3, 7], jnp.int32)] != 0))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "kv_layout, pool_mult",
+    [
+        (batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE, 1),
+        (batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE, 2),
+        (batched_rpa_configs.KVLayout.SEQ_ALONG_LANE, 2),
+    ],
+    ids=["nhd_1x", "nhd_2x", "hnd_2x"],
+)
+def test_batched_rpa_subspace_on_shared_packed_pool_matches_separate_5d(
+    kv_layout: batched_rpa_configs.KVLayout,
+    pool_mult: int,
+):
+    """Run `_pallas_rpa_kernel_batched` with Subspace-RPA on a 4D shared pool.
+
+    Covers equal (1x) and unequal (2x) pool pages in HEAD_ALONG_SUBLANE and
+    unequal (2x) pool pages in SEQ_ALONG_LANE, checking bit-exact parity
+    against a separate 5D cache across prefill and decode.
+    """
+    from vllm_torchtpu.kernels.experimental.batched_rpa import (
+        wrapper as rpa_batched_wrapper,
+    )
+
+    tpu_devices = jax.devices("tpu")
+    mesh = Mesh(np.asarray(tpu_devices[:1]), ("model",))
+    head_dim = 512
+    rot_dim = 128
+    num_kv_heads = 1
+    num_q_heads = 4
+    page_size = 128
+    num_pool_blocks = 6
+    fp8 = jnp.float8_e4m3fn
+
+    native_5d = rpa_batched_wrapper.get_kv_cache_shape(
+        total_num_pages=num_pool_blocks * pool_mult,
+        page_size=page_size,
+        actual_num_kv_heads=num_kv_heads,
+        actual_head_dim=head_dim,
+        kv_dtype=fp8,
+        kv_layout=kv_layout,
+        chip_version=get_chip_version(),
+        subspace_k_rot_dim=rot_dim,
+    )
+    packing = 4
+    if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+        words_per_token = native_5d[1] * native_5d[2] * pool_mult
+        pool_shape = (num_pool_blocks, words_per_token, packing, page_size)
+    else:
+        words_per_token = native_5d[2] * native_5d[4] * pool_mult
+        pool_shape = (num_pool_blocks, page_size, packing, words_per_token)
+
+    shared_pool = jax.lax.bitcast_convert_type(
+        jnp.zeros(pool_shape, dtype=jnp.uint8), fp8
+    )
+    sep_cache = jax.lax.bitcast_convert_type(jnp.zeros(native_5d, dtype=jnp.uint8), fp8)
+
+    # Shuffled pool block IDs; with pool_mult=2 and subpage_split=1, the
+    # adapter scales pool block IDs by table_scale=2.
+    pool_bt = jnp.asarray([4, 1, 5], dtype=jnp.int32)
+    sep_bt = pool_bt * pool_mult
+
+    prefill_len = page_size + 24
+    total_len = prefill_len + 1
+    rng = np.random.default_rng(100 + pool_mult)
+    q_all = jnp.asarray(
+        rng.standard_normal((total_len, num_q_heads, head_dim)) * 0.5, jnp.bfloat16
+    )
+    k_f32 = rng.standard_normal((total_len, num_kv_heads, rot_dim)) * 0.5
+    v_f32 = rng.standard_normal((total_len, num_kv_heads, head_dim)) * 0.5
+    k_scale, v_scale = 0.75, 1.25
+    finfo = jnp.finfo(fp8)
+    v_all = jnp.clip(
+        jnp.asarray(v_f32, jnp.float32) / v_scale, float(finfo.min), float(finfo.max)
+    ).astype(fp8)
+    if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+        k_all = jnp.clip(
+            jnp.asarray(k_f32, jnp.float32) / k_scale,
+            float(finfo.min),
+            float(finfo.max),
+        ).astype(fp8)
+    else:
+        k_all = jnp.asarray(k_f32, jnp.bfloat16)
+
+    def _run(cache, bt, sl: slice, seq_len: int, decode: bool):
+        q, k, v = q_all[sl], k_all[sl], v_all[sl]
+        dist = jnp.asarray((1, 1, 1) if decode else (0, 0, 1), jnp.int32)
+        return attn_module._pallas_rpa_kernel_batched(
+            cache,
+            q,
+            k,
+            v,
+            jnp.asarray([seq_len], jnp.int32),
+            bt,
+            jnp.asarray([0, q.shape[0]], jnp.int32),
+            dist,
+            None,
+            None,
+            k_scale,
+            v_scale,
+            mesh=mesh,
+            sliding_window=None,
+            sm_scale=head_dim**-0.5,
+            skip_kv_update=False,
+            kv_layout=kv_layout,
+            subpage_split=1,
+        )
+
+    shared_pool, pre_shared = _run(
+        shared_pool, pool_bt, slice(0, prefill_len), prefill_len, False
+    )
+    shared_pool, dec_shared = _run(
+        shared_pool, pool_bt, slice(prefill_len, total_len), total_len, True
+    )
+    sep_cache, pre_sep = _run(
+        sep_cache, sep_bt, slice(0, prefill_len), prefill_len, False
+    )
+    sep_cache, dec_sep = _run(
+        sep_cache, sep_bt, slice(prefill_len, total_len), total_len, True
+    )
+
+    v_deq = np.asarray(v_all.astype(jnp.float32)) * v_scale
+    if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+        k_rot_deq = np.asarray(k_all.astype(jnp.float32)) * k_scale
+    else:
+        k_rot_deq = np.asarray(k_all.astype(jnp.float32))
+    k_full = np.concatenate([k_rot_deq, v_deq[..., rot_dim:]], axis=-1)
+    q_f32 = np.asarray(q_all.astype(jnp.float32))
+
+    for got, want, q_offset, kv_len in (
+        (pre_shared, pre_sep, 0, prefill_len),
+        (dec_shared, dec_sep, prefill_len, total_len),
+    ):
+        got_f32 = np.asarray(got.astype(jnp.float32))
+        want_f32 = np.asarray(want.astype(jnp.float32))
+        assert np.abs(got_f32).max() > 0
+        np.testing.assert_array_equal(got_f32, want_f32)
+        ref = _ref_causal_gqa_attention(
+            q_f32[q_offset:kv_len],
+            k_full[:kv_len],
+            v_deq[:kv_len],
+            q_offset=q_offset,
+            scale=head_dim**-0.5,
+            sliding_window=None,
+        )
+        np.testing.assert_allclose(got_f32, ref, atol=2.5e-2, rtol=2e-2)
+
+    # Compare written pool bytes against the separate 5D cache after remapping.
+    packed_5d = shared_pool.reshape(
+        pool_shape[0], pool_shape[1], 1, packing, pool_shape[3]
+    )
+    shared_native = attn_module._reshape_packed_kv_cache(packed_5d, native_5d)
+    shared_u8 = np.asarray(jax.lax.bitcast_convert_type(shared_native, jnp.uint8))
+    sep_u8 = np.asarray(jax.lax.bitcast_convert_type(sep_cache, jnp.uint8))
+    written_ids = np.asarray(sep_bt)
+    np.testing.assert_array_equal(shared_u8[written_ids], sep_u8[written_ids])
+
+    # Unused pool blocks [0, 2, 3] remain untouched zeros.
+    unused = jax.lax.bitcast_convert_type(shared_pool, jnp.uint8)[
+        jnp.asarray([0, 2, 3], jnp.int32)
+    ]
+    assert not bool(jnp.any(unused != 0))

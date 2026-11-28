@@ -102,7 +102,10 @@ from vllm_torchtpu.layers.core.attention_interface import (
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
-from vllm_torchtpu.layers.core.quantization import quantize_kv
+from vllm_torchtpu.layers.core.quantization import (
+    quantize_kv,
+    static_per_tensor_quantize_tensor,
+)
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
@@ -117,6 +120,10 @@ logger = init_logger(__name__)
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
+# Subspace-RPA (TPU_SUBSPACE_RPA): head dim it applies to and how many of
+# those channels RoPE rotates.
+SUBSPACE_RPA_HEAD_DIM = 512
+SUBSPACE_RPA_ROT_DIM = 128
 
 _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
     P(DCP_AXIS_NAME),  # kv_cache_nope, this rank's position shard
@@ -156,8 +163,15 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
 }
 
 
-def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
-    return cache_dtype_str.lower().strip() in frozenset(("fp8", "fp8_e4m3", "fp8_e5m2"))
+def is_8bit_float_dtype(dtype: torch.dtype | None) -> bool:
+    """Return True for 8-bit floating dtypes (excludes int8/uint8 packed FP4)."""
+    return dtype is not None and dtype.is_floating_point and dtype.itemsize == 1
+
+
+def is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
+    """Return True for FP8 KV cache dtype strings (excludes uint8 like fp8_ds_mla)."""
+    dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(cache_dtype_str.lower().strip())
+    return is_8bit_float_dtype(dtype)
 
 
 def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
@@ -285,6 +299,7 @@ def _pallas_rpa_kernel_impl(
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
     subpage_split: int = 1,
+    subspace_k_rot_dim: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
@@ -294,15 +309,18 @@ def _pallas_rpa_kernel_impl(
         kv_cache = kernel_view(kv_cache)
     packed_pool_shape = None
     if kv_cache.ndim == 4:
-        if uses_seq_along_lane_kv_page(kv_layout, query.shape[2]):
+        is_seq_along_lane = uses_seq_along_lane_kv_page(kv_layout, query.shape[2])
+        if subspace_k_rot_dim is not None or is_seq_along_lane:
+            assert kv_layout is not None
             native_shape = rpa_batched_wrapper.get_kv_cache_shape(
                 total_num_pages=1,
-                page_size=pool_shape[3],
+                page_size=pool_shape[3] if is_seq_along_lane else pool_shape[1],
                 actual_num_kv_heads=key.shape[1],
                 actual_head_dim=query.shape[2],
                 kv_dtype=kv_cache.dtype,
-                kv_layout=batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
+                kv_layout=kv_layout,
                 chip_version=get_chip_version(),
+                subspace_k_rot_dim=subspace_k_rot_dim,
             )
         else:
             native_shape = PallasAttentionBackend.get_kv_cache_shape(
@@ -568,6 +586,17 @@ def _pallas_rpa_kernel_batched(
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
+    subspace_k_rot_dim = rpa_batched_wrapper.infer_subspace_k_rot_dim(key, value)
+    rpa_kwargs: dict[str, Any] = {}
+    if decode_query_size > 1:
+        rpa_kwargs["decode_query_size"] = decode_query_size
+    if subspace_k_rot_dim is not None:
+        rpa_kwargs["subspace_k_rot_dim"] = subspace_k_rot_dim
+    rpa_func = (
+        functools.partial(ragged_paged_attention_batched, **rpa_kwargs)
+        if rpa_kwargs
+        else ragged_paged_attention_batched
+    )
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -584,25 +613,70 @@ def _pallas_rpa_kernel_batched(
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=(
-            functools.partial(
-                ragged_paged_attention_batched, decode_query_size=decode_query_size
-            )
-            if decode_query_size > 1
-            else ragged_paged_attention_batched
-        ),
+        rpa_func=rpa_func,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
         block_major=block_major,
         subpage_split=subpage_split,
+        subspace_k_rot_dim=subspace_k_rot_dim,
     )
 
 
 # ======================================================================================
 # VLLM Attention Backend
 # ======================================================================================
+
+
+def is_subspace_rpa_model_config(model_config: Any) -> bool:
+    """Return True if ``model_config`` is Gemma 4 eligible for Subspace-RPA."""
+    if model_config is None:
+        return False
+    text_config = model_config.hf_text_config
+    model_type = str(text_config.model_type).lower()
+    if "gemma4" not in model_type:
+        return False
+    if not bool(text_config.attention_k_eq_v):
+        return False
+    if int(text_config.num_kv_shared_layers or 0) != 0:
+        return False
+    if bool(text_config.attention_bias):
+        return False
+    rope_params = text_config.rope_parameters
+    if not isinstance(rope_params, dict):
+        return False
+    full_rope = rope_params.get("full_attention", rope_params)
+    if (
+        not isinstance(full_rope, dict)
+        or full_rope.get("rope_type") != "proportional"
+        or full_rope.get("partial_rotary_factor")
+        != SUBSPACE_RPA_ROT_DIM / SUBSPACE_RPA_HEAD_DIM
+    ):
+        return False
+    layer_types = text_config.layer_types
+    per_layer = text_config.per_layer_config
+    has_eligible_global = False
+    for idx, layer_type in enumerate(layer_types):
+        layer_head_dim = per_layer[idx].head_dim
+        if layer_type == "sliding_attention":
+            if layer_head_dim == SUBSPACE_RPA_HEAD_DIM:
+                return False
+        elif layer_head_dim == SUBSPACE_RPA_HEAD_DIM:
+            has_eligible_global = True
+    return has_eligible_global
+
+
+def _uses_subspace_rpa(
+    head_size: int, kv_dtype: torch.dtype, model_config: Any = None
+) -> bool:
+    """Whether a BatchedRPA layer with this geometry stores Subspace-RPA KV pages."""
+    return (
+        envs.TPU_SUBSPACE_RPA
+        and head_size == SUBSPACE_RPA_HEAD_DIM
+        and is_8bit_float_dtype(kv_dtype)
+        and is_subspace_rpa_model_config(model_config)
+    )
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
@@ -656,7 +730,6 @@ class PallasAttentionBackend(AttentionBackend):
             return (num_blocks, block_size, num_kv_heads_x2, 1, padded_head_size)
         kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         kv_packing = get_dtype_packing(kv_dtype)
-
         num_kv_heads_x2 = num_kv_heads if use_hd64 else num_kv_heads * 2
         num_kv_heads_x2 = cdiv(num_kv_heads_x2, kv_packing) * kv_packing
         return (
@@ -870,14 +943,18 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
             )
+        vllm_config = get_current_vllm_config()
         kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[
-            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+            vllm_config.cache_config.get_resolved_kv_cache_layout()
         ]
-        if not uses_seq_along_lane_kv_page(kv_layout, head_size):
+        torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
+        use_subspace = _uses_subspace_rpa(
+            head_size, torch_dtype, vllm_config.model_config
+        )
+        if not uses_seq_along_lane_kv_page(kv_layout, head_size) and not use_subspace:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
             )
-        torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         # Resolve the chip here rather than in the kernel: the scheduler
         # process calls this and owns no chip, so the wrapper must not query a
         # live device.
@@ -889,6 +966,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             kv_dtype=pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[torch_dtype],
             kv_layout=kv_layout,
             chip_version=get_chip_version(),
+            subspace_k_rot_dim=SUBSPACE_RPA_ROT_DIM if use_subspace else None,
         )
 
     @staticmethod
@@ -970,7 +1048,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         self.kv_cache_quantized_dtype = None
         # Only set kv_cache_quantized_dtype for fp8 KV cache
-        if _is_fp8_kv_cache_dtype(kv_cache_dtype):
+        if is_fp8_kv_cache_dtype(kv_cache_dtype):
             self.kv_cache_quantized_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
                 kv_cache_dtype.lower().strip()
             ]
@@ -1614,43 +1692,55 @@ class PallasAttentionBackendImpl(AttentionImpl):
             k_len, k_compute_dim = key.shape
 
         assert q_compute_dim == self.head_size * self.num_heads
-        assert k_compute_dim == self.head_size * self.num_kv_heads
-
         query = query.view(q_len, self.num_heads, self.head_size)
-        key = key.view(k_len, self.num_kv_heads, self.head_size)
         value = value.view(k_len, self.num_kv_heads, self.head_size)
-        assert key.shape == value.shape
-
-        # A layer whose head_size is narrower than the page it writes into —
-        # a DFlash draft layer sharing the target's unified pool, whose page
-        # geometry comes from whichever attention spec defined the pool (see
-        # `kv_cache_materializer._pool_attention_geometry`). Pad q/k/v out to
-        # the page width so the kernel's slot writes line up, and slice the
-        # result back below. Zeros contribute nothing to the QK dot product,
-        # `self.scale` comes from the real head_size and is passed separately,
-        # and the padded V columns are dropped — so the output is unchanged.
-        #
-        # Only the head dim is reconciled. A layer whose `num_kv_heads`
-        # disagrees with the pool's would write the wrong slots and padding
-        # cannot fix that, so the two must already agree.
-        # SEQ_ALONG_LANE places `page_size` on the last axis and the packed
-        # `head_dim` axes at `[-3, -2]` (indexed from the end so both 5D
-        # layer-major and 6D block-major pools resolve identically).
-        if kv_cache.ndim == 4:
-            pool_head_dim = self.head_size
-        elif self._pool_is_seq_along_lane:
-            pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
-        else:
-            pool_head_dim = kv_cache.shape[-1]
-        # A layer writing its own native page is never padded, even when the
-        # page is wider than head_size (the head_dim=64 page packs K and V along
-        # its last axis). Only a page defined by another spec is padded.
-        native_page = PallasAttentionBackend.get_kv_cache_shape(
-            1, 1, self.num_kv_heads, self.head_size, kv_cache.dtype
-        )[2:]
-        pad_size = kv_page_head_padding(
-            tuple(kv_cache.shape[-3:]), native_page, pool_head_dim, self.head_size
+        is_subspace_rpa = (
+            self.head_size == SUBSPACE_RPA_HEAD_DIM
+            and k_compute_dim == SUBSPACE_RPA_ROT_DIM * self.num_kv_heads
         )
+        if is_subspace_rpa:
+            if not isinstance(self, PallasBatchedRPAAttentionBackendImpl):
+                raise NotImplementedError(
+                    "Subspace-RPA requires PallasBatchedRPAAttentionBackendImpl "
+                    "(--attention-backend CUSTOM)."
+                )
+            key = key.view(k_len, self.num_kv_heads, SUBSPACE_RPA_ROT_DIM)
+            pad_size = 0
+        else:
+            assert k_compute_dim == self.head_size * self.num_kv_heads
+            key = key.view(k_len, self.num_kv_heads, self.head_size)
+            assert key.shape == value.shape
+
+            # A layer whose head_size is narrower than the page it writes into —
+            # a DFlash draft layer sharing the target's unified pool, whose page
+            # geometry comes from whichever attention spec defined the pool (see
+            # `kv_cache_materializer._pool_attention_geometry`). Pad q/k/v out to
+            # the page width so the kernel's slot writes line up, and slice the
+            # result back below. Zeros contribute nothing to the QK dot product,
+            # `self.scale` comes from the real head_size and is passed separately,
+            # and the padded V columns are dropped — so the output is unchanged.
+            #
+            # Only the head dim is reconciled. A layer whose `num_kv_heads`
+            # disagrees with the pool's would write the wrong slots and padding
+            # cannot fix that, so the two must already agree.
+            # SEQ_ALONG_LANE places `page_size` on the last axis and the packed
+            # `head_dim` axes at `[-3, -2]` (indexed from the end so both 5D
+            # layer-major and 6D block-major pools resolve identically).
+            if kv_cache.ndim == 4:
+                pool_head_dim = self.head_size
+            elif self._pool_is_seq_along_lane:
+                pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
+            else:
+                pool_head_dim = kv_cache.shape[-1]
+            # A layer writing its own native page is never padded, even when the
+            # page is wider than head_size (the head_dim=64 page packs K and V along
+            # its last axis). Only a page defined by another spec is padded.
+            native_page = PallasAttentionBackend.get_kv_cache_shape(
+                1, 1, self.num_kv_heads, self.head_size, kv_cache.dtype
+            )[2:]
+            pad_size = kv_page_head_padding(
+                tuple(kv_cache.shape[-3:]), native_page, pool_head_dim, self.head_size
+            )
         if pad_size:
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
@@ -1660,11 +1750,21 @@ class PallasAttentionBackendImpl(AttentionImpl):
             v_scale_value = layer._v_scale_float
             if k_scale_value == 0.0 or v_scale_value == 0.0:
                 raise ValueError("k_scale_float and v_scale_float must be non-zero")
-            key, quantized_value = quantize_kv(
-                self.kv_cache_quantized_dtype, key, value, k_scale_value, v_scale_value
-            )
-            assert quantized_value is not None
-            value = quantized_value
+            if is_subspace_rpa and not self._pool_is_seq_along_lane:
+                # HEAD_ALONG_SUBLANE stores K_rot as BF16, so only V is quantized.
+                value = static_per_tensor_quantize_tensor(
+                    value, self.kv_cache_quantized_dtype, v_scale_value
+                )
+            else:
+                key, quantized_value = quantize_kv(
+                    self.kv_cache_quantized_dtype,
+                    key,
+                    value,
+                    k_scale_value,
+                    v_scale_value,
+                )
+                assert quantized_value is not None
+                value = quantized_value
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()

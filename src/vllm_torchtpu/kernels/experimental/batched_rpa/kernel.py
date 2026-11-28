@@ -518,61 +518,144 @@ def rpa_body(
     q = q[..., : cfgs.compute_kv_head_dim]
 
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
-    # where bkv_stride ~= num_kv_heads * 2 // kv_packing
-    # to 2x (batch, num_kv_heads, bkv_sz, d)
+    # where bkv_stride ~= num_kv_heads * 2 // kv_packing (or num_kv_heads in
+    # Subspace-RPA mode, plus optional bank-conflict pad) to 2x
+    # (batch, num_kv_heads, bkv_sz, d) (with K's last dim = rot_dim in
+    # Subspace-RPA mode).
     # We use strided_load to avoid the expensive transpose.
     k_b = []
     v_b = []
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
-        token = (
-            lax.broadcasted_iota(jnp.int32, (pack_dim, cfgs.bkv_sz), 1)
+        if cfgs.serve.subspace_k_rot_dim is not None:
+            rot_dim = cfgs.serve.subspace_k_rot_dim
+            token_v = (
+                lax.broadcasted_iota(
+                    jnp.int32, (cfgs.compute_kv_head_dim, cfgs.bkv_sz), 1
+                )
+                if cfgs.serve.mask_invalid_v
+                else None
+            )
+            for b_idx in range(cfgs.batch_size):
+                valid_v = (
+                    _compute_valid_kv_mask(token_v, b_idx, stitch_meta, step_meta)
+                    if token_v is not None
+                    else None
+                )
+                ks = []
+                vs = []
+                for kv_head in range(cfgs.model.num_kv_heads):
+                    kv_slice = (
+                        kv_in_vref.at[b_idx, kv_head]
+                        .bitcast(jnp.uint32)
+                        .reshape(-1, cfgs.kv_vmem_lanes)
+                    )
+                    kv_u32 = utils.strided_load(kv_slice, 0, pack_dim, 1)
+                    kv_loaded = pltpu.bitcast(kv_u32, cfgs.serve.dtype_kv)[
+                        :, : cfgs.bkv_sz
+                    ].reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz)
+                    k_head = kv_loaded[:rot_dim, :]
+                    v_head = kv_loaded[rot_dim : rot_dim + cfgs.compute_kv_head_dim, :]
+                    if valid_v is not None:
+                        v_head = jnp.where(valid_v, v_head, jnp.zeros_like(v_head))
+                    ks.append(k_head)
+                    vs.append(v_head)
+                k_b.append(jnp.stack(ks, axis=0))
+                v_b.append(jnp.stack(vs, axis=0))
+        else:
+            token = (
+                lax.broadcasted_iota(jnp.int32, (pack_dim, cfgs.bkv_sz), 1)
+                if cfgs.serve.mask_invalid_v
+                else None
+            )
+            for b_idx in range(cfgs.batch_size):
+                valid = (
+                    _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                    if token is not None
+                    else None
+                )
+                ks = []
+                vs = []
+                for kv_head in range(cfgs.model.num_kv_heads):
+                    k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
+                    v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
+
+                    target_shape = (-1, cfgs.kv_vmem_lanes)
+                    k_head_ref = k_slice.reshape(target_shape)
+                    v_head_ref = v_slice.reshape(target_shape)
+
+                    # Load as uint32 to avoid dtype conversion during strided load
+                    k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
+                    v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+                    if valid is not None:
+                        # HND packs channels of one token together. Mask the words
+                        # before unpacking, including any co-located V scale channels.
+                        v_head_u32 = jnp.where(
+                            valid,
+                            v_head_u32[:, : cfgs.bkv_sz],
+                            jnp.zeros_like(v_head_u32[:, : cfgs.bkv_sz]),
+                        )
+
+                    if cfgs.serve.dtype_kv == jnp.uint8:
+                        fp4 = jnp.float4_e2m1fn
+                        k_head = pltpu.bitcast(k_head_u32, fp4)[:, : cfgs.bkv_sz]
+                        v_head = pltpu.bitcast(v_head_u32, fp4)[:, : cfgs.bkv_sz]
+                        ks.append(k_head)
+                        vs.append(v_head)
+                    else:
+                        k_head_loaded = pltpu.bitcast(k_head_u32, cfgs.serve.dtype_kv)
+                        v_head_loaded = pltpu.bitcast(v_head_u32, cfgs.serve.dtype_kv)
+                        k_head = k_head_loaded[:, : cfgs.bkv_sz]
+                        v_head = v_head_loaded[:, : cfgs.bkv_sz]
+                        ks.append(k_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
+                        vs.append(v_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
+
+                k_b.append(jnp.stack(ks, axis=0))
+                v_b.append(jnp.stack(vs, axis=0))
+    elif cfgs.serve.subspace_k_rot_dim is not None:
+        rot_dim = cfgs.serve.subspace_k_rot_dim
+        token_v = (
+            lax.broadcasted_iota(jnp.int32, (cfgs.bkv_sz, cfgs.compute_kv_head_dim), 0)
             if cfgs.serve.mask_invalid_v
             else None
         )
         for b_idx in range(cfgs.batch_size):
-            valid = (
-                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
-                if token is not None
+            valid_v = (
+                _compute_valid_kv_mask(token_v, b_idx, stitch_meta, step_meta)
+                if token_v is not None
                 else None
+            )
+            kv_u32_ref = pltpu.annotate(
+                kv_in_vref.at[b_idx]
+                .bitcast(jnp.uint32)
+                .reshape(-1, cfgs.aligned_kv_head_dim),
+                no_hazard_no_deps=True,
             )
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
-                k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
-                v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
-
-                target_shape = (-1, cfgs.kv_vmem_lanes)
-                k_head_ref = k_slice.reshape(target_shape)
-                v_head_ref = v_slice.reshape(target_shape)
-
-                # Load as uint32 to avoid dtype conversion during strided load
-                k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
-                v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
-                if valid is not None:
-                    # HND packs channels of one token together. Mask the words
-                    # before unpacking, including any co-located V scale channels.
-                    v_head_u32 = jnp.where(
-                        valid,
-                        v_head_u32[:, : cfgs.bkv_sz],
-                        jnp.zeros_like(v_head_u32[:, : cfgs.bkv_sz]),
-                    )
-
-                if cfgs.serve.dtype_kv == jnp.uint8:
-                    fp4 = jnp.float4_e2m1fn
-                    k_head = pltpu.bitcast(k_head_u32, fp4)[:, : cfgs.bkv_sz]
-                    v_head = pltpu.bitcast(v_head_u32, fp4)[:, : cfgs.bkv_sz]
-                    ks.append(k_head)
-                    vs.append(v_head)
-                else:
-                    k_head_loaded = pltpu.bitcast(k_head_u32, cfgs.serve.dtype_kv)
-                    v_head_loaded = pltpu.bitcast(v_head_u32, cfgs.serve.dtype_kv)
-                    k_head = k_head_loaded[:, : cfgs.bkv_sz]
-                    v_head = v_head_loaded[:, : cfgs.bkv_sz]
-                    ks.append(k_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
-                    vs.append(v_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
-
+                kv_u32 = utils.strided_load(
+                    kv_u32_ref,
+                    kv_head,
+                    cfgs.bkv_sz * cfgs.bkv_stride,
+                    cfgs.bkv_stride,
+                )
+                [(v0, v1)] = utils.convert_to_target_bitwidth(
+                    kv_u32.astype(jnp.uint16),
+                    target_bitwidth=8,
+                    kv_dtype=cfgs.serve.dtype_kv,
+                )
+                v_head = jnp.concatenate([v0, v1], axis=-1)[
+                    :, : cfgs.compute_kv_head_dim
+                ]
+                if valid_v is not None:
+                    v_head = jnp.where(valid_v, v_head, jnp.zeros_like(v_head))
+                k_head = pltpu.bitcast((kv_u32 >> 16).astype(jnp.uint16), jnp.bfloat16)[
+                    :, :rot_dim
+                ]
+                ks.append(k_head)
+                vs.append(v_head)
             k_b.append(jnp.stack(ks, axis=0))
             v_b.append(jnp.stack(vs, axis=0))
     else:
@@ -655,6 +738,8 @@ def rpa_body(
                 cfgs=cfgs,
                 bq_start=bq_start,
                 k_scale=k_scale,
+                v=v,
+                v_scale=v_scale,
             )
         )
         m_scratch_ref[:, q_slice] = m_carry
@@ -799,6 +884,8 @@ def create_allocs(
 def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     serve = cfgs.serve
     name = f"RPA{cfgs.mode.symbol}-{serve.kv_layout.symbol}-p{serve.page_size}"
+    if serve.subspace_k_rot_dim is not None:
+        name += f"-sub{serve.subspace_k_rot_dim}"
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"

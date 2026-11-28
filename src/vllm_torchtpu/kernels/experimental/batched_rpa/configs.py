@@ -148,6 +148,96 @@ NUM_INPUT_SLOTS = 3
 NUM_OUTPUT_SLOTS = 2
 
 
+def get_subspace_aligned_kv_head_dim(
+    head_dim: int,
+    subspace_k_rot_dim: int,
+    kv_layout: KVLayout,
+    kv_packing: int,
+    num_lanes: int,
+    num_sublanes: int,
+) -> int:
+    """Aligned KV head dim for Subspace-RPA (one packed slot per KV head)."""
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        return utils.align_to(subspace_k_rot_dim + head_dim, num_sublanes * kv_packing)
+    return utils.align_to(
+        pl.cdiv(head_dim + 2 * subspace_k_rot_dim, kv_packing),
+        num_lanes,
+    )
+
+
+def validate_subspace_rpa_config(
+    *,
+    subspace_k_rot_dim: int,
+    dtype_kv: jax.typing.DTypeLike,
+    kv_layout: KVLayout,
+    per_token_scale: bool | None = None,
+    scale_q: int | float | None = None,
+    cp_group_size: int | None = None,
+    head_dim: int | None = None,
+    num_lanes: int | None = None,
+    num_sublanes: int | None = None,
+) -> None:
+    """Raise NotImplementedError for unsupported Subspace-RPA configurations."""
+    if subspace_k_rot_dim <= 0:
+        raise NotImplementedError(
+            f"Subspace-RPA requires subspace_k_rot_dim > 0, got {subspace_k_rot_dim=}."
+        )
+    kv_dtype = jnp.dtype(dtype_kv)
+    if not (
+        jnp.issubdtype(kv_dtype, jnp.floating) and utils.get_dtype_bits(kv_dtype) == 8
+    ):
+        raise NotImplementedError(
+            "Subspace-RPA requires an 8-bit floating KV cache dtype, "
+            f"got dtype_kv={kv_dtype}."
+        )
+    if per_token_scale:
+        raise NotImplementedError(
+            f"Subspace-RPA does not support per_token_scale={per_token_scale}."
+        )
+    if scale_q is not None:
+        raise NotImplementedError(
+            f"Subspace-RPA does not support quantized queries ({scale_q=})."
+        )
+    if cp_group_size is not None:
+        raise NotImplementedError(
+            f"Subspace-RPA does not support context parallelism ({cp_group_size=})."
+        )
+    if num_lanes is not None and subspace_k_rot_dim % num_lanes != 0:
+        raise NotImplementedError(
+            f"Subspace-RPA requires subspace_k_rot_dim aligned to {num_lanes=}, "
+            f"got {subspace_k_rot_dim=}."
+        )
+    if head_dim is not None:
+        if subspace_k_rot_dim >= head_dim:
+            raise NotImplementedError(
+                "Subspace-RPA requires subspace_k_rot_dim < head_dim, "
+                f"got {subspace_k_rot_dim=} and {head_dim=}."
+            )
+        if (
+            kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+            and num_lanes is not None
+            and num_sublanes is not None
+        ):
+            kv_packing = utils.get_dtype_packing(kv_dtype)
+            aligned_dim = get_subspace_aligned_kv_head_dim(
+                head_dim,
+                subspace_k_rot_dim,
+                kv_layout,
+                kv_packing,
+                num_lanes,
+                num_sublanes,
+            )
+            compute_head_dim = utils.align_to(head_dim, num_lanes)
+            if compute_head_dim > 2 * aligned_dim or subspace_k_rot_dim > aligned_dim:
+                raise NotImplementedError(
+                    "HEAD_ALONG_SUBLANE Subspace-RPA requires "
+                    "compute_head_dim <= 2 * aligned_kv_head_dim and "
+                    "subspace_k_rot_dim <= aligned_kv_head_dim, got "
+                    f"{head_dim=}, {subspace_k_rot_dim=}, "
+                    f"aligned_kv_head_dim={aligned_dim}."
+                )
+
+
 @dataclasses.dataclass(frozen=True)
 class ServingConfigs:
     """Serving config that can change depending on use cases."""
@@ -174,6 +264,7 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    subspace_k_rot_dim: int | None = None
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -181,6 +272,15 @@ class ServingConfigs:
                 self,
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
+            )
+        if self.subspace_k_rot_dim is not None:
+            validate_subspace_rpa_config(
+                subspace_k_rot_dim=self.subspace_k_rot_dim,
+                dtype_kv=self.dtype_kv,
+                kv_layout=self.kv_layout,
+                per_token_scale=self.per_token_scale,
+                scale_q=self.scale_q,
+                cp_group_size=self.cp_group_size,
             )
 
     @property
@@ -342,7 +442,10 @@ class RpaConfigs:
 
     @property
     def bkv_stride(self) -> int:
-        bkv_stride = pl.cdiv(self.model.num_kv_heads * 2, self.serve.packing_kv)
+        if self.serve.subspace_k_rot_dim is not None:
+            bkv_stride = self.model.num_kv_heads
+        else:
+            bkv_stride = pl.cdiv(self.model.num_kv_heads * 2, self.serve.packing_kv)
 
         if utils.has_bank_conflicts(bkv_stride):
             bkv_stride += 1
@@ -371,6 +474,16 @@ class RpaConfigs:
         num_sublanes = pltpu.get_tpu_info().num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
 
+        if self.serve.subspace_k_rot_dim is not None:
+            return get_subspace_aligned_kv_head_dim(
+                self.model.head_dim,
+                self.serve.subspace_k_rot_dim,
+                self.serve.kv_layout,
+                kv_packing,
+                num_lanes,
+                num_sublanes,
+            )
+
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             total_head_dim = self.model.head_dim
             if self.serve.dtype_kv == jnp.uint8:
@@ -386,6 +499,10 @@ class RpaConfigs:
 
     @property
     def aligned_num_kv_heads_x2(self) -> int:
+        if self.serve.subspace_k_rot_dim is not None:
+            if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+                return self.model.num_kv_heads
+            return self.model.num_kv_heads * self.serve.packing_kv
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         packing_kv = self.serve.packing_kv
@@ -398,6 +515,8 @@ class RpaConfigs:
 
     @property
     def kv_hbm_stride(self) -> int:
+        if self.serve.subspace_k_rot_dim is not None:
+            return self.model.num_kv_heads
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
@@ -410,7 +529,7 @@ class RpaConfigs:
     @property
     def kv_bytes_per_token(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
+            num_elements = self.kv_hbm_stride * self.aligned_kv_head_dim
         else:
             num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
         # Calculate byte size using bits to account for subbyte dtypes like fp4.
@@ -483,7 +602,7 @@ class RpaConfigs:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
                 self.block.batch_size,
-                self.model.num_kv_heads * 2,
+                self.kv_hbm_stride,
                 self.aligned_kv_head_dim // self.serve.packing_kv,
                 self.serve.packing_kv,
                 self.kv_vmem_lanes,
@@ -559,8 +678,6 @@ class RpaConfigs:
             raise ValueError(
                 f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}"
             )
-        if k.shape != v.shape:
-            raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
         if not (q.shape[0] == k.shape[0] == v.shape[0]):
             raise ValueError(
                 "Expected number of sequences in Q, K, and V to be the same, but got"
@@ -570,13 +687,40 @@ class RpaConfigs:
         if self.serve.dtype_kv == jnp.uint8:
             expected_kv_head_dim = q.shape[2] // 2
 
-        if not (k.shape[2] == v.shape[2] == expected_kv_head_dim):
-            raise ValueError(
-                "Expected number of head dimensions in K and V to be"
-                f" {expected_kv_head_dim} (matching Q shape {q.shape[2]} with"
-                f" packing for {self.serve.dtype_kv}), but got {k.shape[2]=} and"
-                f" {v.shape[2]=}"
+        if self.serve.subspace_k_rot_dim is not None:
+            tpu_info = pltpu.get_tpu_info()
+            validate_subspace_rpa_config(
+                subspace_k_rot_dim=self.serve.subspace_k_rot_dim,
+                dtype_kv=self.serve.dtype_kv,
+                kv_layout=self.serve.kv_layout,
+                per_token_scale=self.serve.per_token_scale,
+                scale_q=self.serve.scale_q,
+                cp_group_size=self.serve.cp_group_size,
+                head_dim=self.model.head_dim,
+                num_lanes=tpu_info.num_lanes,
+                num_sublanes=tpu_info.num_sublanes,
             )
+            exp_k = (
+                q.shape[0],
+                self.model.num_kv_heads,
+                self.serve.subspace_k_rot_dim,
+            )
+            exp_v = (q.shape[0], self.model.num_kv_heads, expected_kv_head_dim)
+            if k.shape != exp_k or v.shape != exp_v:
+                raise ValueError(
+                    f"Subspace-RPA expected k={exp_k} and v={exp_v}, "
+                    f"got {k.shape=}, {v.shape=}"
+                )
+        else:
+            if k.shape != v.shape:
+                raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
+            if not (k.shape[2] == v.shape[2] == expected_kv_head_dim):
+                raise ValueError(
+                    "Expected number of head dimensions in K and V to be"
+                    f" {expected_kv_head_dim} (matching Q shape {q.shape[2]} with"
+                    f" packing for {self.serve.dtype_kv}), but got {k.shape[2]=} and"
+                    f" {v.shape[2]=}"
+                )
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             if self.serve.page_size % 128 != 0:
@@ -586,7 +730,7 @@ class RpaConfigs:
                 )
             expected_kv_cache_shape = (
                 kv_cache.shape[0],
-                self.model.num_kv_heads * 2,
+                self.kv_hbm_stride,
                 self.aligned_kv_head_dim // self.serve.packing_kv,
                 self.serve.packing_kv,
                 self.serve.page_size,
@@ -595,7 +739,7 @@ class RpaConfigs:
             expected_kv_cache_shape = (
                 kv_cache.shape[0],
                 self.serve.page_size,
-                self.aligned_num_kv_heads_x2 // self.serve.packing_kv,
+                self.kv_hbm_stride,
                 self.serve.packing_kv,
                 self.aligned_kv_head_dim,
             )
