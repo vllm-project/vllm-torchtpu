@@ -30,7 +30,7 @@ from vllm_torchtpu.layers.adapter.quantization.fp8 import (
 )
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmDeepseekV4Mxfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-    VllmUnquantizedFusedMoEMethod,
+    VllmUnquantizedConfig,
 )
 from vllm_torchtpu.layers.core.quant_methods import (
     DEEPSEEK_V4_FP8,
@@ -76,17 +76,13 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
         prefix: str,
     ) -> vllm_linear.LinearMethodBase | QuantizeMethodBase | None:
         if isinstance(layer, vllm_linear.LinearBase):
-            linear_config = self.get_linear_config(layer)
             if is_layer_skipped(
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
-                from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedLinearMethod,
-                )
-
-                return VllmUnquantizedLinearMethod()
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
+            linear_config = self.get_linear_config(layer)
             return VllmFp8LinearMethodTPU(self, linear_config, prefix=prefix)
         elif isinstance(layer, RoutedExperts):
             if is_layer_skipped(
@@ -94,7 +90,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
-                return VllmUnquantizedFusedMoEMethod(layer.moe_config)
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
 
             if self.expert_dtype == "fp4":
                 if self.moe_quant_algo == "NVFP4":
