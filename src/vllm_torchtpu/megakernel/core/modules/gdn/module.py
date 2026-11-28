@@ -74,6 +74,13 @@ from .states import (
 )
 
 
+def _geom_gate(geom: Any) -> Any:
+    if geom is None:
+        return None
+    g_gate = getattr(geom, "gdn_gate", None)
+    return g_gate if g_gate is not None else getattr(geom, "gate", None)
+
+
 class GDNModule(Module):
     """GatedDeltaNet module supporting decode (`T=1`), verify (`T>1`), and `GCH`."""
 
@@ -100,7 +107,7 @@ class GDNModule(Module):
         self.geometry = geometry
         self.prefix = prefix
         self._explicit_gate = None if gate is None else validate_gdn_gate(gate)
-        g_gate = getattr(geometry, "gdn_gate", getattr(geometry, "gate", None))
+        g_gate = _geom_gate(geometry)
         self.gate = (
             self._explicit_gate
             if self._explicit_gate is not None
@@ -110,10 +117,11 @@ class GDNModule(Module):
             weight_dtypes, GDN_WEIGHT_NAMES, "GDNModule", MegakernelConfigError
         )
         opts: dict[str, Any] = {}
-        if self._explicit_gate is not None or g_gate is not None:
+        if self._explicit_gate is not None or self.gate != "silu":
             opts["gate"] = self.gate
         if weight_dtypes is not None:
             opts["weight_dtypes"] = self.weight_dtypes
+        self._validate_options(opts)  # kept to match GQAModule
         self.options = FrozenDict(opts)
 
     @classmethod
@@ -127,8 +135,7 @@ class GDNModule(Module):
     def _effective_gate(self, g: Any = None) -> str:
         if self._explicit_gate is not None:
             return self._explicit_gate
-        geom = g if g is not None else self.geometry
-        g_gate = getattr(geom, "gdn_gate", getattr(geom, "gate", None))
+        g_gate = _geom_gate(g if g is not None else self.geometry)
         return validate_gdn_gate(g_gate) if g_gate is not None else self.gate
 
     def conv_dtype(self, g: Any) -> Any:

@@ -163,6 +163,10 @@ def resolve_gdn_binding(
     gate = validate_gdn_gate(raw_gate)
     if gate != "silu" or "gate" in opts:
         opts["gate"] = gate
+    if "weight_dtypes" in opts:
+        opts["weight_dtypes"] = normalize_weight_dtypes(
+            opts["weight_dtypes"], GDN_WEIGHT_NAMES, "GDNModule", MegakernelConfigError
+        )
     vals.update(
         {
             "H": int(vals["hidden"]),
