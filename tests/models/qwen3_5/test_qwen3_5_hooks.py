@@ -18,6 +18,8 @@ from __future__ import annotations
 import copy
 import json
 import pathlib
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +48,42 @@ def restore_config_map():
     yield
     MODELS_CONFIG_MAP.clear()
     MODELS_CONFIG_MAP.update(saved)
+
+
+_REGISTERED = (
+    "from vllm.model_executor.models.config import MODELS_CONFIG_MAP; "
+    "from vllm_torchtpu.models.qwen3_5.hooks import TPUQwen35MoeConfig; "
+    f"assert MODELS_CONFIG_MAP[{QWEN35!r}] is TPUQwen35MoeConfig"
+)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        # The hook module alone, first: its top-level import of the attention
+        # adapter loads vllm_torchtpu.layers before vllm.platforms.
+        "import vllm_torchtpu.models.qwen3_5.hooks",
+        # The platform module first, then the hook.
+        "import vllm_torchtpu.platforms.tpu_platform; "
+        "import vllm_torchtpu.models.qwen3_5.hooks",
+        # vLLM's start-up: the platform plugin resolves, then the general
+        # plugins load; their entry point (vllm_torchtpu.layers:
+        # register_layers) imports the hook through register_models.
+        "from vllm.platforms import current_platform; "
+        "assert type(current_platform).__name__ == 'TpuPlatform'; "
+        "from vllm.plugins import load_general_plugins; "
+        f"load_general_plugins(); {_REGISTERED}",
+    ],
+    ids=["hook_first", "platform_then_hook", "plugin_start_up"],
+)
+def test_the_hook_imports_without_a_cycle(code):
+    """The platform imports the attention adapter only inside its methods, to
+    avoid an import cycle with vllm.platforms; the hook imports it at module
+    top, so each order runs in a fresh interpreter."""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
 
 
 def test_hook_is_registered_for_qwen3_5_only(restore_config_map):
