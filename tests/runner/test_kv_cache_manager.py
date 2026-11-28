@@ -18,6 +18,7 @@ they cover; see vllm-project/vllm-torchtpu#713.
 """
 
 import dataclasses
+import math
 import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -64,6 +65,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     RunLocalStateSpec,
 )
+from vllm_torchtpu.layers.adapter.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
@@ -3296,3 +3298,303 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
     kv_cache_specs = KVCacheManager(stub).get_kv_cache_spec()
     assert kv_cache_specs["target.0"].is_draft is False
     assert kv_cache_specs["draft.0"].is_draft is True
+
+
+@pytest.fixture
+def owned_runner():
+    """A CPU runner mock for the `TpuOwnedKVCache` tests."""
+    with patch.object(
+        TpuPlatform, "_find_non_ssm_backend", return_value=PallasAttentionBackend
+    ):
+        yield _build_mock_cpu_runner()
+
+
+def _owned_cache(spec, shape=None):
+    """A `TpuOwnedKVCache` that declares `spec` and, if given, owns
+    `shape[1:]` per block."""
+
+    class _OwnedCache(TpuOwnedKVCache):
+        def get_kv_cache_spec(self, vllm_config):
+            return spec
+
+        def kv_cache_shape(self, num_blocks):
+            return None if shape is None else (num_blocks, *shape[1:])
+
+        def get_attn_backend(self):
+            return PallasMLAttentionBackend
+
+    return _OwnedCache()
+
+
+_GET_LAYERS = "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config"
+
+
+@patch(_GET_LAYERS)
+def test_get_kv_cache_spec_takes_owned_cache_spec(mock_get_layers, owned_runner):
+    spec = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    mock_get_layers.return_value = {"layer.0.index_cache": _owned_cache(spec)}
+
+    out = owned_runner.get_kv_cache_spec()["layer.0.index_cache"]
+
+    assert isinstance(out, MLAAttentionSpec)
+    assert (out.block_size, out.head_size) == (16, 128)
+    assert out.dtype == torch.bfloat16
+
+
+@patch(_GET_LAYERS)
+def test_owned_cache_shape_keeps_its_exact_spec(mock_get_layers, owned_runner):
+    # float32 on a bf16 runner: normalization would retype it.
+    spec = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.float32
+    )
+    mock_get_layers.return_value = {
+        "layer.0.index_cache": _owned_cache(spec, (1, 16, 128))
+    }
+
+    out = owned_runner.get_kv_cache_spec()["layer.0.index_cache"]
+
+    # Exempt from normalization: the spec comes back exactly as declared.
+    assert out == spec
+
+
+@pytest.mark.parametrize(
+    ("spec_cls", "shape", "match"),
+    [
+        (MLAAttentionSpec, (1, 32, 128), "bytes"),
+        (FullAttentionSpec, (1, 16, 128), "MLAAttentionSpec"),
+        (MLAAttentionSpec, (16 * 128,), "block axis first"),
+        (MLAAttentionSpec, (2, 8, 128), "block axis first"),
+    ],
+)
+@patch(_GET_LAYERS)
+def test_owned_cache_shape_is_validated(
+    mock_get_layers, owned_runner, spec_cls, shape, match
+):
+    spec = spec_cls(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+    owned = _owned_cache(spec)
+    # Return the shape as is, to test a wrong leading dimension.
+    owned.kv_cache_shape = lambda num_blocks: shape
+    mock_get_layers.return_value = {"layer.0.index_cache": owned}
+
+    with pytest.raises(ValueError, match=match):
+        owned_runner.get_kv_cache_spec()
+
+
+@patch(_GET_LAYERS)
+def test_owned_integer_mla_spec_needs_a_shape(mock_get_layers, owned_runner):
+    """An owned uint8 MLA spec without kv_cache_shape() is rejected: the
+    normalizer would budget it with the DSA indexer backend while the
+    allocator uses the MLA backend."""
+    spec = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.uint8
+    )
+    mock_get_layers.return_value = {"layer.0.index_cache": _owned_cache(spec)}
+
+    with pytest.raises(ValueError, match="needs kv_cache_shape"):
+        owned_runner.get_kv_cache_spec()
+
+
+@patch(_GET_LAYERS)
+def test_owned_cache_rejects_mamba_layers(mock_get_layers, owned_runner):
+    """Mamba page padding and the attention budget check count only vLLM
+    attention pages, so an owned cache next to Mamba layers is rejected."""
+    spec = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    mamba = MagicMock(spec=DummyMamba)
+    mock_get_layers.return_value = {
+        "layer.0.index_cache": _owned_cache(spec, (1, 16, 128)),
+        "layer.1.mamba": mamba,
+    }
+
+    with pytest.raises(NotImplementedError, match="Mamba layers"):
+        owned_runner.get_kv_cache_spec()
+
+
+@patch(_GET_LAYERS)
+def test_owned_groups_are_checked_on_normalized_specs(mock_get_layers, owned_runner):
+    """A layer without a shape whose spec becomes equal to an owned spec only
+    after normalization (float32 retyped to the bf16 runner dtype) would
+    share the owned layer's group with another shape."""
+    declared = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.float32
+    )
+    # The owned spec declares the values normalization gives `declared`.
+    owned = dataclasses.replace(
+        declared,
+        dtype=torch.bfloat16,
+        page_size_padded=16 * 128 * 2,
+        num_head_slots=1,
+        state_content_bytes=128 * 2,
+    )
+    mock_get_layers.return_value = {
+        "layer.0.index_cache": _owned_cache(owned, (1, 16, 128)),
+        "layer.1.index_cache": _owned_cache(declared),
+    }
+
+    with pytest.raises(ValueError, match="same shape"):
+        owned_runner.get_kv_cache_spec()
+
+
+@patch("vllm_torchtpu.utils.tpu_bind_kv_cache")
+@patch(
+    "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+    return_value=False,
+)
+@patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
+def test_initialize_kv_cache_allocates_owned_shape(
+    mock_input_batch, mock_has_kv_transfer, mock_bind_kv_cache, owned_runner
+):
+    """The owned layer's cache tensor has kv_cache_shape(num_blocks), not
+    the MLA backend's shape for its spec."""
+    runner = owned_runner
+    spec = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.uint8
+    )
+    page = spec.page_size_bytes
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=page * 100,
+                layers=["layer.0.index_cache"],
+                layer_stride=page * 100,
+                block_stride=page,
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["layer.0.index_cache"], kv_cache_spec=spec)
+        ],
+    )
+    runner.vllm_config.compilation_config.static_forward_context = {
+        "layer.0.index_cache": _owned_cache(spec, (1, 16, 64))
+    }
+    runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+    runner.kv_caches = []
+    mock_bt = MagicMock()
+    mock_bt.max_num_blocks_per_req = 1
+    mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1), dtype=torch.int32)
+    mock_input_batch.return_value.block_table = [mock_bt]
+    runner.input_batch = mock_input_batch.return_value
+
+    runner.initialize_kv_cache(kv_cache_config)
+
+    cache = mock_bind_kv_cache.call_args[0][0]["layer.0.index_cache"]
+    assert tuple(cache.shape) == (100, 16, 64)
+    assert cache.dtype == torch.uint8
+
+
+def _pad_owned_regions(groups, owned_block_shapes):
+    """`_pad_native_attention_regions` on `groups` ((layer names, spec) pairs)
+    with the pool unshareable, so every group's native geometry is budgeted."""
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+
+    manager = object.__new__(KVCacheManager)
+    manager.runner = SimpleNamespace(vllm_config=None)
+    specs = {name: spec for names, spec in groups for name in names}
+    kv_groups = [KVCacheGroupSpec(list(names), spec) for names, spec in groups]
+    with (
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.can_share_attention_cache",
+            return_value=False,
+        ),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_kv_cache_groups",
+            return_value=kv_groups,
+        ),
+    ):
+        return manager._pad_native_attention_regions(
+            specs, PallasAttentionBackend, owned_block_shapes
+        )
+
+
+def test_owned_cache_shape_is_budgeted_as_allocated():
+    """A model-owned cache's region is budgeted from its own shape, not from
+    the MLA backend's shape for its spec (which pads a 64-wide uint8 row to
+    128 lanes, twice the bytes the owned cache allocates)."""
+    owned = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.uint8
+    )
+    mla = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+    )
+    owned_shape = (1, 16, 64)  # one block = the spec's page, 1024 bytes
+    groups = [(["layer.0.index_cache"], owned), (["layer.0.attn"], mla)]
+    mla_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+        1, mla.block_size, mla.num_kv_heads, mla.head_size, mla.dtype
+    )
+    mla_bytes = math.prod(mla_shape) * mla.dtype.itemsize
+    backend_owned_bytes = math.prod(
+        PallasMLAttentionBackend.get_kv_cache_shape(1, 16, 1, 64, torch.uint8)
+    )
+    assert backend_owned_bytes != owned.page_size_bytes  # the test discriminates
+
+    out = _pad_owned_regions(groups, {"layer.0.index_cache": owned_shape})
+    assert {spec.page_size_padded for spec in out.values()} == {
+        owned.page_size_bytes + mla_bytes
+    }
+    unowned = _pad_owned_regions(groups, {})
+    assert {spec.page_size_padded for spec in unowned.values()} == {
+        backend_owned_bytes + mla_bytes
+    }
+
+
+@pytest.mark.parametrize(
+    "owned_block_shapes",
+    [
+        {"layer.0.index_cache": (1, 16, 128)},  # one layer of the group not owned
+        {"layer.0.index_cache": (1, 16, 128), "layer.1.index_cache": (1, 8, 256)},
+    ],
+)
+def test_owned_cache_shapes_must_be_uniform_per_group(owned_block_shapes):
+    owned = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    mla = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="same shape"):
+        _pad_owned_regions(
+            [
+                (["layer.0.index_cache", "layer.1.index_cache"], owned),
+                (["layer.0.attn"], mla),
+            ],
+            owned_block_shapes,
+        )
+
+
+def test_owned_cache_shape_rejects_the_unified_pool():
+    manager = object.__new__(KVCacheManager)
+    manager.runner = SimpleNamespace(_unified_kv_layout=True)
+    spec = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="unified KV block pool"):
+        manager._checked_owned_shape("layer.0.index_cache", spec, (1, 16, 128))
+
+
+@pytest.mark.parametrize(
+    ("owned", "ok"),
+    [
+        ({"a": (1, 16, 64), "b": (1, 16, 64)}, True),
+        ({"a": (1, 16, 64)}, False),  # b has a's spec but owns nothing
+        ({"a": (1, 16, 64), "b": (1, 8, 128)}, False),
+    ],
+)
+def test_owned_shapes_are_uniform_across_equal_specs(owned, ok):
+    """Checked when specs are collected, on every path: layers with equal
+    specs share a group, so they must own the same shape."""
+    spec = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.uint8
+    )
+    other = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+    )
+    specs = {"a": spec, "b": spec, "attn": other}
+    if ok:
+        KVCacheManager._check_owned_groups(specs, owned)
+    else:
+        with pytest.raises(ValueError, match="same shape"):
+            KVCacheManager._check_owned_groups(specs, owned)
