@@ -742,3 +742,150 @@ def test_mirror_rows_per_tile_keeps_128_lanes_above_a_lane_block(tile_m, rows):
 def test_mirror_rows_per_tile_refuses_a_partial_lane_row():
     with pytest.raises(ValueError):
         host.mirror_rows_per_tile(192)
+
+
+@pytest.mark.parametrize(
+    "smem,t_local,topk,fits",
+    [
+        (None, 8192, 10, True),  # 640 KiB <= 992 KiB on TPU v7x (1 MiB SMEM)
+        (None, 12288, 10, True),  # 960 KiB <= 992 KiB
+        (None, 12697, 10, True),  # 1,015,760 B <= 1,015,808 B upper boundary
+        (None, 12698, 10, False),  # 1,015,840 B > 1,015,808 B
+        (None, 16384, 8, False),  # 1,024 KiB > 992 KiB (no headroom left)
+        (None, 16384, 10, False),  # 1,280 KiB > 1 MiB (Qwen3.5 1P1D prefill)
+        (512 * 1024, 4096, 10, True),  # 320 KiB <= 480 KiB on 512 KiB SMEM
+        (512 * 1024, 8192, 10, False),  # 640 KiB > 480 KiB on 512 KiB SMEM
+        (2 * 1024 * 1024, 16384, 10, True),  # 1,280 KiB <= 2,016 KiB on 2 MiB
+    ],
+)
+def test_combine_tables_budget_follows_the_chips_smem(smem, t_local, topk, fits):
+    """Combine scalar-prefetch tables fit the chip's SMEM less the headroom."""
+    if smem is None:
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    else:
+        info = types.SimpleNamespace(smem_capacity_bytes=smem)
+    assert kernel.combine_tables_fit(t_local, topk, info) is fits
+    expected_use = bool(kernel.combine_step_tokens(t_local)) and fits
+    assert kernel.combine_uses_kernel(t_local, topk, info) is expected_use
+
+
+def test_combine_uses_kernel_skips_device_lookup_below_min_tokens(monkeypatch):
+    """Below COMBINE_MIN_TOKENS, combine_uses_kernel short-circuits before TPU info."""
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: (_ for _ in ()).throw(AssertionError("should not query TPU info")),
+    )
+    assert kernel.combine_uses_kernel(8, 10) is False
+
+
+def test_combine_arrivals_dispatches_on_smem_budget(monkeypatch):
+    """_combine_arrivals falls back to XLA when pos+coef exceed SMEM, else kernel."""
+    from vllm_torchtpu.kernels.fused_moe.v2 import layer
+
+    t_local = kernel.COMBINE_MIN_TOKENS
+    topk, lane_blocks, lanes, tile_m = 10, 2, 128, 128
+    hidden = lane_blocks * lanes
+    assert kernel.combine_step_tokens(t_local) == 64
+    assert kernel.combine_prefetch_bytes(t_local, topk) == 20480
+
+    rng = np.random.default_rng(42)
+    recv_rows = 64
+    arrivals_np = rng.uniform(-1.0, 1.0, (recv_rows, lane_blocks, lanes)).astype(
+        np.float32
+    )
+    scales_np = rng.uniform(0.5, 1.5, (2, tile_m)).astype(np.float32)
+    pos_np = rng.integers(0, recv_rows, (t_local, topk), dtype=np.int32)
+    mirror_pos_np = rng.integers(0, 2 * tile_m, (t_local, topk), dtype=np.int32)
+    weights_np = rng.uniform(0.05, 0.25, (t_local, topk)).astype(np.float32)
+
+    row_scales = scales_np[mirror_pos_np // tile_m, mirror_pos_np % tile_m]
+    coef_np = row_scales * weights_np
+    expected = (
+        (arrivals_np[pos_np] * coef_np[:, :, None, None])
+        .sum(axis=1)
+        .reshape(t_local, hidden)
+    )
+
+    args = (
+        jnp.asarray(arrivals_np),
+        jnp.asarray(scales_np),
+        jnp.asarray(pos_np),
+        jnp.asarray(mirror_pos_np),
+        jnp.asarray(weights_np),
+        jnp.bfloat16,
+    )
+
+    # Small SMEM (48 KiB -> 16 KiB budget < 20 KiB tables): must skip kernel
+    # and match the weighted sum via the XLA gather epilogue.
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: types.SimpleNamespace(smem_capacity_bytes=48 * 1024),
+    )
+
+    def _fail_if_built(**kwargs):
+        raise AssertionError(
+            f"build_combine_kernel should not be called when over SMEM: {kwargs}"
+        )
+
+    monkeypatch.setattr(layer, "build_combine_kernel", _fail_if_built)
+    got = layer._combine_arrivals(*args)
+    assert got.shape == (t_local, hidden)
+    assert got.dtype == jnp.bfloat16
+    np.testing.assert_allclose(
+        np.asarray(got, dtype=np.float32), expected, rtol=1e-2, atol=1e-2
+    )
+
+    # Real TPU v7x SMEM (1 MiB -> 992 KiB budget >= 20 KiB tables): must select
+    # build_combine_kernel with the exact shape and dtype arguments.
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    recorded = {}
+    sentinel = jnp.full((t_local, hidden), 7.0, dtype=jnp.bfloat16)
+
+    def _fake_builder(**kwargs):
+        recorded["kwargs"] = kwargs
+        return lambda arrivals, coef, rows: sentinel
+
+    monkeypatch.setattr(layer, "build_combine_kernel", _fake_builder)
+    got_kernel = layer._combine_arrivals(*args)
+    assert got_kernel is sentinel
+    assert recorded["kwargs"] == {
+        "t_local": t_local,
+        "topk": topk,
+        "hidden": hidden,
+        "lane_blocks": lane_blocks,
+        "wire_dtype": jnp.float32,
+        "out_dtype": jnp.bfloat16,
+    }
+
+
+def test_build_combine_kernel_rejects_oversized_smem_and_unaligned_tokens(monkeypatch):
+    """Direct calls to _build_combine_kernel raise ValueError instead of OOMing."""
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    with pytest.raises(ValueError, match=r"1310720 bytes.*1015808-byte SMEM budget"):
+        kernel._build_combine_kernel(
+            t_local=16384,
+            topk=10,
+            hidden=256,
+            lane_blocks=2,
+            wire_dtype=jnp.bfloat16,
+            out_dtype=jnp.bfloat16,
+        )
+    with pytest.raises(ValueError, match=r"t_local=8"):
+        kernel._build_combine_kernel(
+            t_local=8,
+            topk=10,
+            hidden=256,
+            lane_blocks=2,
+            wire_dtype=jnp.bfloat16,
+            out_dtype=jnp.bfloat16,
+        )

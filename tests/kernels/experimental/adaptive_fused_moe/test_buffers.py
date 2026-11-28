@@ -14,11 +14,16 @@
 """Host checks for choosing asymmetric weight buffers within VMEM."""
 
 import dataclasses
+import types
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host, layer
+from vllm_torchtpu.kernels.fused_moe.v2 import kernel as v2_kernel
 
 
 @pytest.mark.parametrize(
@@ -68,3 +73,82 @@ def test_budget_boundary_falls_back_and_rejects_when_minimum_does_not_fit(monkey
     assert host.select_weight_buffers(**shape, info=tight).w1_nbuf == 2
     with pytest.raises(ValueError, match="minimum W1/W2=2/1"):
         host.select_weight_buffers(**shape, info=exhausted)
+
+
+def test_adaptive_combine_arrivals_dispatches_on_smem_budget(monkeypatch):
+    """adaptive_fused_moe._combine_arrivals uses the shared SMEM budget gate."""
+    t_local = v2_kernel.COMBINE_MIN_TOKENS
+    topk, lane_blocks, lanes, tile_m = 10, 2, 128, 128
+    hidden = lane_blocks * lanes
+
+    rng = np.random.default_rng(7)
+    recv_rows = 64
+    arrivals_np = rng.uniform(-1.0, 1.0, (recv_rows, lane_blocks, lanes)).astype(
+        np.float32
+    )
+    scales_np = rng.uniform(0.5, 1.5, (2, tile_m)).astype(np.float32)
+    pos_np = rng.integers(0, recv_rows, (t_local, topk), dtype=np.int32)
+    mirror_pos_np = rng.integers(0, 2 * tile_m, (t_local, topk), dtype=np.int32)
+    weights_np = rng.uniform(0.05, 0.25, (t_local, topk)).astype(np.float32)
+
+    row_scales = scales_np[mirror_pos_np // tile_m, mirror_pos_np % tile_m]
+    coef_np = row_scales * weights_np
+    expected = (
+        (arrivals_np[pos_np] * coef_np[:, :, None, None])
+        .sum(axis=1)
+        .reshape(t_local, hidden)
+    )
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        args = (
+            jnp.asarray(arrivals_np),
+            jnp.asarray(scales_np),
+            jnp.asarray(pos_np),
+            jnp.asarray(mirror_pos_np),
+            jnp.asarray(weights_np),
+            jnp.bfloat16,
+        )
+
+        # Over budget: must skip Pallas combine kernel and match XLA fallback.
+        monkeypatch.setattr(
+            pltpu,
+            "get_tpu_info",
+            lambda: types.SimpleNamespace(smem_capacity_bytes=48 * 1024),
+        )
+
+        def _fail_if_built(**kwargs):
+            raise AssertionError(
+                f"build_combine_kernel should not be called when over SMEM: {kwargs}"
+            )
+
+        monkeypatch.setattr(layer, "build_combine_kernel", _fail_if_built)
+        got = layer._combine_arrivals(*args)
+        assert got.shape == (t_local, hidden)
+        assert got.dtype == jnp.bfloat16
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float32), expected, rtol=1e-2, atol=1e-2
+        )
+
+        # Within TPU v7x SMEM budget: must select build_combine_kernel.
+        monkeypatch.setattr(
+            pltpu,
+            "get_tpu_info",
+            lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+        )
+        recorded = {}
+        sentinel = jnp.full((t_local, hidden), 3.0, dtype=jnp.bfloat16)
+
+        def _fake_builder(**kwargs):
+            recorded["kwargs"] = kwargs
+            return lambda arrivals, coef, rows: sentinel
+
+        monkeypatch.setattr(layer, "build_combine_kernel", _fake_builder)
+        assert layer._combine_arrivals(*args) is sentinel
+        assert recorded["kwargs"] == {
+            "t_local": t_local,
+            "topk": topk,
+            "hidden": hidden,
+            "lane_blocks": lane_blocks,
+            "wire_dtype": jnp.float32,
+            "out_dtype": jnp.bfloat16,
+        }

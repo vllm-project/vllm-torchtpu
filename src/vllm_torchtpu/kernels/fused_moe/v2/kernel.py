@@ -2433,6 +2433,40 @@ COMBINE_PARITIES = 4
 COMBINE_LEAD = 2
 
 
+def combine_prefetch_bytes(t_local: int, topk: int) -> int:
+    """SMEM bytes the combine kernel's scalar-prefetched tables occupy.
+
+    `pos` is int32[t_local * topk] and `coef` is float32[t_local * topk];
+    both ride PrefetchScalarGridSpec(num_scalar_prefetch=2) into SMEM.
+    """
+    return (
+        t_local
+        * topk
+        * (jnp.dtype(jnp.int32).itemsize + jnp.dtype(jnp.float32).itemsize)
+    )
+
+
+def combine_tables_fit(t_local: int, topk: int, info=None) -> bool:
+    """Whether the combine kernel's scalar-prefetched tables fit SMEM.
+
+    Where the tables exceed `host.smem_budget`, the layer keeps the fused
+    XLA gather epilogue instead of failing Mosaic SMEM allocation.
+    """
+    return combine_prefetch_bytes(t_local, topk) <= host.smem_budget(info)
+
+
+def combine_uses_kernel(t_local: int, topk: int, info=None) -> bool:
+    """Whether combine dispatches to the Pallas kernel instead of XLA.
+
+    Requires both an aligned token step (`combine_step_tokens(t_local) > 0`)
+    and scalar-prefetch tables within `host.smem_budget`. Checks the token
+    count first so below-threshold shapes never query the device.
+    """
+    return bool(combine_step_tokens(t_local)) and combine_tables_fit(
+        t_local, topk, info=info
+    )
+
+
 def combine_step_tokens(t_local):
     """Tokens a combine step stages, or 0 where this path does not apply.
 
@@ -2474,6 +2508,21 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     packed-f8 rows, and the live accumulator is one token wide.
     """
     tb = combine_step_tokens(t_local)
+    if not tb:
+        raise ValueError(
+            f"combine kernel requires t_local >= {COMBINE_MIN_TOKENS} with an "
+            f"aligned step count, got t_local={t_local}"
+        )
+    info = pltpu.get_tpu_info()
+    if not combine_tables_fit(t_local, topk, info=info):
+        need = combine_prefetch_bytes(t_local, topk)
+        budget = host.smem_budget(info)
+        raise ValueError(
+            f"combine kernel scalar prefetch for t_local={t_local}, "
+            f"topk={topk} needs {need} bytes, exceeding the {budget}-byte "
+            f"SMEM budget ({info.smem_capacity_bytes} bytes less "
+            f"{host.SMEM_HEADROOM_BYTES} of headroom)"
+        )
     steps = t_local // tb
     gt = COMBINE_GROUP
     groups = tb // gt
@@ -2578,7 +2627,7 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
         ),
         out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
+            vmem_limit_bytes=host.vmem_limit(info), disable_bounds_checks=True
         ),
         name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}",
     )

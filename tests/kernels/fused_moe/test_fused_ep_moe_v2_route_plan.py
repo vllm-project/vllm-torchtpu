@@ -75,7 +75,7 @@ ROUTINGS = ["skewed", "padded", "all_mine"]
 # The chip the SMEM budget is checked against off TPU, where get_tpu_info()
 # has no chip to read: v7x, where the budget's headroom was measured.
 V7X_INFO = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
-SMEM_BUDGET = V7X_INFO.smem_capacity_bytes - route_plan.SMEM_HEADROOM_BYTES
+SMEM_BUDGET = host.smem_budget(V7X_INFO)
 # Per case, above the multichip lane's --timeout=600 and the child process's
 # own limit, so a slow interpreted case fails on the child's timeout with its
 # output rather than on pytest's.

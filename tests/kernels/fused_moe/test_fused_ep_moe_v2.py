@@ -1133,6 +1133,51 @@ def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
     )
 
 
+@pytest.mark.parametrize(
+    "t_local,uses_kernel",
+    [(12288, True), (16384, False)],
+    ids=["t12288_kernel", "t16384_xla"],
+)
+def test_combine_arrivals_at_prefill_buckets_compiles_and_matches_reference(
+    t_local, uses_kernel
+):
+    """The #3694 prefill buckets on the chip (top-10, hidden 4096).
+
+    12288 x 10 (960 KiB of pos and coef tables) stays on the Pallas combine
+    kernel and must compile in this chip's SMEM; 16384 x 10 (1,280 KiB) takes
+    the XLA epilogue. Both must match a reference on sampled tokens.
+    """
+    topk, lane_blocks, lanes, tile_m = 10, 32, 128, 128
+    hidden = lane_blocks * lanes
+    recv_rows, scale_sublanes = 8192, 64
+    rng = np.random.default_rng(0)
+    arrivals_f32 = rng.standard_normal((recv_rows, lane_blocks, lanes), np.float32)
+    scales = rng.uniform(0.5, 1.5, (scale_sublanes, tile_m)).astype(np.float32)
+    pos = rng.integers(0, recv_rows, (t_local, topk), dtype=np.int32)
+    mirror_pos = rng.integers(0, scale_sublanes * tile_m, (t_local, topk), np.int32)
+    weights = rng.uniform(0.0, 1.0, (t_local, topk)).astype(np.float32)
+
+    with jax.default_device(jax.devices()[0]):
+        assert kernel.combine_uses_kernel(t_local, topk) is uses_kernel
+        arrivals = jnp.asarray(arrivals_f32).astype(FP8)
+        combined = layer._combine_arrivals(
+            arrivals,
+            jnp.asarray(scales),
+            jnp.asarray(pos),
+            jnp.asarray(mirror_pos),
+            jnp.asarray(weights),
+            jnp.bfloat16,
+        )
+        out = np.asarray(combined.astype(jnp.float32))
+        rows_f32 = np.asarray(arrivals.astype(jnp.float32)).reshape(recv_rows, hidden)
+
+    assert out.shape == (t_local, hidden)
+    sample = rng.choice(t_local, size=64, replace=False)
+    coef = weights[sample] * scales.reshape(-1)[mirror_pos[sample]]
+    expected = np.einsum("sk,skh->sh", coef, rows_f32[pos[sample]])
+    np.testing.assert_allclose(out[sample], expected, rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
 @pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid", "sqrtsoftplus"])
 def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(

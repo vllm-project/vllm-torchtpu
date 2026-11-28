@@ -51,9 +51,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     weight_format_of_dtype,
 )
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.kernel import (
-    build_combine_kernel,
     build_fused_ep_moe_kernel,
-    combine_step_tokens,
     rowquant_fp8,
 )
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.router_ops import (
@@ -62,6 +60,16 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.router_ops import (
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.token_parallel import (
     TokenReplicaLayout,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.host import smem_budget
+from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
+    build_combine_kernel,
+    combine_prefetch_bytes,
+    combine_step_tokens,
+    combine_uses_kernel,
+)
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def _combine_arrivals(
@@ -77,12 +85,14 @@ def _combine_arrivals(
     written in it -- so a whole source TILE's scales are one sublane and the
     mirror position is NOT the arrival row.
 
-    Where the kernel path applies (kernel.combine_step_tokens) the row gather
-    and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
-    with a SparseCore gather whose output is in HBM at any size, so the rows
-    are written out and read straight back before the sum sees them.
-    Everywhere else the gather is not offloaded and there is no round trip to
-    remove, so the fused XLA epilogue below stays.
+    Where fused_moe/v2's combine kernel applies (its combine_uses_kernel) the
+    row gather and the weighted sum are one Mosaic call: XLA answers
+    `arrivals[rows]` with a SparseCore gather whose output is in HBM at any
+    size, so the rows are written out and read straight back before the sum
+    sees them.
+    Everywhere else -- below the minimum token threshold or when the
+    scalar-prefetched `pos` and `coef` tables exceed the SMEM budget -- the
+    fused XLA epilogue below stays.
 
     Both paths fold the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
@@ -100,7 +110,7 @@ def _combine_arrivals(
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
     row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
     coef = row_scales * topk_weights.astype(jnp.float32)
-    if combine_step_tokens(t_local):
+    if combine_uses_kernel(t_local, topk):
         combine = build_combine_kernel(
             t_local=t_local,
             topk=topk,
@@ -110,6 +120,16 @@ def _combine_arrivals(
             out_dtype=out_dtype,
         )
         return combine(arrivals, coef, rows)
+    if combine_step_tokens(t_local):
+        logger.info_once(
+            "adaptive_fused_moe: combine kernel scalar prefetch (%d bytes "
+            "for t_local=%d, topk=%d) exceeds %d-byte SMEM budget; using XLA "
+            "combine epilogue",
+            combine_prefetch_bytes(t_local, topk),
+            t_local,
+            topk,
+            smem_budget(),
+        )
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
     coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
     terms = []
