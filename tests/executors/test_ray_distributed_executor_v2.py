@@ -68,6 +68,7 @@ class MockVllmConfig:
     return_value="127.0.0.1",
 )
 @patch("vllm_torchtpu.executors.ray_distributed_executor_v2._wait_until_pg_ready")
+@patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_num_chips", lambda: 0)
 class TestTpuRayDistributedExecutorV2:
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -101,6 +102,31 @@ class TestTpuRayDistributedExecutorV2:
         mock_ray.init.assert_called_once()
         assert executor.parallel_config.placement_group == mock_placement_group
         mock_ray.util.placement_group.assert_called_once()
+
+    def test_initialize_ray_cluster_rejects_over_reported_tpu_devices(
+        self, mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray
+    ):
+        mock_platform.ray_device_key = "TPU"
+        mock_ray.is_initialized.return_value = True
+        mock_ray.nodes.return_value = [
+            {
+                "NodeID": "node_1",
+                "NodeManagerAddress": "10.0.0.1",
+                "Resources": {"TPU": 6.0},
+            }
+        ]
+        executor = RayDistributedExecutorV2(self.vllm_config)
+        executor.parallel_config = self.parallel_config
+
+        with (
+            patch(
+                "vllm_torchtpu.executors.ray_distributed_executor_v2.get_num_chips",
+                return_value=4,
+            ),
+            pytest.raises(ValueError, match="4 usable TPU compute devices"),
+        ):
+            executor._initialize_ray_cluster()
+        mock_ray.util.placement_group.assert_not_called()
 
     def test_initialize_ray_cluster_pipeline_parallelism(
         self, mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray
@@ -942,3 +968,78 @@ def test_ray_distributed_executor_bundle_expansion():
     # Too many bundle indices raises ValueError
     with pytest.raises(ValueError, match="less than or equal to world_size"):
         expand_bundles(list(range(17)), 16)
+
+
+def test_validate_ray_tpu_device_counts_checks_driver_and_remote_nodes():
+    from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+        _validate_ray_tpu_device_counts,
+    )
+
+    # Matching counts across all alive nodes pass (dead nodes are ignored).
+    _validate_ray_tpu_device_counts(
+        [
+            {"NodeID": "n0", "NodeManagerAddress": "10.0.0.1", "Resources": {"TPU": 8}},
+            {"NodeID": "n1", "NodeManagerAddress": "10.0.0.2", "Resources": {"TPU": 8}},
+            {
+                "NodeID": "dead",
+                "Alive": False,
+                "NodeManagerAddress": "10.0.0.3",
+                "Resources": {"TPU": 12},
+            },
+        ],
+        device_str="TPU",
+        local_usable_devices=8,
+    )
+
+    # Driver node over-reporting fails fast with actionable remediation.
+    with pytest.raises(ValueError, match='ray start --resources.*"TPU": 8'):
+        _validate_ray_tpu_device_counts(
+            [
+                {
+                    "NodeID": "n0",
+                    "NodeManagerAddress": "10.0.0.1",
+                    "Resources": {"TPU": 12},
+                }
+            ],
+            device_str="TPU",
+            local_usable_devices=8,
+        )
+
+    # Remote node over-reporting fails even when driver reports the right count.
+    with pytest.raises(ValueError, match="10.0.0.2"):
+        _validate_ray_tpu_device_counts(
+            [
+                {
+                    "NodeID": "n0",
+                    "NodeManagerAddress": "10.0.0.1",
+                    "Resources": {"TPU": 8},
+                },
+                {
+                    "NodeID": "n1",
+                    "NodeManagerAddress": "10.0.0.2",
+                    "Resources": {"TPU": 12},
+                },
+            ],
+            device_str="TPU",
+            local_usable_devices=8,
+        )
+
+    # Head-only driver (local_usable_devices=0) still catches inconsistent
+    # remote slice host counts.
+    with pytest.raises(ValueError, match="inconsistent TPU counts"):
+        _validate_ray_tpu_device_counts(
+            [
+                {
+                    "NodeID": "n1",
+                    "NodeManagerAddress": "10.0.0.2",
+                    "Resources": {"TPU": 8},
+                },
+                {
+                    "NodeID": "n2",
+                    "NodeManagerAddress": "10.0.0.3",
+                    "Resources": {"TPU": 12},
+                },
+            ],
+            device_str="TPU",
+            local_usable_devices=0,
+        )

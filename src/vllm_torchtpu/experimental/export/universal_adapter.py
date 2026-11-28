@@ -215,8 +215,9 @@ def _detect_target_tpu() -> str:
     accelerator_type = tpu_info.get_tpu_type()
     if not accelerator_type:
         raise RuntimeError(
-            "Cannot detect the TPU generation (neither TPU_ACCELERATOR_TYPE nor "
-            "the GCE metadata accelerator-type is available); pass --target-tpu."
+            "Cannot detect the TPU generation (TPU_ACCELERATOR_TYPE, local VFIO "
+            "sysfs, and GCE metadata accelerator-type are all unavailable); "
+            "pass --target-tpu."
         )
     try:
         return str(tpu_info.parse_chip_version(accelerator_type).value)

@@ -18,6 +18,7 @@ import os
 # while the package's own __init__ is still running.
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tpu_vfio import detect_vfio_tpu_type
 
 logger = init_logger(__name__)
 
@@ -140,6 +141,8 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
         return override if override > 0 else None
 
     tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
+    if not tpu_type:
+        tpu_type = detect_vfio_tpu_type()
     if not tpu_type:
         tpu_type = _fetch_tpu_type_from_metadata()
     if not tpu_type:

@@ -43,6 +43,7 @@ from vllm_torchtpu.executors.kv_block_override import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
+from vllm_torchtpu.tpu_info import get_num_chips
 from vllm_torchtpu.utils import get_dp_size
 from vllm_torchtpu.worker.tpu_rank_binding import slice_binding_env
 
@@ -68,6 +69,57 @@ def get_tpu_bundles_for_indices(
 
 
 logger = init_logger(__name__)
+
+
+def _validate_ray_tpu_device_counts(
+    nodes_with_device: list[dict[str, Any]],
+    *,
+    device_str: str,
+    local_usable_devices: int,
+) -> None:
+    """Fail fast when Ray over-counts bare-metal SR-IOV VFIO groups.
+
+    TODO(https://github.com/ray-project/ray/issues/68548): remove once Ray
+    excludes SR-IOV physical functions and ICI management VFs on bare-metal TPU
+    hosts. Ray < 2.58 counts every numeric ``/dev/vfio`` group, and Ray >= 2.58
+    filters by vendor ``0x1ae0`` but still counts SR-IOV PFs and management VFs
+    in privileged bare-metal pods.
+    """
+    alive_counts = [
+        (
+            str(n.get("NodeManagerAddress") or n.get("NodeID") or "<unknown>"),
+            int(n["Resources"][device_str]),
+        )
+        for n in nodes_with_device
+        if n.get("Alive", True)
+    ]
+    if not alive_counts:
+        return
+
+    if local_usable_devices > 0:
+        over_reported = [
+            (addr, count)
+            for addr, count in alive_counts
+            if count > local_usable_devices
+        ]
+        if over_reported:
+            resources_arg = f'{{"{device_str}": {local_usable_devices}}}'
+            raise ValueError(
+                f"Ray reports more {device_str} devices than the "
+                f"{local_usable_devices} usable TPU compute devices on this "
+                f"host: {over_reported}. Restart Ray on every host with "
+                f"`ray start --resources '{resources_arg}'`."
+            )
+
+    unique_counts = {count for _, count in alive_counts}
+    if len(unique_counts) > 1:
+        min_count = min(unique_counts)
+        raise ValueError(
+            f"Ray TPU slice hosts report inconsistent {device_str} counts "
+            f"({dict(alive_counts)}); a remote host may have over-counted "
+            "SR-IOV VFIO groups. Restart Ray on every host with "
+            f"`ray start --resources '{{\"{device_str}\": {min_count}}}'`."
+        )
 
 
 class RayDistributedExecutorV2(RayExecutorV2):
@@ -640,6 +692,12 @@ class RayDistributedExecutorV2(RayExecutorV2):
             "(filtered from %s total nodes)",
             len(nodes_with_device),
             len(ray_nodes),
+        )
+
+        _validate_ray_tpu_device_counts(
+            nodes_with_device,
+            device_str=device_str,
+            local_usable_devices=get_num_chips(),
         )
 
         dp_size, dp_rank, _ = self._get_dp_geometry()

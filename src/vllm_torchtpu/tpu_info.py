@@ -23,6 +23,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tpu_vfio import count_vfio_tpu_chips, detect_vfio_tpu_type
 
 logger = init_logger(__name__)
 
@@ -56,6 +57,8 @@ def get_tpu_metadata(key: str = "") -> str:
 
 def get_tpu_type() -> str:
     tpu_type = envs.TPU_ACCELERATOR_TYPE
+    if tpu_type is None:
+        tpu_type = detect_vfio_tpu_type()
     if tpu_type is None:
         tpu_type = get_tpu_metadata(key="accelerator-type")
     return tpu_type
@@ -201,20 +204,14 @@ def get_node_worker_id() -> int:
 
 
 def get_num_cores_per_chip() -> int:
-    tpu_type = get_tpu_type()
-    if tpu_type.startswith(("v5litepod", "v6e")):
-        return 1
-    return 2
+    return int(get_chip_version().num_physical_tensor_cores_per_chip)
 
 
 def get_num_chips() -> int:
-    accel_files = glob.glob("/dev/accel*")
+    # Linux DRM accel / NVIDIA >= 570.x drivers expose /dev/accel as a
+    # directory (/dev/accel/accel0), whereas TPU nodes expose char devices
+    # (/dev/accel0, ...).
+    accel_files = [p for p in glob.glob("/dev/accel*") if not os.path.isdir(p)]
     if accel_files:
         return len(accel_files)
-    try:
-        vfio_entries = os.listdir("/dev/vfio")
-        numeric_entries = [int(entry) for entry in vfio_entries if entry.isdigit()]
-        return len(numeric_entries)
-    except FileNotFoundError as e:
-        logger.warning("Failed to detect number of TPUs: %s", e)
-        return 0
+    return count_vfio_tpu_chips()
