@@ -170,6 +170,38 @@ class TestExternalHitEstimate(unittest.TestCase):
         self.assertEqual(self._estimate(), 3 * self.BLOCK)
         self.assertEqual(set(self.scheduler._external_hit_estimates), {"req"})
 
+    def test_a_queued_request_is_estimated_from_its_arrival(self):
+        """vLLM's Scheduler.add_request hands every new request to the
+        connector's on_new_request (the multi-connector passes it to each
+        child), which tracks it. So a request still queued behind others has
+        its estimate before get_num_new_matched_tokens first reaches it."""
+        from vllm import SamplingParams
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+        from vllm.v1.request import Request
+
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingConnector,
+        )
+
+        self._host_warm()
+        params = SamplingParams(max_tokens=1)
+        params.update_from_generation_config({}, 2)
+        follow_up = Request(
+            "follow-up",
+            list(range(self.PROMPT)),
+            params,
+            None,
+            block_hasher=get_request_block_hasher(self.BLOCK, sha256),
+        )
+        estimate = self.scheduler.estimate_external_hit_tokens
+        # Not tracked yet: no estimate.
+        self.assertEqual(estimate(follow_up, self.LOCAL), 0)
+        connector = object.__new__(TPURaidenOffloadingConnector)
+        connector.connector_scheduler = self.scheduler
+        connector.on_new_request(follow_up)
+        self.assertEqual(estimate(follow_up, self.LOCAL), 3 * self.BLOCK)
+
     def test_connector_reports_its_scheduler_estimate(self):
         from vllm_torchtpu.offload.raiden_connector import (
             TPURaidenOffloadingConnector,
