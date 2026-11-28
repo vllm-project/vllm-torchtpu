@@ -2857,6 +2857,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _free_h2d_sources={},
         _registered_h2d_sources=set(),
         _token_padding_state=None,
+        _fast_metadata_plan=None,
         pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
             prepare_dummy=lambda **kw: SimpleNamespace(
@@ -2871,6 +2872,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
     )
     for name in (
         "_build_attention_metadata",
+        "_build_attention_metadata_staged",
         "_record_input_staging_fence",
         "_wait_input_staging_fence",
         "_pp_take_topk_indices",
