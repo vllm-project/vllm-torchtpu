@@ -289,13 +289,31 @@ def _order_key(x: jax.Array) -> jax.Array:
 
 
 def _kth_largest_key(keys: jax.Array, k: int) -> jax.Array:
-    """Per row, the k-th largest key (counting repeats): 16 count passes."""
+    """Per row, the k-th largest key (counting repeats): the largest t with at
+    least k keys >= t, found one 4-bit digit per pass from 15 trial counts
+    (4 dependent passes instead of 16 for a bit-at-a-time search)."""
     t = jnp.full(keys.shape[:-1], -(1 << 15), jnp.int32)
-    for bit in range(15, -1, -1):
-        trial = t + (1 << bit)
-        count = jnp.sum((keys >= trial[..., None]).astype(jnp.int32), axis=-1)
-        t = jnp.where(count >= k, trial, t)
+    digits = 1 + lax.broadcasted_iota(
+        jnp.int32, (1,) * (keys.ndim - 1) + (15,), keys.ndim - 1
+    )
+    for shift in (12, 8, 4, 0):
+        trial = t[..., None] + (digits << shift)
+        count = jnp.sum(
+            (keys[..., None, :] >= trial[..., None]).astype(jnp.int32), axis=-1
+        )
+        t = t + (jnp.sum((count >= k).astype(jnp.int32), axis=-1) << shift)
     return t
+
+
+def _cumsum01(x: jax.Array) -> jax.Array:
+    """Inclusive cumsum of 0/1 int32 [R, N] along N, as one matmul with an
+    upper-triangular ones matrix (exact: the counts are far below 2**24)."""
+    n = x.shape[-1]
+    i = lax.broadcasted_iota(jnp.int32, (n, n), 0)
+    j = lax.broadcasted_iota(jnp.int32, (n, n), 1)
+    upper = (i <= j).astype(jnp.bfloat16)
+    out = jnp.dot(x.astype(jnp.bfloat16), upper, preferred_element_type=jnp.float32)
+    return out.astype(jnp.int32)
 
 
 def _select_top(keys: jax.Array, k: int) -> jax.Array:
@@ -305,8 +323,8 @@ def _select_top(keys: jax.Array, k: int) -> jax.Array:
     above = keys > t
     need = k - jnp.sum(above.astype(jnp.int32), axis=-1, keepdims=True)
     tie = keys == t
-    chosen = above | (tie & (jnp.cumsum(tie.astype(jnp.int32), axis=-1) <= need))
-    slot = jnp.cumsum(chosen.astype(jnp.int32), axis=-1) - 1
+    chosen = above | (tie & (_cumsum01(tie.astype(jnp.int32)) <= need))
+    slot = _cumsum01(chosen.astype(jnp.int32)) - 1
     slots = lax.broadcasted_iota(jnp.int32, (1, k, 1), 1)
     return chosen[:, None, :] & (slot[:, None, :] == slots)
 
@@ -515,6 +533,7 @@ def _gather_candidates(vals, ids, boundary, top, first, axis):
     major) and per-row scalars (boundary / top / first [R] -> [R, tp]),
     exchanged as their int32 bits in one all-gather. The payloads are a few
     KiB, so each collective costs its latency: one gather instead of five."""
+    assert ids.dtype == first.dtype == jnp.int32, (ids.dtype, first.dtype)
     kc = vals.shape[1]
     packed = jnp.concatenate(
         [
