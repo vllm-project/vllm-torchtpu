@@ -125,6 +125,36 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     }
 
 
+def test_spec_warmup_num_output_tokens_keeps_in_flight_placeholders():
+    """An async spec step appends 1 + K placeholders that the next step's
+    `_modify_prev_results` rolls back from `num_tokens_no_spec`. Upstream
+    `_update_states` truncates output_token_ids (and rewinds
+    num_tokens_no_spec) when the scheduler reports fewer outputs, so the
+    warmup must report the runner's own count, never a smaller one."""
+    K, P = 7, 4
+    # Prefill sampled one token, then decode step 0 left 1 + K placeholders.
+    output_token_ids = [11] + [0] * (1 + K)
+    requests = {"r0": SimpleNamespace(output_token_ids=output_token_ids)}
+    (reported,) = tpu_runner._spec_warmup_num_output_tokens(requests, ["r0"])
+    assert reported == len(output_token_ids)
+
+    def rollback_slice(num_output_tokens: int, accepted: int) -> range:
+        """Index math of _update_states then _modify_prev_results."""
+        num_tokens_no_spec = P + len(output_token_ids)
+        if num_output_tokens < len(output_token_ids):
+            num_tokens_no_spec = P + num_output_tokens
+        start = num_tokens_no_spec - (1 + K)
+        return range(start, start + accepted)
+
+    # The old warmup count (t + 1 = 2 at decode step 1) starts the roll-back
+    # before the request's first token: slice(-2, 0) of token_ids_cpu is empty.
+    old = rollback_slice(2, accepted=2)
+    assert old.start < 0
+    assert reported >= 2
+    new = rollback_slice(reported, accepted=2)
+    assert list(new) == [P + 1, P + 2]
+
+
 @pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
 def test_spec_warmup_request_counts_blocks_in_block_table_units(
     dcp_size, expected_blocks
