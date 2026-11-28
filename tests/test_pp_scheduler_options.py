@@ -813,6 +813,52 @@ def test_prefix_aware_resolves_a_divergent_hit_through_the_connector(
     assert seen == [12288]
 
 
+def test_a_kv_consumer_keeps_a_divergent_hit_for_its_transfer_connector():
+    """On a KV consumer the transfer connector loads a diverged hit's suffix
+    (Stage-3), which the resolver, a host-tier decision, knows nothing of: the
+    resolver is not asked and the base hit stands, as with a transfer
+    connector that has no resolver."""
+    asked = []
+
+    def base(self, request, max_cache_hit_length=None):
+        return "blocks", 8192, 0, True
+
+    kvm = SimpleNamespace(
+        get_computed_blocks=lambda request, cap: asked.append("reconcile")
+        or ("reconciled", 2048, 777),
+    )
+    connector = SimpleNamespace(
+        supports_divergent_local_hybrid_hits=True,
+        resolve_divergent_local_hit_tokens=lambda *a: asked.append(a),
+    )
+    request = _req(0, 16384)
+    with patch.object(Scheduler, "_get_local_prefix_cache_hit", base):
+        s = _sched(
+            connector=connector,
+            _hit_resolver=connector,
+            _prefix_aware=True,
+            _is_kv_consumer=True,
+            kv_cache_manager=kvm,
+        )
+        s._get_block_size = lambda: 2048
+        got = s._get_local_prefix_cache_hit(request, 12288)
+    assert got == ("blocks", 8192, 0, True)
+    assert asked == []
+    assert request._tpu_local_hit_tokens == 8192
+
+
+def test_the_ext_room_reads_vllms_reservation_not_the_prefetch_counter():
+    """_free_blocks_for_ext runs on every sort and promotion. It reads vLLM's
+    own _inflight_prefill_reserved_blocks (a sum of block counts taken with
+    the admission cap, which writes no state), not PrefixAwareScheduler's
+    override, which counts a call at the prefetch cap as a refused load."""
+    assert PrefixAwareScheduler not in TpuPipelineChunkScheduler.__mro__
+    assert (
+        TpuPipelineChunkScheduler._inflight_prefill_reserved_blocks
+        is Scheduler._inflight_prefill_reserved_blocks
+    )
+
+
 def test_without_prefix_aware_the_resend_is_not_trimmed():
     trimmed = []
     cached = SimpleNamespace(all_token_ids={"r": [1, 2, 3]})

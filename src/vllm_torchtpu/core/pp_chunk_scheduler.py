@@ -684,7 +684,10 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         if hit is not None:
             request._tpu_local_hit_tokens = hit[1]
             return hit
-        resolver = self._hit_resolver
+        # A KV consumer keeps vLLM's handling of a diverged hit: its transfer
+        # connector loads the suffix (Stage-3), which the resolver, a host-tier
+        # decision, does not know about.
+        resolver = None if self._is_kv_consumer else self._hit_resolver
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
             super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         )

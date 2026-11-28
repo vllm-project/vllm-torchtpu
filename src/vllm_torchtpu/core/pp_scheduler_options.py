@@ -63,7 +63,8 @@ class PPSchedulerOptions:
     waiting-queue sort (on a KV producer), shortest-remaining-prefill-first
     order of running prefills, warmest-first promotion (unless
     ``tpu_scheduler.promote_warmest`` is false), the cross-step prefix-hit
-    memo, divergent hybrid hits resolved through the KV connector, the
+    memo, divergent hybrid hits resolved through the KV connector (on a KV
+    producer; a consumer's transfer connector loads the suffix), the
     trimmed token-id resend, packed prompt ids, and the connector's
     completion poll at the start of each step. The validation entries'
     prefill legs run true."""
