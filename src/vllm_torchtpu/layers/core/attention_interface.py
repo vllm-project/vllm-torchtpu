@@ -111,6 +111,21 @@ def _resolve_sparse_mla_split_q(ql_nope: jax.Array, q_pe: jax.Array) -> bool:
     return False
 
 
+def sparse_mla_gather_kwargs() -> dict[str, int]:
+    """Kernel kwargs for the sparse MLA SparseCore KV gather.
+
+    Empty (kernel default: DMA-ring gather) unless `TPU_SPARSE_MLA_SC_GATHER_RING`
+    is off, which stands the ring down to the `emit_pipeline` gather.
+    """
+    if envs.TPU_SPARSE_MLA_SC_GATHER_RING:
+        return {}
+    logger.info_once(
+        "TPU_SPARSE_MLA_SC_GATHER_RING=0: sparse MLA SparseCore KV gather uses "
+        "emit_pipeline instead of the DMA ring."
+    )
+    return {"sparsecore_gather_ring_slots": 0}
+
+
 def sharded_flash_attention(
     mesh: Mesh,
     causal: bool = True,
@@ -998,7 +1013,7 @@ def sparse_mla_attention(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
-    chunk_kwargs = sparse_mla_chunk_kwargs()
+    chunk_kwargs = {**sparse_mla_chunk_kwargs(), **sparse_mla_gather_kwargs()}
     split_q = _resolve_sparse_mla_split_q(ql_nope, q_pe)
 
     def _sparse_mla_ragged_paged_attention(
@@ -1203,6 +1218,7 @@ def sparse_mla_attention_dcp(
         )
     cache_layout = nope_spec.layout.value
     split_q = _resolve_sparse_mla_split_q(ql_nope, q_pe)
+    gather_kwargs = sparse_mla_gather_kwargs()
 
     def _local(
         ql_nope,
@@ -1282,6 +1298,7 @@ def sparse_mla_attention_dcp(
             # exact in-kernel overflow pass for the rows that need more.
             topk_cap=topk_cap,
             **chunk_kwargs,
+            **gather_kwargs,
             **split_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
