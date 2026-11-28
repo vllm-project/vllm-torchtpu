@@ -232,6 +232,8 @@ ignore = [
 "src/vllm_torchtpu/models/kimi_k3/megakernel/common/**" = ["B023", "E501"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/**" = ["E501", "S110"]
 "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/{__init__,load,mla_dcp,decode_megakernel,paged}.py" = ["B023", "E501", "E702", "T20"]
+"src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/{helpers,prefill_megakernel}.py" = ["B023", "E501"]
+"src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/**" = ["E501"]
 
 # Library code logs through vllm_torchtpu.logger. Tests, scripts and
 # command-line tools print to the terminal on purpose.
@@ -243,6 +245,8 @@ docstring-code-format = true
 exclude = [
     "src/vllm_torchtpu/models/kimi_k3/megakernel/common/**",
     "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/{load,mla_dcp,decode_megakernel,paged}.py",
+    "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+    "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/**",
 ]
 
 [tool.pymarkdown]
