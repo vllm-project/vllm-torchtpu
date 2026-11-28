@@ -368,8 +368,10 @@ class TestProducerDivergentHitsOption:
             ("kv_producer", None, False),
             ("kv_producer", False, False),
             ("kv_producer", True, True),
-            # On a consumer the option changes nothing: every child must agree.
-            ("kv_consumer", True, False),
+            # kv_both is a producer too (is_kv_producer).
+            ("kv_both", True, True),
+            # A consumer keeps upstream's rule: every child must agree.
+            ("kv_consumer", False, False),
             ("kv_consumer", None, False),
         ],
     )
@@ -378,6 +380,26 @@ class TestProducerDivergentHitsOption:
             self._config(kv_role, option), KVConnectorRole.SCHEDULER, MagicMock()
         )
         assert connector.supports_divergent_local_hybrid_hits is expected
+
+    def test_the_option_is_refused_on_a_consumer(self):
+        """On a consumer the option would do nothing (Knob hygiene: an
+        explicit value that cannot work raises), refused before upstream's
+        __init__ builds the children."""
+        with (
+            patch.object(
+                MultiConnector, "__init__", side_effect=AssertionError("built")
+            ),
+            pytest.raises(
+                ValueError,
+                match=r"\['producer_divergent_hits'\] applies to a KV producer, "
+                "not to kv_role 'kv_consumer'",
+            ),
+        ):
+            TPUMultiConnector(
+                self._config("kv_consumer", True),
+                KVConnectorRole.SCHEDULER,
+                MagicMock(),
+            )
 
     @pytest.mark.parametrize("value", ["true", 1, "1"])
     def test_option_must_be_a_json_boolean(self, value):

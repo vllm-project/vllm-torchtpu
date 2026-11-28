@@ -9161,13 +9161,31 @@ class TestStage3ConnectorOptions:
         assert not worker.late_poll_enabled
 
     def test_options_follow_the_connector_extra_config(self):
-        worker = _make_raiden_worker(
-            is_producer=False,
-            extra_config={"async_complete": True, "late_poll": True},
+        producer = _make_raiden_worker(
+            is_producer=True, extra_config={"async_complete": True}
         )
-        assert worker._async_complete
-        assert worker.late_poll_enabled
-        assert not worker._async_register
+        assert producer._async_complete
+        assert not producer._async_register
+        consumer = _make_raiden_worker(
+            is_producer=False, extra_config={"late_poll": True}
+        )
+        assert consumer.late_poll_enabled
+        assert not consumer._async_complete
+
+    @pytest.mark.parametrize("option", ["async_complete", "async_register"])
+    def test_a_producer_option_is_refused_on_a_consumer(self, option):
+        """Both act on a producer's sends; a consumer would accept them and
+        do nothing (Knob hygiene: an explicit value that cannot work raises)."""
+        with pytest.raises(
+            ValueError,
+            match=rf"\['{option}'\] applies to a KV producer, not to kv_role "
+            "'kv_consumer'",
+        ):
+            _make_raiden_worker(is_producer=False, extra_config={option: True})
+        # Off, or on a producer (kv_both included), the same engines start.
+        _make_raiden_worker(is_producer=False, extra_config={option: False})
+        worker = _make_raiden_worker(kv_role="kv_both", extra_config={option: True})
+        assert getattr(worker, f"_{option}")
 
     @pytest.mark.parametrize("value", ["1", 1, "true", None])
     def test_option_must_be_a_json_boolean(self, value):

@@ -52,11 +52,19 @@ class TPUMultiConnector(MultiConnector):
             MultiConnectorOptions,
             vllm_config.kv_transfer_config.kv_connector_extra_config,
         )
-        super().__init__(vllm_config, role, kv_cache_config)
-        self._producer_divergent_hits = (
+        if (
             options.producer_divergent_hits
-            and vllm_config.kv_transfer_config.is_kv_producer
-        )
+            and not vllm_config.kv_transfer_config.is_kv_producer
+        ):
+            # A consumer keeps upstream's every-child rule; the option would
+            # do nothing there.
+            raise ValueError(
+                "kv_connector_extra_config['producer_divergent_hits'] applies "
+                "to a KV producer, not to kv_role "
+                f"{vllm_config.kv_transfer_config.kv_role!r}"
+            )
+        super().__init__(vllm_config, role, kv_cache_config)
+        self._producer_divergent_hits = options.producer_divergent_hits
         # Only a consumer starts from a decode-local hit; on a producer the
         # transfer child always reports False, whatever the other children say.
         if (

@@ -2730,6 +2730,16 @@ class TPURaidenConnectorWorker:
         self._async_register = options.async_register
         # Public: TPUWorker reads it to find the connectors it late-polls.
         self.late_poll_enabled = options.late_poll
+        for name, on in (
+            ("async_complete", self._async_complete),
+            ("async_register", self._async_register),
+        ):
+            if on and not self.is_producer:
+                # Both act on a producer's sends; a consumer would ignore them.
+                raise ValueError(
+                    f"kv_connector_extra_config[{name!r}] applies to a KV "
+                    f"producer, not to kv_role {self.config.kv_role!r}"
+                )
         if self.late_poll_enabled and self.is_producer:
             # A producer loads nothing, so late_poll_finished_recving would
             # always answer an empty set.
