@@ -9184,7 +9184,11 @@ class TestStage3ConnectorOptions:
             _make_raiden_worker(is_producer=False, extra_config={option: True})
         # Off, or on a producer (kv_both included), the same engines start.
         _make_raiden_worker(is_producer=False, extra_config={option: False})
-        worker = _make_raiden_worker(kv_role="kv_both", extra_config={option: True})
+        # The helper's config stands in for vLLM's KVTransferConfig, whose
+        # is_kv_producer is True for kv_both.
+        worker = _make_raiden_worker(
+            is_producer=True, kv_role="kv_both", extra_config={option: True}
+        )
         assert getattr(worker, f"_{option}")
 
     @pytest.mark.parametrize("value", ["1", 1, "true", None])

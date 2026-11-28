@@ -85,8 +85,9 @@ def _engine(
 
     vLLM runs the hook while it builds the config and resolves the layout
     later, in the runner; here the layout is resolved first. The hook reads
-    the same layout either way: here the resolved one from the cache config,
-    in vLLM's order ``VLLM_KV_CACHE_LAYOUT``
+    the same layout either way. Here it reads the resolved layout from the
+    cache config. In vLLM's order the cache config has no layout yet, so the
+    hook reads ``VLLM_KV_CACHE_LAYOUT``
     (``test_hook_reads_the_layout_vllm_will_resolve``). The helper's own
     patches are undone when it exits; the calling test's are kept."""
     from vllm import envs as vllm_envs
