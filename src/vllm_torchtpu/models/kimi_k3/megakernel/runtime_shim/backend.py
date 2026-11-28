@@ -198,3 +198,15 @@ def draft_ring_rows(vllm_config: Any) -> int:
     from vllm_torchtpu.models.kimi_k3.megakernel.layout import LAYOUT
 
     return LAYOUT.region("draft").rows
+
+
+def capabilities(vllm_config: Any):
+    """The selected program's :class:`Capabilities` (None: backend not selected)."""
+    if role(vllm_config) is None:
+        return None
+    from vllm_torchtpu.models.kimi_k3.megakernel import program
+    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
+        MegakernelEngineConfig,
+    )
+
+    return program.capabilities(MegakernelEngineConfig.from_vllm_config(vllm_config))
