@@ -20,6 +20,7 @@ during inference.
 """
 
 import functools
+import math
 from enum import Enum
 from typing import Any, cast
 
@@ -31,12 +32,26 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
+    DEFAULT_MASK_VALUE,
     align_to,
     cdiv,
     get_dtype_packing,
     get_tpu_version,
     next_power_of_2,
 )
+from vllm_torchtpu.math_utils import largest_divisor
+
+# Fraction of VMEM capacity reserved for explicit tile buffers/scratch during
+# default block-size clamping; the remaining headroom covers compiler-internal
+# scratch and vreg spills while CompilerParams still receives full capacity.
+_VMEM_CLAMP_UTILIZATION = 0.85
+
+# Per-TPU-generation (base_tile_tokens, max_q_csz_divisor) for non-decode tiling.
+_TPU_PREFILL_TILES: dict[int, tuple[int, int]] = {
+    5: (1024, 1),
+    6: (1024, 1),
+    7: (2048, 2),
+}
 
 
 class RpaCase(Enum):
@@ -98,8 +113,7 @@ def ref_ragged_paged_attention(
         out_dtype = jnp.float32 if queries.dtype == jnp.float32 else jnp.bfloat16
 
     if mask_value is None:
-        # We do not set to -inf directly because (-inf) - (-inf) is nan.
-        mask_value = cast(float, jnp.finfo(out_dtype).min)
+        mask_value = DEFAULT_MASK_VALUE
     dynamic_validate_inputs(
         queries,
         keys,
@@ -182,9 +196,7 @@ def ref_ragged_paged_attention(
                 q = jnp.clip(q, min=minval, max=maxval)
             q = q.astype(k.dtype)
 
-        attn = jnp.einsum(
-            "qhd,khd->hqk", q, k, preferred_element_type=jnp.float32
-        ).astype(out_dtype)
+        attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
         attn *= sm_scale
         if k_scale is not None:
             attn *= k_scale
@@ -202,11 +214,12 @@ def ref_ragged_paged_attention(
             if sliding_window is not None:
                 mask = jnp.logical_and(mask, q_span < kv_span + sliding_window)
             attn = jnp.where(mask, attn, mask_value)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        attn = jax.nn.softmax(attn, axis=-1)
 
-        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(out_dtype)
+        out = jnp.einsum("hqk,khd->qhd", attn, v, preferred_element_type=jnp.float32)
         if v_scale is not None:
             out *= v_scale
+        out = out.astype(out_dtype)
 
         outputs.append(out)
 
@@ -240,7 +253,7 @@ def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
     return cdiv(total_bits, 8)
 
 
-def get_vmem_estimate_bytes(
+def _get_vmem_component_bytes(
     actual_num_kv_heads,
     actual_num_q_heads_per_kv_head,
     actual_head_dim,
@@ -248,7 +261,8 @@ def get_vmem_estimate_bytes(
     bkv_sz,
     q_dtype,
     kv_dtype,
-):
+) -> tuple[int, int]:
+    """Return estimated (bkv_bytes, bq_and_scratch_bytes) in VMEM."""
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
@@ -257,10 +271,9 @@ def get_vmem_estimate_bytes(
         bkv_stride += 1
     head_dim = align_to(actual_head_dim, 128)
 
-    total_bits = (
-        # bkv_x2_ref
-        (2 * bkv_sz * bkv_stride * kv_packing * head_dim) * (32 // kv_packing)
-        +
+    # bkv_x2_ref
+    bkv_bits = (2 * bkv_sz * bkv_stride * kv_packing * head_dim) * (32 // kv_packing)
+    bq_and_scratch_bits = (
         # bq_x2_ref + bo_x2_ref
         2
         * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim)
@@ -272,7 +285,28 @@ def get_vmem_estimate_bytes(
         # acc_ref
         (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * 32
     )
-    return cdiv(total_bits, 8)
+    return cdiv(bkv_bits, 8), cdiv(bq_and_scratch_bits, 8)
+
+
+def get_vmem_estimate_bytes(
+    actual_num_kv_heads,
+    actual_num_q_heads_per_kv_head,
+    actual_head_dim,
+    bq_sz,
+    bkv_sz,
+    q_dtype,
+    kv_dtype,
+):
+    bkv_bytes, bq_and_scratch_bytes = _get_vmem_component_bytes(
+        actual_num_kv_heads,
+        actual_num_q_heads_per_kv_head,
+        actual_head_dim,
+        bq_sz,
+        bkv_sz,
+        q_dtype,
+        kv_dtype,
+    )
+    return bkv_bytes + bq_and_scratch_bytes
 
 
 def get_kv_cache_shape(
@@ -1081,9 +1115,9 @@ def _ragged_paged_attention_kernel_loop(
             l = broadcast_minor(l_ref[...], acc.shape)  # noqa
             out = (
                 acc * pl.reciprocal(l, approx=True)
-                if (l.dtype == jnp.float32 and out_dtype != jnp.float32)
+                if q_dtype != jnp.float32
                 else lax.div(acc, l)
-            ).astype(out_dtype)
+            ).astype(q_dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1550,17 +1584,23 @@ def get_default_block_sizes(
     pages_per_seq,
     *,
     case: RpaCase = RpaCase.MIXED,
+    vmem_limit_bytes: int | None = None,
 ):
     """Get (bq, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas.
 
     Note the default block sizes are not necessarily optimal.
     """
+    # Kept for caller compatibility with block-size lookup signature.
+    del max_num_seqs
     tpu_version = get_tpu_version()
+    if tpu_version not in _TPU_PREFILL_TILES:
+        raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
     kv_packing = get_dtype_packing(kv_dtype)
     num_kv_heads_x2 = next_power_of_2(align_to(actual_num_kv_heads * 2, kv_packing))
     head_dim = align_to(head_dim, 128)
-    num_q_heads_per_kv_head = next_power_of_2(actual_num_q_heads // actual_num_kv_heads)
+    actual_q_heads_per_kv = actual_num_q_heads // actual_num_kv_heads
+    num_q_heads_per_kv_head = next_power_of_2(actual_q_heads_per_kv)
 
     max_q = next_power_of_2(max_num_tokens)
     max_kv = pages_per_seq * page_size
@@ -1569,40 +1609,68 @@ def get_default_block_sizes(
         16 * 1024 * 1024 * kv_packing // 4 // head_dim // num_kv_heads_x2
     )
 
-    match tpu_version:
-        case 5 | 6:
-            if case == RpaCase.DECODE:
-                bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
-                bq_csz = 1
-                bkv_csz = min(min_bkv_sz_to_peak, max_kv)
-            else:
-                bq_sz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_sz = min(1024, max_kv)
-                bq_csz = min(512 // num_q_heads_per_kv_head, max_q)
-                bkv_csz = min(512, align_to(max_kv // 2, page_size))
-        case 7:
-            if case == RpaCase.DECODE:
-                bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
-                bq_csz = 1
-                bkv_csz = min(min_bkv_sz_to_peak, max_kv)
-            else:
-                bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_sz = min(2048, max_kv)
-                bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_csz = min(512, align_to(max_kv // 2, page_size))
-        case _:
-            raise NotImplementedError(f"Unsupported {tpu_version=}.")
+    if case == RpaCase.DECODE:
+        bq_sz = 1
+        bkv_sz = min(min_bkv_sz_to_peak, max_kv)
+        bq_csz = 1
+        bkv_csz = bkv_sz
+    else:
+        q_tile, bq_csz_max_q_divisor = _TPU_PREFILL_TILES[tpu_version]
+        bq_sz = min(q_tile // num_q_heads_per_kv_head, max_q // 2)
+        bkv_sz = min(q_tile, max_kv)
+        bq_csz = min(
+            (q_tile // 2) // num_q_heads_per_kv_head,
+            max_q // bq_csz_max_q_divisor,
+        )
+        bkv_csz = min(512, align_to(max_kv // 2, page_size))
 
-    # The query compute block should never exceed the query fetch block.
-    bq_csz = min(bq_csz, bq_sz)
+    # Enforce block divisibility and VMEM budget invariants.
+    bq_sz = max(1, bq_sz)
+    bq_csz = math.gcd(bq_sz, max(1, min(bq_csz, bq_sz)))
+    bkv_sz = align_to(max(page_size, bkv_sz), page_size)
+    bkv_csz = (
+        largest_divisor(
+            bkv_sz // page_size,
+            max(1, align_to(max(page_size, bkv_csz), page_size) // page_size),
+        )
+        * page_size
+    )
+
+    resolved_vmem_limit = (
+        vmem_limit_bytes
+        if vmem_limit_bytes is not None
+        else pltpu.get_tpu_info().vmem_capacity_bytes
+    )
+    vmem_budget = int(resolved_vmem_limit * _VMEM_CLAMP_UTILIZATION)
+    while True:
+        bkv_bytes, bq_and_scratch_bytes = _get_vmem_component_bytes(
+            actual_num_kv_heads,
+            actual_q_heads_per_kv,
+            head_dim,
+            bq_sz,
+            bkv_sz,
+            q_dtype,
+            kv_dtype,
+        )
+        if bkv_bytes + bq_and_scratch_bytes <= vmem_budget:
+            break
+        if bkv_sz > page_size and (bkv_bytes >= bq_and_scratch_bytes or bq_sz <= 1):
+            bkv_sz = max(page_size, (bkv_sz // page_size // 2) * page_size)
+            bkv_csz = (
+                largest_divisor(bkv_sz // page_size, max(1, bkv_csz // page_size))
+                * page_size
+            )
+        elif bq_sz > 1:
+            bq_sz //= 2
+            bq_csz = math.gcd(bq_sz, min(bq_csz, bq_sz))
+        else:
+            break
 
     return {
-        "bq_sz": max(1, bq_sz),
-        "bkv_sz": align_to(bkv_sz, page_size),
-        "bq_csz": max(1, bq_csz),
-        "bkv_csz": align_to(bkv_csz, page_size),
+        "bq_sz": bq_sz,
+        "bkv_sz": bkv_sz,
+        "bq_csz": bq_csz,
+        "bkv_csz": bkv_csz,
     }
 
 
@@ -1689,9 +1757,10 @@ def ragged_paged_attention(
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
       soft_cap: the logit soft cap for the attention.
-      out_dtype: the dtype of the output and the accumulator for matmul. Set
-        lower for better performance, set higher for better accuracy. If None, it
-        uses q.dtype.
+      out_dtype: the dtype of the returned output tensor. Online softmax and
+        matmul accumulation always run in float32; the kernel stores in q.dtype
+        and casts to out_dtype if needed (so output precision is capped at
+        q.dtype). If None, it uses q.dtype.
       mask_value: mask value for causal mask.
       q_scale: the scale for the query.
       k_scale: the scale for the key.
@@ -1716,12 +1785,9 @@ def ragged_paged_attention(
         out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
 
     if mask_value is None:
-        # We do not set to -inf directly because (-inf) - (-inf) is nan.
-        mask_value = cast(float, jnp.finfo(out_dtype).min)
+        mask_value = DEFAULT_MASK_VALUE
 
     if vmem_limit_bytes is None:
-        # TODO(jevinjiang, jacobplatin): change this to use
-        # `get_vmem_estimate_bytes` when VREG spilling is fixed.
         vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
 
     static_validate_inputs(
@@ -1819,13 +1885,13 @@ def ragged_paged_attention(
 
         l_scratch = pltpu.VMEM(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
-            out_dtype,
+            jnp.float32,
         )
         m_scratch = l_scratch
 
         acc_scratch = pltpu.VMEM(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
-            out_dtype,
+            jnp.float32,
         )
 
         scratch_shapes = [
@@ -1939,6 +2005,7 @@ def ragged_paged_attention(
                 max_num_seqs,
                 pages_per_seq,
                 case=case,
+                vmem_limit_bytes=vmem_limit_bytes,
             )
         return {
             "bq_sz": block_sizes[0],
@@ -1979,7 +2046,7 @@ def ragged_paged_attention(
             actual_num_q_heads_per_kv_head,
             actual_head_dim,
             fuse_non_tiling_axis_swap=False,
-        ),
+        ).astype(out_dtype),
         kv_cache,
     )
 

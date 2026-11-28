@@ -266,8 +266,12 @@ def calculate_block_sizes(
         num_scale_channels = serve_cfgs.scale_channels
         base_dim = physical_kv_head_dim + num_scale_channels
         aligned_kv_head_dim_val = utils.align_to(base_dim, num_sublanes * packing_kv)
+        compute_kv_head_dim = utils.align_to(
+            model_cfgs.head_dim, num_sublanes * packing_kv
+        )
     else:
         aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim, num_lanes)
+        compute_kv_head_dim = aligned_kv_head_dim_val
 
     def calculate_vmem_usage(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
@@ -318,7 +322,8 @@ def calculate_block_sizes(
         loaded_bq_bytes = loaded_bq_size * q_bytes
         compute_kv_bytes = kv_bytes
         loaded_bkv_bytes = loaded_bkv_size * compute_kv_bytes
-        qk_bytes = qk_size * out_bytes
+        acc_bytes = jax.dtypes.itemsize_bits(serve_cfgs.dtype_acc) / 8
+        qk_bytes = qk_size * acc_bytes
 
         # Calculate VMEM contribution of active unpacked scale arrays during
         # compute. Note: since flash_attention consumes quantized k/v directly
@@ -351,8 +356,11 @@ def calculate_block_sizes(
         acc_array_size = (
             model_cfgs.num_kv_heads * bq_sz * aligned_num_q_heads_per_kv_head
         )
-        # m and l scratches share the same shape.
-        scratch_bytes = (2 * lm_array_size + acc_array_size) * out_bytes
+        # m and l scratches share the same shape (with num_lanes minor dim);
+        # acc scratch has compute_kv_head_dim minor dim. All are in dtype_acc (fp32).
+        scratch_bytes = (
+            2 * lm_array_size * num_lanes + acc_array_size * compute_kv_head_dim
+        ) * acc_bytes
         total_bytes += scratch_bytes
 
         return total_bytes

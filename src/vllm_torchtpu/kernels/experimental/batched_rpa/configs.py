@@ -200,6 +200,11 @@ class ServingConfigs:
         return self.page_size - 1
 
     @property
+    def dtype_acc(self) -> jnp.dtype:
+        """Online-softmax and PV accumulator dtype (always float32)."""
+        return jnp.float32
+
+    @property
     def packing_q(self) -> int:
         return utils.get_dtype_packing(self.dtype_q)
 
