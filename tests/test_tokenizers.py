@@ -11,29 +11,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The DeepSeek-V4 tokenizer wrapper that honors ``continue_final_message``.
+"""The DeepSeek-V4 / V4.1 tokenizer wrapper that honors ``continue_final_message``.
 
-vLLM renders DeepSeek-V4 chat through the checkpoint's ``encode_messages``
-rather than a Jinja template, and drops ``continue_final_message`` on the way.
-A prefill of a trailing assistant turn therefore gets ``eos_token`` appended,
-which asks the model to generate past end-of-sentence. The wrapper's whole job
-is to translate that flag into the per-message ``wo_eos`` marker the encoder
-does read.
+vLLM renders DeepSeek-V4 and V4.1 chat through the checkpoint's
+``encode_messages`` rather than a Jinja template, and drops
+``continue_final_message`` on the way. A prefill of a trailing assistant turn
+therefore gets ``eos_token`` appended, which asks the model to generate past
+end-of-sentence. The wrapper's whole job is to translate that flag into the
+per-message ``wo_eos`` marker the encoders do read.
 
-The wrapper is built per instance (vLLM constructs the DeepSeek-V4 tokenizer
-class dynamically from the checkpoint's HF backend), so these tests stand a
-fake base class in for it. That is what the wrapper subclasses in production
-too, only with a real tokenizer.
+The wrapper is built per instance (vLLM constructs the DeepSeek-V4 / V4.1
+tokenizer classes dynamically from the checkpoint's HF backend), so these tests
+stand a fake base class in for it. That is what the wrapper subclasses in
+production too, only with a real tokenizer.
 """
 
 import copy
+import inspect
 import pickle
-from unittest.mock import MagicMock
+from typing import Any, cast
+from unittest.mock import MagicMock, call
 
 import pytest
+from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
 
 from vllm_torchtpu.tokenizers import (
     TpuDeepseekV4Tokenizer,
+    TpuDeepseekV41Tokenizer,
     _tpu_deepseek_v4_tokenizer,
     register_tokenizers,
 )
@@ -96,6 +101,29 @@ def test_trailing_assistant_turn_is_marked_wo_eos(tokenizer, base):
     }
     # Earlier turns end normally; only the one being continued skips eos.
     assert "wo_eos" not in conversation[0]
+
+
+def test_trailing_assistant_turn_is_marked_on_messages_too(tokenizer, base):
+    """The V4.1 encoder renders ``messages`` and never looks at the
+    ``conversation`` kwarg, so the marker has to be on the positional list as
+    well or a V4.1 prefill still gets eos_token appended."""
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "partial answ"},
+    ]
+
+    tokenizer.apply_chat_template(messages, continue_final_message=True)
+
+    sent = _last_call(base)["messages"]
+    assert sent[-1] == {
+        "role": "assistant",
+        "content": "partial answ",
+        "wo_eos": True,
+    }
+    assert "wo_eos" not in sent[0]
+    # Marked on a copy: the caller's list is still what it passed in.
+    assert sent is not messages
+    assert "wo_eos" not in messages[-1]
 
 
 def test_continue_final_message_is_not_forwarded(tokenizer, base):
@@ -210,6 +238,9 @@ def test_an_explicit_conversation_kwarg_wins_over_messages(tokenizer, base):
     assert sent[-1]["content"] == "the real one"
     assert sent[-1]["wo_eos"] is True
     assert conversation == [{"role": "assistant", "content": "the real one"}]
+    # The positional list is marked from its own trailing turn, not copied
+    # from the conversation: its user turn stays unmarked.
+    assert _last_call(base)["messages"] == [{"role": "user", "content": "ignored"}]
 
 
 # ---------------------------------------------------------------------------
@@ -275,30 +306,145 @@ def test_registration_is_skipped_unless_the_env_var_is_set(monkeypatch):
     registry.register.assert_not_called()
 
 
-def test_registration_binds_the_deepseek_v4_tokenizer_mode(monkeypatch):
-    """With the flag on, the entry point is registered under the
-    deepseek_v4 tokenizer mode by module path and class name, which is how
-    vLLM's registry resolves it in a worker process."""
+def test_registration_binds_both_deepseek_v4_tokenizer_modes(monkeypatch):
+    """With the flag on, an entry point is registered under each tokenizer
+    mode vLLM resolves ``auto`` to for these models (``deepseek_v4`` for V4,
+    ``deepseek_v41`` for V4.1), by module path and class name, which is how
+    vLLM's registry resolves it in a worker process. Registering only the V4
+    mode is how a V4.1 server silently keeps appending eos_token."""
     registry = MagicMock()
     monkeypatch.setattr("vllm.tokenizers.registry.TokenizerRegistry", registry)
     monkeypatch.setenv("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", "1")
 
     register_tokenizers()
 
-    registry.register.assert_called_once_with(
-        "deepseek_v4", "vllm_torchtpu.tokenizers", "TpuDeepseekV4Tokenizer"
-    )
+    assert registry.register.call_args_list == [
+        call("deepseek_v4", "vllm_torchtpu.tokenizers", "TpuDeepseekV4Tokenizer"),
+        call("deepseek_v41", "vllm_torchtpu.tokenizers", "TpuDeepseekV41Tokenizer"),
+    ]
 
 
-def test_from_pretrained_returns_a_wrapped_tokenizer(monkeypatch):
-    """The registry entry point builds vLLM's tokenizer, then wraps it."""
+@pytest.mark.parametrize(
+    ("tpu_cls", "upstream_target"),
+    [
+        (TpuDeepseekV4Tokenizer, "vllm.tokenizers.deepseek_v4.DeepseekV4Tokenizer"),
+        (
+            TpuDeepseekV41Tokenizer,
+            "vllm.tokenizers.deepseek_v41.DeepseekV41Tokenizer",
+        ),
+    ],
+    ids=["deepseek_v4", "deepseek_v41"],
+)
+def test_from_pretrained_returns_a_wrapped_tokenizer(
+    monkeypatch, tpu_cls, upstream_target
+):
+    """Each registry entry point builds its matching upstream vLLM tokenizer.
+
+    The wrapped tokenizer marks continued turns on both ``messages`` and
+    ``conversation`` so both V4 and V4.1 encoders honor ``wo_eos``.
+    """
     inner = _FakeBaseTokenizer()
-    deepseek_cls = MagicMock()
-    deepseek_cls.from_pretrained.return_value = inner
-    monkeypatch.setattr("vllm.tokenizers.deepseek_v4.DeepseekV4Tokenizer", deepseek_cls)
+    upstream_cls = MagicMock()
+    upstream_cls.from_pretrained.return_value = inner
+    monkeypatch.setattr(upstream_target, upstream_cls)
 
-    wrapped = TpuDeepseekV4Tokenizer.from_pretrained("some/model", trust=True)
+    wrapped = tpu_cls.from_pretrained("some/model", trust=True)
 
-    deepseek_cls.from_pretrained.assert_called_once_with("some/model", trust=True)
+    upstream_cls.from_pretrained.assert_called_once_with("some/model", trust=True)
     assert type(wrapped).__name__ == "_TpuDeepseekV4Tokenizer"
     assert isinstance(wrapped, _FakeBaseTokenizer)
+    wrapped.apply_chat_template(
+        [{"role": "assistant", "content": "x"}], continue_final_message=True
+    )
+    assert inner.seen[-1]["messages"][-1]["wo_eos"] is True
+    assert inner.seen[-1]["kwargs"]["conversation"][-1]["wo_eos"] is True
+
+
+# ---------------------------------------------------------------------------
+# Integration with upstream vLLM's real DeepSeek-V4 and V4.1 prompt encoders.
+# ---------------------------------------------------------------------------
+
+
+class _MinimalHfTokenizer:
+    """Minimal HF-like backend sufficient for upstream get_deepseek_v4*_tokenizer."""
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {"<｜end▁of▁sentence｜>": 1}
+
+    def encode(
+        self, text: str, add_special_tokens: bool = False, **_kwargs
+    ) -> list[int]:
+        del add_special_tokens
+        return [ord(ch) for ch in text]
+
+
+@pytest.mark.parametrize(
+    "wrap_upstream",
+    [get_deepseek_v4_tokenizer, get_deepseek_v41_tokenizer],
+    ids=["deepseek_v4", "deepseek_v41"],
+)
+def test_real_upstream_encoders_omit_trailing_eos_on_continued_turn(
+    wrap_upstream,
+) -> None:
+    """Exercises upstream vLLM's real V4 and V4.1 encoders under the exact
+    keyword call pattern DeepseekV4Renderer / DeepseekV41Renderer use."""
+    eos = "<｜end▁of▁sentence｜>"
+    messages = [
+        {"role": "user", "content": "Say hi."},
+        {"role": "assistant", "content": "Hi!"},
+        {"role": "user", "content": "Pick A or B."},
+        {"role": "assistant", "content": "</think>The best answer is"},
+    ]
+    conversation = [dict(m) for m in messages]
+
+    stock = wrap_upstream(cast(Any, _MinimalHfTokenizer()))
+    stock_prompt = stock.apply_chat_template(
+        conversation=conversation,
+        messages=messages,
+        tokenize=False,
+        continue_final_message=False,
+    )
+    assert isinstance(stock_prompt, str)
+    assert stock_prompt.endswith(f"The best answer is{eos}")
+
+    wrapped = _tpu_deepseek_v4_tokenizer(stock)
+    continued_prompt = wrapped.apply_chat_template(
+        conversation=conversation,
+        messages=messages,
+        tokenize=False,
+        continue_final_message=True,
+    )
+    assert isinstance(continued_prompt, str)
+    assert continued_prompt.endswith("The best answer is")
+    assert not continued_prompt.endswith(eos)
+    # Earlier assistant turns still close with eos_token.
+    assert continued_prompt.count(eos) == 1
+
+    closed_prompt = wrapped.apply_chat_template(
+        conversation=conversation,
+        messages=messages,
+        tokenize=False,
+        continue_final_message=False,
+    )
+    assert closed_prompt == stock_prompt
+
+
+def test_real_v41_wrapper_preserves_signature_and_image_order() -> None:
+    """DeepseekV41Tokenizer adds an ``image_order`` parameter; the wrapper
+    preserves both its inspected signature and positional forwarding."""
+    stock = get_deepseek_v41_tokenizer(cast(Any, _MinimalHfTokenizer()))
+    wrapped = _tpu_deepseek_v4_tokenizer(stock)
+
+    assert "image_order" in inspect.signature(wrapped.apply_chat_template).parameters
+
+    image_order: list[int] = []
+    prompt = wrapped.apply_chat_template(
+        [{"role": "assistant", "content": "</think>Ans:"}],
+        None,
+        image_order,
+        tokenize=False,
+        continue_final_message=True,
+    )
+    assert isinstance(prompt, str)
+    assert prompt.endswith("Ans:")
+    assert not prompt.endswith("<｜end▁of▁sentence｜>")

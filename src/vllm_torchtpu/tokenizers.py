@@ -11,44 +11,73 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSeek-V4 tokenizer that honors ``continue_final_message``.
+"""DeepSeek-V4 / V4.1 tokenizers that honor ``continue_final_message``.
 
-vLLM renders DeepSeek-V4 chat by calling the checkpoint's ``encode_messages``
-instead of a Jinja template, and builds its encode config from ``thinking_mode``,
-``drop_thinking`` and ``reasoning_effort`` alone. ``continue_final_message`` is
-dropped, so a trailing assistant turn is always rendered with ``eos_token`` and
-a request that prefills one asks the model to generate past end-of-sentence.
+vLLM renders DeepSeek-V4 and V4.1 chat by calling ``encode_messages`` instead
+of a Jinja template, and builds its encode config from ``thinking_mode``,
+``drop_thinking`` and ``reasoning_effort`` alone. ``continue_final_message``
+is dropped, so a trailing assistant turn is always rendered with ``eos_token``
+and a request that prefills one asks the model to generate past
+end-of-sentence.
 
-The encoder reads a per-message ``wo_eos`` flag and has a template for that
-case. This module registers a tokenizer that sets the flag.
+Both encoders read a per-message ``wo_eos`` flag and have a template for that
+case. This module registers tokenizers that set the flag. vLLM resolves
+``tokenizer_mode=auto`` to ``deepseek_v4`` for ``DeepseekV4ForCausalLM`` and to
+``deepseek_v41`` for ``DeepseekV41ForCausalLM``, so one entry point is
+registered per mode.
 """
 
+from __future__ import annotations
+
 import copy
+import functools
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from vllm.tokenizers.protocol import TokenizerLike
 
 
-def _tpu_deepseek_v4_tokenizer(tokenizer):
+def _mark_continued_turn(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a copy of ``messages`` with ``wo_eos`` on a trailing assistant turn.
+
+    Setting ``wo_eos`` tells the encoder to omit ``eos_token`` so the model
+    continues that turn. Earlier turns and a trailing user turn are left as
+    they are.
+    """
+    marked = [dict(m) for m in messages]
+    if marked and marked[-1].get("role") == "assistant":
+        marked[-1]["wo_eos"] = True
+    return marked
+
+
+def _tpu_deepseek_v4_tokenizer(tokenizer: Any) -> Any:
     """Return a copy of ``tokenizer`` that honors ``continue_final_message``.
 
     The concrete class is built per instance because vLLM constructs its own
-    DeepSeek-V4 tokenizer class dynamically from the checkpoint's HF backend.
+    DeepSeek-V4 / V4.1 tokenizer classes dynamically from the checkpoint's HF
+    backend.
     """
     base_cls = tokenizer.__class__
 
     class _TpuDeepseekV4Tokenizer(base_cls):
-        def apply_chat_template(self, messages, tools=None, **kwargs):
-            """Set ``wo_eos`` on a trailing assistant turn when
-            ``continue_final_message`` is set, so the encoder omits
-            ``eos_token`` and the model continues that turn."""
+        @functools.wraps(base_cls.apply_chat_template)
+        def apply_chat_template(self, messages, *args, **kwargs):
+            # vLLM's renderer passes both ``messages`` and ``conversation``.
+            # The V4 encoder renders ``conversation`` when it is there and
+            # ``messages`` otherwise; the V4.1 encoder renders ``messages``
+            # and ignores the kwarg. Mark both so either encoder sees it.
             if kwargs.pop("continue_final_message", False):
-                # The parent renders the conversation from kwargs when it is
-                # there, so the marked copy goes back the same way.
-                conversation = list(kwargs.get("conversation", messages))
-                if conversation and conversation[-1].get("role") == "assistant":
-                    conversation[-1] = {**conversation[-1], "wo_eos": True}
-                kwargs["conversation"] = conversation
-            return super().apply_chat_template(messages, tools, **kwargs)
+                marked_messages = _mark_continued_turn(messages)
+                if "conversation" in kwargs:
+                    kwargs["conversation"] = _mark_continued_turn(
+                        kwargs["conversation"]
+                    )
+                else:
+                    kwargs["conversation"] = marked_messages
+                messages = marked_messages
+            return super().apply_chat_template(messages, *args, **kwargs)
 
         def __reduce__(self):
             return _tpu_deepseek_v4_tokenizer, (tokenizer,)
@@ -70,6 +99,23 @@ class TpuDeepseekV4Tokenizer(TokenizerLike):
         )
 
 
+# TODO(vllm v0.34.0): Delete TpuDeepseekV41Tokenizer and the "deepseek_v41"
+# registration below once pinned to vLLM v0.34.0 (vllm-project/vllm#62729),
+# where encode_messages in vllm/tokenizers/deepseek_v41_encoding.py honors
+# continue_final_message directly (popping it in _TpuDeepseekV4Tokenizer
+# would otherwise bypass upstream handling).
+class TpuDeepseekV41Tokenizer(TokenizerLike):
+    """Registry entry point for ``tokenizer_mode=deepseek_v41``."""
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        from vllm.tokenizers.deepseek_v41 import DeepseekV41Tokenizer
+
+        return _tpu_deepseek_v4_tokenizer(
+            DeepseekV41Tokenizer.from_pretrained(*args, **kwargs)
+        )
+
+
 def register_tokenizers() -> None:
     from vllm_torchtpu import envs
 
@@ -79,3 +125,4 @@ def register_tokenizers() -> None:
     from vllm.tokenizers.registry import TokenizerRegistry
 
     TokenizerRegistry.register("deepseek_v4", __name__, "TpuDeepseekV4Tokenizer")
+    TokenizerRegistry.register("deepseek_v41", __name__, "TpuDeepseekV41Tokenizer")
