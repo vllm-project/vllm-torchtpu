@@ -216,8 +216,9 @@ class SequenceParallelPrefill(nn.Module):
         else:
             hidden_states, residual = layer.input_layernorm(hidden_states, residual)
         attn, mlp = layer.self_attn, layer.mlp
-        qkv = self.exchange.rows_to_heads(
-            *column(attn.qkv_proj, replica.qkv, hidden_states)
+        exchange = self.exchange
+        qkv = exchange.rows_to_heads(
+            exchange.in_rank_order(*column(attn.qkv_proj, replica.qkv, hidden_states))
         )
         q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // attn.head_dim, attn.head_dim)
@@ -226,7 +227,9 @@ class SequenceParallelPrefill(nn.Module):
         k = attn.k_norm(k_by_head).view(k.shape)
         q, k = attn.rotary_emb(positions, q, k)
         hidden_states = row(
-            attn.o_proj, replica.o, *self.exchange.heads_to_rows(attn.attn(q, k, v))
+            attn.o_proj,
+            replica.o,
+            *exchange.own_and_rest(exchange.heads_to_rows(attn.attn(q, k, v))),
         )
         hidden_states, residual = layer.post_attention_layernorm(
             hidden_states, residual
@@ -242,7 +245,9 @@ class SequenceParallelPrefill(nn.Module):
 
 class _OtherShards(nn.Module):
     """The other TP ranks' shards of one decoder layer's projections, stacked
-    in rank order as [tp - 1, in, out]."""
+    in rank order as [tp - 1, in, out]. They stay apart from the layer's own
+    (rather than one stack of every rank's) so that this graph takes every
+    input of the TP graph it shares buckets with (compilation.shape_variants)."""
 
     qkv: torch.Tensor
     o: torch.Tensor
