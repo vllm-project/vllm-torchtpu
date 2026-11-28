@@ -6815,8 +6815,96 @@ def test_stage3_layout_measures_the_block_major_pool():
     ):
         result = worker._measure_stage3_layout(manifest)
 
-    measure.assert_called_once_with(manifest, block_major=True)
+    measure.assert_called_once_with(manifest, block_major=True, rope_in_graph=True)
     assert result == ("fingerprint", payload, 256)
+
+
+@pytest.mark.parametrize("in_graph", [True, False])
+@pytest.mark.parametrize("family", ["fa", "dsv4", "glm", "kimi", "sol"])
+def test_stage3_layout_forwards_rope_in_graph(family, in_graph):
+    worker, runner = _block_major_admission_worker()
+    worker.runner = runner
+    worker.vllm_config.additional_config = {"tpu_rope_in_graph": in_graph}
+    manifest = object()
+    sol_mod = "vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane"
+    payload = {"rope_in_graph": in_graph}
+
+    if family == "dsv4":
+        with (
+            patch(f"{_MOD}._use_raiden_dsv4_admission", return_value=True),
+            patch(
+                f"{_FINGERPRINT}.measured_dsv4_layout_fingerprint",
+                return_value=("fp", payload),
+            ) as measure,
+        ):
+            result = worker._measure_stage3_layout(manifest)
+        measure.assert_called_once_with(manifest, rope_in_graph=in_graph)
+        expected_tokens = int(worker.vllm_config.cache_config.block_size)
+    elif family == "kimi":
+        worker._stage3_kimi = True
+        worker.vllm_config.model_config.hf_text_config.linear_attn_config = {
+            "num_heads": 8
+        }
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 4),
+            patch(
+                f"{_FINGERPRINT}.measured_kimi_k3_layout_fingerprint",
+                return_value=("fp", payload),
+            ) as measure,
+        ):
+            result = worker._measure_stage3_layout(manifest)
+        expected_tokens = int(worker.vllm_config.cache_config.block_size)
+        measure.assert_called_once_with(
+            manifest,
+            page_tokens=expected_tokens,
+            state_fragment_heads=2,
+            state_fragments=4,
+            rope_in_graph=in_graph,
+        )
+    elif family == "glm":
+        with (
+            patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+            patch(f"{_MOD}._use_per_layer_pool_tags", return_value=False),
+            patch(
+                f"{_FINGERPRINT}.measured_glm_layout_fingerprint",
+                return_value=("fp", payload),
+            ) as measure,
+        ):
+            result = worker._measure_stage3_layout(manifest)
+        expected_tokens = int(worker.vllm_config.cache_config.block_size)
+        measure.assert_called_once_with(
+            manifest,
+            page_tokens=expected_tokens,
+            rope_in_graph=in_graph,
+            hash_indexer=True,
+        )
+    elif family == "sol":
+        with (
+            patch(f"{_MOD}._raiden_seq_on_lane_layout", return_value=True),
+            patch(
+                f"{sol_mod}.measured_sol_layout_fingerprint",
+                return_value=("fp", payload),
+            ) as measure,
+            patch(f"{sol_mod}.sol_fa_page_tokens", return_value=128),
+        ):
+            result = worker._measure_stage3_layout(manifest)
+        measure.assert_called_once_with(manifest, rope_in_graph=in_graph)
+        expected_tokens = 128
+    else:
+        with (
+            patch(
+                f"{_FINGERPRINT}.measured_fa_layout_fingerprint",
+                return_value=("fp", payload),
+            ) as measure,
+            patch(f"{_FINGERPRINT}.fa_page_tokens", return_value=256),
+        ):
+            result = worker._measure_stage3_layout(manifest)
+        measure.assert_called_once_with(
+            manifest, block_major=True, rope_in_graph=in_graph
+        )
+        expected_tokens = 256
+
+    assert result == ("fp", payload, expected_tokens)
 
 
 class TestGlmPipelineParallelProducer:

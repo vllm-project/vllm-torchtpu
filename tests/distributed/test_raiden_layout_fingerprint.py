@@ -17,8 +17,22 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
 
-from .raiden_test_utils import FakeTensor, dsv4_materialization, glm_named_kv_caches
+from .raiden_test_utils import (
+    FakeTensor,
+    dsv4_materialization,
+    glm_named_kv_caches,
+    kimi_pool_manifest,
+)
+from .test_seq_on_lane import (
+    PRODUCER_SHAPE,
+    SOL_LAYOUT,
+    TP8_GDN,
+)
+from .test_seq_on_lane import (
+    _manifest as _sol_manifest,
+)
 
 
 def _manifest(*, page_tokens=4096):
@@ -55,6 +69,7 @@ def test_measured_fa_layout_fingerprint_golden(monkeypatch):
     manifest = _manifest()
     fingerprint, payload = rlf.measured_fa_layout_fingerprint(
         manifest,
+        rope_in_graph=True,
         layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
         package_version=lambda package: {
             "torch_tpu": "0.1.1.dev20260630090312",
@@ -71,9 +86,10 @@ def test_measured_fa_layout_fingerprint_golden(monkeypatch):
         "element_size_in_bits": 8,
         "kv_layout": "layer-major",
         "gdn_conv_layout": "legacy-split-qk",
+        "rope_in_graph": True,
     }
     assert fingerprint == (
-        "491e9b375a38f65d175e6e38919d29af59bf5149a2c617d0bea69872e3431b77"
+        "28529d4ce5ae25321242301c2457ff61b44eeefe5334e7473040f7b420d7a30c"
     )
     assert (
         rlf.canonical_layout_fingerprint(dict(reversed(list(payload.items()))))
@@ -91,11 +107,13 @@ def test_block_major_fingerprint_names_the_layout(monkeypatch):
     bm_fingerprint, bm_payload = rlf.measured_fa_layout_fingerprint(
         manifest,
         block_major=True,
+        rope_in_graph=True,
         layout_getter=lambda tensor: row_layout,
         package_version=versions.__getitem__,
     )
     lm_fingerprint, lm_payload = rlf.measured_fa_layout_fingerprint(
         manifest,
+        rope_in_graph=True,
         layout_getter=lambda tensor: page_layout,
         package_version=versions.__getitem__,
     )
@@ -108,12 +126,14 @@ def test_block_major_fingerprint_names_the_layout(monkeypatch):
         rlf.measured_fa_layout_fingerprint(
             manifest,
             block_major=True,
+            rope_in_graph=True,
             layout_getter=lambda tensor: page_layout,
             package_version=versions.__getitem__,
         )
     with pytest.raises(RuntimeError, match="minor-to-major"):
         rlf.measured_fa_layout_fingerprint(
             manifest,
+            rope_in_graph=True,
             layout_getter=lambda tensor: row_layout,
             package_version=versions.__getitem__,
         )
@@ -127,6 +147,7 @@ def test_fingerprint_diverges_across_gdn_conv_layouts(monkeypatch):
     def measure():
         return rlf.measured_fa_layout_fingerprint(
             _manifest(),
+            rope_in_graph=True,
             layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
             package_version=lambda package: "unused",
         )
@@ -139,6 +160,68 @@ def test_fingerprint_diverges_across_gdn_conv_layouts(monkeypatch):
     assert pair_payload["gdn_conv_layout"] == "qk-pair-v1"
     assert legacy_payload["gdn_conv_layout"] == "legacy-split-qk"
     assert pair_fingerprint != legacy_fingerprint
+
+
+@pytest.mark.parametrize("kind", ["fa", "dsv4", "glm", "kimi", "sol"])
+def test_fingerprint_diverges_across_rope_in_graph(monkeypatch, kind):
+    """Peers with different tpu_rope_in_graph settings must not share a
+    fingerprint: in-graph cos/sin is not bit-identical to the precomputed
+    table, and K is rotated before KV cache storage."""
+    monkeypatch.delenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", raising=False)
+
+    def measure(rope_in_graph: bool):
+        if kind == "fa":
+            return rlf.measured_fa_layout_fingerprint(
+                _manifest(),
+                rope_in_graph=rope_in_graph,
+                layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
+                package_version=lambda package: "unused",
+            )
+        if kind == "dsv4":
+            return rlf.measured_dsv4_layout_fingerprint(
+                _dsv4_manifest(),
+                rope_in_graph=rope_in_graph,
+                layout_getter=_glm_layout_getter,
+                package_version=_glm_versions,
+            )
+        if kind == "glm":
+            return rlf.measured_glm_layout_fingerprint(
+                _glm_manifest(),
+                page_tokens=1024,
+                rope_in_graph=rope_in_graph,
+                layout_getter=_glm_layout_getter,
+                package_version=_glm_versions,
+            )
+        if kind == "kimi":
+            manifest = kimi_pool_manifest(3, kv_dtype="float8_e4m3fn")
+            return rlf.measured_kimi_k3_layout_fingerprint(
+                manifest,
+                page_tokens=manifest.storages[0].shape[1] * 4,
+                state_fragment_heads=3,
+                state_fragments=1,
+                rope_in_graph=rope_in_graph,
+                layout_getter=lambda tensor: ([3, 2, 1, 0], [[4, 128], [4, 1]], 0),
+                package_version=_glm_versions,
+            )
+        sol_manifest = _sol_manifest(
+            PRODUCER_SHAPE,
+            TP8_GDN,
+            num_kv_heads=2,
+            builder=sol.build_qwen35_pool_manifest_sol,
+        )
+        return sol.measured_sol_layout_fingerprint(
+            sol_manifest,
+            rope_in_graph=rope_in_graph,
+            layout_getter=lambda tensor: SOL_LAYOUT,
+            package_version=_glm_versions,
+        )
+
+    enabled_fp, enabled_payload = measure(True)
+    disabled_fp, disabled_payload = measure(False)
+
+    assert enabled_payload["rope_in_graph"] is True
+    assert disabled_payload["rope_in_graph"] is False
+    assert enabled_fp != disabled_fp
 
 
 def _gdn_manifest(*, key_heads=2, value_heads=8, conv_itemsize=4, ssm_itemsize=4):
@@ -177,6 +260,7 @@ def _gdn_manifest(*, key_heads=2, value_heads=8, conv_itemsize=4, ssm_itemsize=4
 def _measure_gdn(**kwargs):
     return rlf.measured_fa_layout_fingerprint(
         _gdn_manifest(**kwargs),
+        rope_in_graph=True,
         layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
         package_version=lambda package: "unused",
     )
@@ -218,6 +302,7 @@ def test_measured_fa_layout_fingerprint_fails_closed(layout, message):
     with pytest.raises(RuntimeError, match=message):
         rlf.measured_fa_layout_fingerprint(
             _manifest(),
+            rope_in_graph=True,
             layout_getter=lambda tensor: layout,
             package_version=lambda package: "unused",
         )
@@ -266,6 +351,7 @@ def test_measured_glm_layout_fingerprint_fails_closed(layout, page_tokens, messa
         rlf.measured_glm_layout_fingerprint(
             _glm_manifest(),
             page_tokens=page_tokens,
+            rope_in_graph=True,
             layout_getter=lambda tensor: layout,
             package_version=lambda package: "unused",
         )
@@ -283,6 +369,7 @@ def test_measured_glm_layout_fingerprint_golden():
     fingerprint, payload = rlf.measured_glm_layout_fingerprint(
         _glm_manifest(),
         page_tokens=1024,
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
@@ -294,6 +381,7 @@ def test_measured_glm_layout_fingerprint_golden():
         "torch_tpu": "torch-tpu-test-version",
         "libtpu": "libtpu-test-version",
         "page_tokens": 1024,
+        "rope_in_graph": True,
         "layouts": {
             "mla.nope": {
                 "page_shape": [1024, 4, 128],
@@ -319,7 +407,7 @@ def test_measured_glm_layout_fingerprint_golden():
         },
     }
     assert fingerprint == (
-        "bfea2b664510bfb11f87b5092431492fddaf535f0f321f01d59a79e139c3bc2b"
+        "0f3eff8e0f03fd36bb4e493721939ab03a6c7397efbcd663f819602f12e12396"
     )
 
 
@@ -334,6 +422,7 @@ def test_glm_fingerprint_rejects_shape_divergence_within_tag():
         rlf.measured_glm_layout_fingerprint(
             manifest,
             page_tokens=1024,
+            rope_in_graph=True,
             layout_getter=_glm_layout_getter,
             package_version=lambda package: "unused",
         )
@@ -356,6 +445,7 @@ def test_measured_glm_layout_fingerprint_accepts_sparsecore_rows():
     fingerprint, payload = rlf.measured_glm_layout_fingerprint(
         _glm_sparsecore_manifest(),
         page_tokens=1024,
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
@@ -372,6 +462,7 @@ def test_measured_glm_layout_fingerprint_accepts_sparsecore_rows():
     tensorcore, _ = rlf.measured_glm_layout_fingerprint(
         _glm_manifest(),
         page_tokens=1024,
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
@@ -395,6 +486,7 @@ def test_measured_glm_sparsecore_fingerprint_fails_closed(layout, page_tokens, m
         rlf.measured_glm_layout_fingerprint(
             _glm_sparsecore_manifest(),
             page_tokens=page_tokens,
+            rope_in_graph=True,
             layout_getter=getter,
             package_version=lambda package: "unused",
         )
@@ -415,6 +507,7 @@ def _dsv4_manifest(**kwargs):
 def test_measured_dsv4_layout_fingerprint_records_every_role():
     _, payload = rlf.measured_dsv4_layout_fingerprint(
         _dsv4_manifest(),
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
@@ -448,6 +541,7 @@ def test_measured_dsv4_layout_fingerprint_records_every_role():
 def test_dsv4_fingerprint_matches_its_host_array_for_aliased_pools():
     _, payload = rlf.measured_dsv4_layout_fingerprint(
         _dsv4_manifest(),
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
@@ -470,6 +564,7 @@ def test_measured_dsv4_layout_fingerprint_fails_closed(layout, message):
     with pytest.raises(RuntimeError, match=message):
         rlf.measured_dsv4_layout_fingerprint(
             _dsv4_manifest(),
+            rope_in_graph=True,
             layout_getter=lambda tensor: layout,
             package_version=lambda package: "unused",
         )
@@ -479,6 +574,7 @@ def test_dsv4_fingerprint_admits_the_shrunk_tile_of_a_small_page():
     """At 16 tokens per page RoPE has 4 rows, which XLA tiles (4, 128)."""
     _, payload = rlf.measured_dsv4_layout_fingerprint(
         _dsv4_manifest(tokens_per_page=16),
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
@@ -489,11 +585,13 @@ def test_dsv4_fingerprint_is_stable_across_pool_capacity():
     """Prefill and decode admit different block counts on the same layout."""
     small, _ = rlf.measured_dsv4_layout_fingerprint(
         _dsv4_manifest(num_blocks=16),
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
     large, _ = rlf.measured_dsv4_layout_fingerprint(
         _dsv4_manifest(num_blocks=64),
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
@@ -517,6 +615,7 @@ def test_glm_stage_without_indexer_fingerprints_like_every_layer():
         return rlf.measured_glm_layout_fingerprint(
             manifest,
             page_tokens=1024,
+            rope_in_graph=True,
             layout_getter=_glm_layout_getter,
             package_version=_glm_versions,
             **kwargs,

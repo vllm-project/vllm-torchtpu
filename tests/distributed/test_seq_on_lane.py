@@ -527,10 +527,10 @@ def test_sol_fingerprint_is_role_invariant_and_layout_specific():
     getter = lambda tensor: SOL_LAYOUT  # noqa: E731
     version = lambda name: f"{name}-test"  # noqa: E731
     fp_a, payload_a = sol.measured_sol_layout_fingerprint(
-        producer, layout_getter=getter, package_version=version
+        producer, rope_in_graph=True, layout_getter=getter, package_version=version
     )
     fp_b, payload_b = sol.measured_sol_layout_fingerprint(
-        shard, layout_getter=getter, package_version=version
+        shard, rope_in_graph=True, layout_getter=getter, package_version=version
     )
     assert fp_a == fp_b
     assert payload_a == payload_b
@@ -556,12 +556,18 @@ def test_sol_fingerprint_is_role_invariant_and_layout_specific():
     )
     with pytest.raises(sol.SeqOnLaneError):
         sol.measured_sol_layout_fingerprint(
-            token_major, layout_getter=getter, package_version=version
+            token_major,
+            rope_in_graph=True,
+            layout_getter=getter,
+            package_version=version,
         )
     bad_tiles = lambda tensor: ((4, 3, 2, 1, 0), ((8, 128), (4, 1)), 8)  # noqa
     with pytest.raises(RuntimeError):
         sol.measured_sol_layout_fingerprint(
-            producer, layout_getter=bad_tiles, package_version=version
+            producer,
+            rope_in_graph=True,
+            layout_getter=bad_tiles,
+            package_version=version,
         )
 
 

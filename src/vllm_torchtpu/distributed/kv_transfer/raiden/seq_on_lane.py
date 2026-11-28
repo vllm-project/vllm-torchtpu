@@ -914,6 +914,7 @@ def canonical_fingerprint(payload: Mapping[str, Any]) -> str:
 def measured_sol_layout_fingerprint(
     manifest: PoolManifest,
     *,
+    rope_in_graph: bool,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -969,6 +970,7 @@ def measured_sol_layout_fingerprint(
         "fa_packing": geometry.packing,
         "pool_lane_width": LANE_WIDTH,
         "gdn_conv_layout": "qk-pair-v1" if qk_pair else "legacy-split-qk",
+        "rope_in_graph": rope_in_graph,
     }
     # See measured_fa_layout_fingerprint: pins the GDN state dtypes.
     unit_bytes = gdn_state_unit_bytes(manifest)

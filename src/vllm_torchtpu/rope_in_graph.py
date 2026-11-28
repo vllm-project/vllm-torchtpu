@@ -837,9 +837,10 @@ class Tier1InGraphRopeMixin:
     """Mixin for Tier-1 0-row cache stub, `_apply` propagation, and `get_cos_sin`.
 
     Place before the upstream `RotaryEmbeddingBase` subclass in the bases
-    tuple. When `tpu_rope_in_graph` is set, `__init__` activates the Tier-1
-    0-row cache stub; a module whose `spec_from_module` returns `None` falls
-    back to the precomputed table and `_on_table_cache_init`.
+    tuple. When `tpu_rope_in_graph` is enabled (the default), `__init__`
+    activates the Tier-1 0-row cache stub; a module whose `spec_from_module`
+    returns `None` falls back to the precomputed table and
+    `_on_table_cache_init`.
     """
 
     _in_graph_spec: RopeInGraphSpec | None = None

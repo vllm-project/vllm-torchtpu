@@ -4475,7 +4475,7 @@ def test_truncate_rope_caches_suppresses_warning_when_in_graph_enabled(
     assert "no position-indexed rope cache" not in caplog.text
 
     caplog.clear()
-    runner.vllm_config = SimpleNamespace(additional_config={})
+    runner.vllm_config = SimpleNamespace(additional_config={"tpu_rope_in_graph": False})
     with caplog.at_level(
         logging.WARNING, logger="vllm.vllm_torchtpu.runner.tpu_runner"
     ):

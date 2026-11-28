@@ -42,7 +42,8 @@ upstream class name, so each upstream class that needs the fix gets one entry:
 the numerics do not depend on ``CompilationConfig.custom_ops`` enabling the op:
 CUDA runs the FP32 kernel in both cases, and so should TPU.
 
-Tier-1 in-graph RoPE (``--additional-config '{"tpu_rope_in_graph": true}'``):
+Tier-1 in-graph RoPE (on by default; opt out via
+``--additional-config '{"tpu_rope_in_graph": false}'``):
 
 * Verified static-forward classes (``TIER1_STATIC_ROPE_CLASSES``) and 3D
   multimodal classes (``TIER1_MROPE_CLASSES``), both derived from
