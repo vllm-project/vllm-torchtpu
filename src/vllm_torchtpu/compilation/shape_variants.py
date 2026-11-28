@@ -168,6 +168,66 @@ def _signature(graph: fx.GraphModule) -> tuple:
     return tuple(shape(value) for value in _placeholder_values(graph))
 
 
+def _inputs(graph: fx.GraphModule) -> tuple:
+    """Every placeholder as (identity or None, signature).
+
+    A variant that uses more of the model than another -- say a weight
+    replica for a sequence-parallel bucket -- lifts more inputs, and its own
+    sizes, so the two input lists differ beyond position. What identifies an
+    input across traces is what Dynamo recorded for it: a tensor it lifted
+    (marked ``tensor_dict``) is named after its source, uniquely within the
+    graph (``L['self'].norm.weight`` -> ``l_self_modules_norm_parameters_
+    weight_``); a size is the symbol the trace's ShapeEnv bound to sources.
+    An input with neither -- one a split subgraph receives from the subgraph
+    before it -- is identified only by its position.
+    """
+    shape_env = trace_shape_env(graph)
+
+    def entry(node: fx.Node) -> tuple:
+        value = _placeholder_value(node)
+        identity: tuple | None = None
+        if isinstance(value, torch.Tensor):
+            dims = tuple(
+                "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
+            )
+            signature: Any = (str(value.dtype), dims)
+            if "tensor_dict" in node.meta:
+                identity = ("tensor", node.name)
+        else:
+            signature = type(value).__name__
+            if isinstance(value, torch.SymInt) and shape_env is not None:
+                sources = shape_env.var_to_sources.get(value.node.expr, ())
+                if sources:
+                    identity = ("size", frozenset(s.name for s in sources))
+        return (identity, signature)
+
+    return tuple(entry(n) for n in graph.graph.nodes if n.op == "placeholder")
+
+
+def _pick_inputs(handed: tuple, live: tuple) -> tuple[int, ...] | None:
+    """Indices of the live graph's inputs that make up a handed graph's, or
+    None when the handed graph needs one the live graph does not have.
+
+    A size matches a live size bound to any of the same sources: the handed
+    trace's guards made those sources equal, so any of them holds its value.
+    """
+    tensors = {key: i for i, (key, _) in enumerate(live) if key and key[0] == "tensor"}
+    sizes = [(key[1], i) for i, (key, _) in enumerate(live) if key and key[0] == "size"]
+    positional = iter([i for i, (key, _) in enumerate(live) if key is None])
+    picks = []
+    for key, signature in handed:
+        if key is None:
+            index = next(positional, None)
+        elif key[0] == "tensor":
+            index = tensors.get(key)
+        else:
+            index = next((i for sources, i in sizes if sources & key[1]), None)
+        if index is None or live[index][1] != signature:
+            return None
+        picks.append(index)
+    return tuple(picks) if next(positional, None) is None else None
+
+
 def graph_signature(graph: fx.GraphModule) -> tuple:
     """:func:`_signature`, for callers outside this module.
 
@@ -206,19 +266,25 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
+        runnable, inputs = found
+        live = _inputs(graph)
+        if inputs == live:
+            return runnable
+        picks = _pick_inputs(inputs, live)
+        if picks is None:
             raise ShapeSpecializationError(
                 f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces. "
-                "The split comes from compilation_config.splitting_ops "
+                f"inputs differ ({[sig for _, sig in inputs]} vs "
+                f"{[sig for _, sig in live]}). "
+                "The live graph may take more inputs than the handed one, but "
+                "not fewer. If the graph is split, its subgraph boundaries move "
+                "with the specialization and a bucket cannot be handed between "
+                "traces. The split comes from compilation_config.splitting_ops "
                 "(boundaries declared by the model's config hook or the "
                 "caller, or the RPA boundaries TPU_KERNEL_ITER_MODE adds); "
                 "drop those boundaries to serve this model."
             )
-        return runnable
+        return lambda *args: runnable(*[args[i] for i in picks])
 
     def put(
         self,
@@ -227,7 +293,7 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (runnable, _inputs(graph))
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.

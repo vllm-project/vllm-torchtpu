@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
+    TPU_SP_PREFILL_MIN_TOKENS: int = 0
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -731,6 +732,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
     # EP and TP > 1 only.
     "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
+    # Padded token buckets of at least this many tokens run as sequence-parallel
+    # prefill with replicated dense weights (models/vllm/sp_prefill.py); 0 is
+    # off. 1024 is the measured v7x-8 TP=8 crossover; env_vars.md has the data
+    # behind it, the costs and the limits.
+    "TPU_SP_PREFILL_MIN_TOKENS": env_nonnegative_int("TPU_SP_PREFILL_MIN_TOKENS", 0),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
