@@ -509,6 +509,22 @@ def _spec_warmup_num_output_tokens(requests: Any, req_ids: list[str]) -> list[in
     return [len(requests[req_id].output_token_ids) for req_id in req_ids]
 
 
+def _spec_warmup_block_ids(group_nblks: list[int], first: int) -> tuple[list[int], ...]:
+    """Disjoint block ids for one synthetic warmup request, one range per
+    kv-cache group, laid out back to back from ``first``.
+
+    Ids must not repeat across groups, as serving's block pool never repeats
+    them: in a unified pool (one memory pool behind every group) a block id is
+    one pool page for every group, so a shared id makes the warmup request's
+    groups (e.g. attention KV and GDN state) overwrite each other's pages.
+    """
+    ids, lo = [], first
+    for g_nblk in group_nblks:
+        ids.append(list(range(lo, lo + g_nblk)))
+        lo += g_nblk
+    return tuple(ids)
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -8252,21 +8268,21 @@ class TPUModelRunner(GPUModelRunner):
         max_pos = min(self.max_model_len, P + 1)
         assert self.kv_cache_config is not None
         top = int(self.kv_cache_config.num_blocks)
-        block_ids_per_group = []
-        max_nblk = 0
-        for group in self.kv_cache_config.kv_cache_groups:
-            group_block_size = int(group.kv_cache_spec.block_size)
-            group_num_blocks = min(
-                cdiv(max_pos, group_block_size),
-                cdiv(self.max_model_len, group_block_size),
+        group_nblks = [
+            min(
+                cdiv(max_pos, int(group.kv_cache_spec.block_size)),
+                cdiv(self.max_model_len, int(group.kv_cache_spec.block_size)),
             )
-            block_ids_per_group.append(list(range(top - group_num_blocks, top)))
-            max_nblk = max(max_nblk, group_num_blocks)
+            for group in self.kv_cache_config.kv_cache_groups
+        ]
+        max_nblk = sum(group_nblks)
         if top <= max_nblk + 1:
             raise RuntimeError(
                 "MTP prefill warmup has not enough KV blocks for its "
                 f"synthetic request: num_blocks={top}, required>{max_nblk + 1}"
             )
+        # The top of the pool, one disjoint range per group.
+        block_ids_per_group = _spec_warmup_block_ids(group_nblks, top - max_nblk)
 
         attempt_succeeded = True
         try:
@@ -8961,13 +8977,14 @@ class TPUModelRunner(GPUModelRunner):
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
         # Per-group block counts in the group's own block-table units (see
-        # _warmup_one_spec_request); the per-request stride uses the widest
-        # group so every group's ranges stay disjoint across requests.
+        # _warmup_one_spec_request); a request's groups take back-to-back
+        # ranges (_spec_warmup_block_ids), so ids stay disjoint across groups
+        # and requests.
         group_nblks = [
             group.kv_cache_spec.max_num_blocks_per_req(self.vllm_config, max_pos)
             for group in self.kv_cache_config.kv_cache_groups
         ]
-        nblk = max(group_nblks)
+        nblk = sum(group_nblks)
         top = int(self.kv_cache_config.num_blocks)
         if top <= R * nblk + 1:
             logger.warning("skip spec-decode warmup R=%d: not enough kv blocks", R)
@@ -8993,9 +9010,7 @@ class TPUModelRunner(GPUModelRunner):
                         mm_features=[],
                         sampling_params=sp,
                         pooling_params=None,
-                        block_ids=tuple(
-                            list(range(lo, lo + g_nblk)) for g_nblk in group_nblks
-                        ),
+                        block_ids=_spec_warmup_block_ids(group_nblks, lo),
                         num_computed_tokens=0,
                         lora_request=None,
                     )
@@ -9057,7 +9072,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
-                mix_nblk = max(mix_nblks)
+                mix_nblk = sum(mix_nblks)
                 variants = [[P_mix]]
                 if max_seqs >= R + 2 and P_mix >= 2 * P:
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
@@ -9076,9 +9091,7 @@ class TPUModelRunner(GPUModelRunner):
                                 mm_features=[],
                                 sampling_params=sp,
                                 pooling_params=None,
-                                block_ids=tuple(
-                                    list(range(lo, lo + g_nblk)) for g_nblk in mix_nblks
-                                ),
+                                block_ids=_spec_warmup_block_ids(mix_nblks, lo),
                                 num_computed_tokens=0,
                                 lora_request=None,
                             )
@@ -9154,20 +9167,17 @@ class TPUModelRunner(GPUModelRunner):
         # attention), an attention block spans block_size x DCP tokens of
         # context, and the runner-level self.block_size predates the
         # executor's post-load block-size finalization.
+        # Groups get disjoint ranges (_spec_warmup_block_ids).
         max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
         top = int(self.kv_cache_config.num_blocks)
-        block_ids_per_group = []
-        max_nblk = 0
-        for group in self.kv_cache_config.kv_cache_groups:
-            g_nblk = group.kv_cache_spec.max_num_blocks_per_req(
-                self.vllm_config, max_pos
-            )
-            block_ids_per_group.append(list(range(1, 1 + g_nblk)))
-            max_nblk = max(max_nblk, g_nblk)
-        if top <= max_nblk + 1:
+        group_nblks = [
+            group.kv_cache_spec.max_num_blocks_per_req(self.vllm_config, max_pos)
+            for group in self.kv_cache_config.kv_cache_groups
+        ]
+        if top <= sum(group_nblks) + 1:
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
             return False
-        block_ids = tuple(block_ids_per_group)
+        block_ids = _spec_warmup_block_ids(group_nblks, 1)
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         try:
             # ---- prefill ----
