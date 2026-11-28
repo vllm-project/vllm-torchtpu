@@ -29,6 +29,7 @@ Options:
                            Include the native Rust serving runtime (rvllm) from
                            LOCATION (https:// or a public gs:// path) holding
                            rvllm and its metadata.json; checked against its sha256
+      --label KEY=VALUE    Label to set on the image; repeat for several
   -h, --help               Show this help and exit
 
 Examples:
@@ -51,6 +52,7 @@ TARGET="prod"
 BUILD_VLLM_RS="false"
 WITH_EXPERIMENTAL_RVLLM="false"
 EXPERIMENTAL_RVLLM_DOWNLOAD_URL=""
+LABELS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -78,6 +80,14 @@ while [[ $# -gt 0 ]]; do
     --experimental-rvllm-url)
       WITH_EXPERIMENTAL_RVLLM="true"
       EXPERIMENTAL_RVLLM_DOWNLOAD_URL="$2"
+      shift 2
+      ;;
+    --label)
+      if [[ "${2:-}" != ?*=* ]]; then
+        echo "--label expects KEY=VALUE, got: ${2:-}" >&2
+        exit 1
+      fi
+      LABELS+=("$2")
       shift 2
       ;;
     -h|--help)
@@ -174,6 +184,10 @@ DOCKER_ARGS=(
   --build-arg WITH_EXPERIMENTAL_RVLLM="${WITH_EXPERIMENTAL_RVLLM}" \
   --build-arg EXPERIMENTAL_RVLLM_DOWNLOAD_URL="${EXPERIMENTAL_RVLLM_DOWNLOAD_URL}" \
 )
+# A label is image metadata, not a layer: it leaves the layer cache alone.
+for LABEL in "${LABELS[@]}"; do
+  DOCKER_ARGS+=(--label "${LABEL}")
+done
 
 # Run docker build
 DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" "${REPO_ROOT}"

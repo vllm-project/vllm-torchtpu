@@ -16,13 +16,18 @@
 # Build the ci, dev and prod images from the release checkout and stage them in
 # GAR as <version> and <date>-<version>. Nothing goes to Docker Hub here: the
 # publish step copies the staged prod image there by digest, so users get the
-# exact bytes this build made.
+# exact bytes this build made. Each image carries the commit it was built from
+# as the org.opencontainers.image.revision label; that commit has to be the one
+# preflight.sh gated on CI (release_revision in lib.sh).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/lib.sh"
 
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
 VERSION="$(release_version)"
+REVISION="$(release_revision "${REPO_ROOT}")"
 DATE="$(date -u +%Y%m%d)"
 
 echo "--- Cleaning up old Docker images and cache"
@@ -32,7 +37,8 @@ ROWS=""
 for target in ci dev prod; do
     image="${RELEASE_GAR}/vllm-torchtpu-${target}"
     echo "--- :docker: Building ${image}:${VERSION}"
-    ./docker/build_image.sh --target "${target}" -t "${image}:${VERSION}"
+    ./docker/build_image.sh --target "${target}" -t "${image}:${VERSION}" \
+        --label "$(image_revision_label "${REVISION}")"
     docker tag "${image}:${VERSION}" "${image}:${DATE}-${VERSION}"
 
     echo "--- :docker: Pushing ${image}:${VERSION} and :${DATE}-${VERSION}"

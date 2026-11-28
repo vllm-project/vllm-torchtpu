@@ -19,7 +19,10 @@
 #   version   RELEASE_VERSION (an rc, e.g. v0.30.0rc1) if set, else the branch:
 #             releases/v0.30.0 -> 0.30.0. Every later step reads it from the
 #             meta-data set here, so the images and wheels can't disagree.
-#   CI        vllm-torchtpu-ci passed a full (NIGHTLY=1) run of this commit
+#   commit    the checkout's HEAD (image_revision), not BUILDKITE_COMMIT, which
+#             can read "HEAD". It is gated on CI below and stored in meta-data
+#             (release-revision); the image build fails if its checkout differs.
+#   CI        vllm-torchtpu-ci passed a full (NIGHTLY=1) run of that commit
 #             (ci_gate.py). RELEASE_SKIP_CI_GATE=1 skips it, with a warning.
 #   PyPI      neither vllm-torchtpu-core nor vllm-torchtpu has this version yet.
 set -euo pipefail
@@ -27,17 +30,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/lib.sh"
 
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
 echo "--- :label: Release version"
 VERSION="$(resolve_release_version)"
-echo "vllm-torchtpu ${VERSION} at ${BUILDKITE_COMMIT}"
+REVISION="$(image_revision "${REPO_ROOT}")"
+echo "vllm-torchtpu ${VERSION} at ${REVISION}"
 
-echo "--- :white_check_mark: vllm-torchtpu-ci on ${BUILDKITE_COMMIT:0:12}"
+echo "--- :white_check_mark: vllm-torchtpu-ci on ${REVISION:0:12}"
 if [[ "${RELEASE_SKIP_CI_GATE:-0}" == "1" ]]; then
     CI_LINE="**skipped** (RELEASE_SKIP_CI_GATE=1)"
     buildkite-agent annotate --style warning --context release-ci-gate \
-        "CI gate skipped (RELEASE_SKIP_CI_GATE=1): nothing checked that ${BUILDKITE_COMMIT:0:12} passed CI."
+        "CI gate skipped (RELEASE_SKIP_CI_GATE=1): nothing checked that ${REVISION:0:12} passed CI."
 else
-    CI_URL="$(python3 "${SCRIPT_DIR}/ci_gate.py" "${BUILDKITE_COMMIT}" | tail -n 1)"
+    CI_URL="$(python3 "${SCRIPT_DIR}/ci_gate.py" "${REVISION}" | tail -n 1)"
     CI_LINE="passed: ${CI_URL}"
 fi
 
@@ -47,11 +53,12 @@ for project in vllm-torchtpu-core vllm-torchtpu; do
 done
 
 buildkite-agent meta-data set release-version "${VERSION}"
+buildkite-agent meta-data set release-revision "${REVISION}"
 PRE="no"
 is_prerelease "${VERSION}" && PRE="yes"
 buildkite-agent meta-data set release-prerelease "${PRE}"
 buildkite-agent annotate --style info --context release-plan <<EOF
-**vllm-torchtpu ${VERSION}** from \`${BUILDKITE_BRANCH}\` at \`${BUILDKITE_COMMIT:0:12}\` (pre-release: ${PRE})
+**vllm-torchtpu ${VERSION}** from \`${BUILDKITE_BRANCH}\` at \`${REVISION:0:12}\` (pre-release: ${PRE})
 
 - vllm-torchtpu-ci: ${CI_LINE}
 - Builds the ci, dev and prod images (staged in GAR) and both wheels, then waits for approval before anything reaches Docker Hub or PyPI.

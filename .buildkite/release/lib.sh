@@ -32,6 +32,67 @@ die() {
     exit 1
 }
 
+# The full SHA of the commit the checkout at <repo_root> holds, which is what
+# its images are built from. BUILDKITE_COMMIT is the fallback for a checkout
+# without git metadata, and is not trusted first because it can read "HEAD"
+# when a build is created without a commit. git is asked only when the
+# checkout has its own .git: otherwise it would climb into an enclosing
+# repository and report that one's HEAD.
+image_revision() {
+    local repo_root="$1" revision=""
+    if [[ -e "${repo_root}/.git" ]]; then
+        revision="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
+    fi
+    if [[ ! "${revision}" =~ ^[0-9a-f]{40}$ ]]; then
+        revision="${BUILDKITE_COMMIT:-}"
+    fi
+    [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] \
+        || die "cannot tell which commit the images are built from: no git HEAD in ${repo_root} and BUILDKITE_COMMIT='${BUILDKITE_COMMIT:-}' is not a full commit SHA."
+    echo "${revision}"
+}
+
+# Look up Buildkite meta-data <key>. Prints the stored value and returns 0 when
+# the key is set, returns 100 when nothing is stored, and dies on any other
+# agent failure.
+_read_release_metadata() {
+    local key="$1" rc=0
+    buildkite-agent meta-data exists "${key}" || rc=$?
+    case "${rc}" in
+        0)
+            buildkite-agent meta-data get "${key}" \
+                || die "could not read meta-data ${key}."
+            ;;
+        100) return 100 ;;
+        *) die "could not read meta-data ${key} (exit ${rc})." ;;
+    esac
+}
+
+# The commit the image build checks against preflight.sh: the one preflight
+# gated on CI and stored in meta-data. Only build_images.sh checks this today;
+# the wheel build steps still use their own checkouts. A checkout at <repo_root>
+# holding another commit fails here, before any image is built. Running a step
+# standalone, with nothing stored, uses the checkout's commit.
+release_revision() {
+    local repo_root="$1" checkout gated rc=0
+    # errexit is off inside the caller's $(...), so a failure is passed on by hand.
+    checkout="$(image_revision "${repo_root}")" || exit 1
+    gated="$(_read_release_metadata release-revision)" || rc=$?
+    case "${rc}" in
+        0)
+            [[ "${checkout}" == "${gated}" ]] \
+                || die "this step's checkout is at ${checkout}, but preflight gated the release on ${gated}."
+            ;;
+        100) ;;
+        *) exit "${rc}" ;;
+    esac
+    echo "${checkout}"
+}
+
+# The `docker build --label` value that records <revision> on an image.
+image_revision_label() {
+    echo "org.opencontainers.image.revision=$1"
+}
+
 is_valid_release_version() {
     [[ "$1" =~ ${PEP440_PUBLIC_REGEX} ]]
 }
@@ -64,11 +125,11 @@ resolve_release_version() {
 # (or resolved on the spot when running a step standalone).
 release_version() {
     local rc=0
-    buildkite-agent meta-data exists release-version || rc=$?
+    _read_release_metadata release-version || rc=$?
     case "${rc}" in
-        0) buildkite-agent meta-data get release-version ;;
+        0) ;;
         100) resolve_release_version ;;
-        *) die "could not read meta-data release-version (exit ${rc})." ;;
+        *) exit "${rc}" ;;
     esac
 }
 
