@@ -15,6 +15,10 @@
 
 import numpy as np
 
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.stage_plan import (
+    _reshape_metadata_page_indices_jax,
+)
+
 
 class RuntimeScheduleField:
     """Minimal per-ring-step ABI consumed by the production Pallas kernels."""
@@ -86,27 +90,6 @@ def _validate_page_interleave_size(
             f"{context} requires page_size to be divisible by "
             f"interleave_size, got {page_size=} {interleave_size=}."
         )
-
-
-def _reshape_metadata_page_indices_jax(page_indices, max_num_seqs: int):
-    import jax.numpy as jnp
-
-    if max_num_seqs <= 0:
-        raise ValueError("metadata must contain at least one sequence slot.")
-    if page_indices.ndim == 1:
-        if page_indices.shape[0] % max_num_seqs != 0:
-            raise ValueError(
-                "flat page_indices size must be divisible by kv_lens.shape[0]."
-            )
-        pages_per_seq = page_indices.shape[0] // max_num_seqs
-        return jnp.reshape(page_indices, (max_num_seqs, pages_per_seq))
-    if page_indices.ndim == 2:
-        if page_indices.shape[0] != max_num_seqs:
-            raise ValueError(
-                "2D page_indices first dimension must match kv_lens.shape[0]."
-            )
-        return page_indices
-    raise ValueError("page_indices must be rank 1 or rank 2.")
 
 
 def build_pcp_streaming_schedule_inputs_from_metadata_jax(
