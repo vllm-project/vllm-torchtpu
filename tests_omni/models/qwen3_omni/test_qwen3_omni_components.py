@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -28,12 +28,22 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder as HfQwen3OmniMoeAudioEncoder,
 )
 from vllm.multimodal.utils import set_mm_embedding_modality
+from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
+    CodePredictorWrapper,
+    CodePredictorWrapperConfig,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeAudioEncoder,
     _get_feat_extract_output_lengths,
 )
 
+from tests_omni.models.qwen3_omni.utils import (
+    TINY_CP_CONFIG,
+    bind_native_custom_ops_on_cpu,
+    init_linear_weights,
+    isolate_talker_patch_targets,
+)
 from tests_omni.omni_test_utils import (
     assert_all_loaded,
     assert_parity,
@@ -41,6 +51,9 @@ from tests_omni.omni_test_utils import (
     init_test_weights,
     isolate_thinker_patch_targets,
     native_ops_on_cpu,
+)
+from vllm_torchtpu.omni.patches.qwen3omni_talker import (
+    maybe_patch_qwen3_omni_talker,
 )
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _padded_audio_forward,
@@ -402,3 +415,73 @@ def test_multimodal_merge_and_embed_input_ids_on_tpu(
         assert torch.equal(
             buf[:num_tokens].cpu(), torch.zeros((num_tokens, hidden_size))
         )
+
+
+def test_code_predictor_wrapper_on_tpu_matches_cpu_reference(omni_ctx: None) -> None:
+    """Patched CodePredictorWrapper runs residual AR on CPU and returns TPU tensors."""
+    if not torch.accelerator.is_available():
+        pytest.fail("Needs a TPU to verify CodePredictorWrapper TPU offload.")
+
+    with isolate_talker_patch_targets():
+        assert (
+            maybe_patch_qwen3_omni_talker(["Qwen3OmniMoeForConditionalGeneration"])
+            is True
+        )
+
+        torch.manual_seed(0)
+        wrapper = CodePredictorWrapper(
+            vllm_config=SimpleNamespace(model_config=SimpleNamespace()),
+            cp_config=TINY_CP_CONFIG,
+            wrapper_config=CodePredictorWrapperConfig(
+                use_parallel_embedding=False,
+                use_projection=True,
+                use_cuda_graphs=False,
+                return_proj_buf=True,
+            ),
+            talker_hidden_size=48,
+        ).eval()
+        init_linear_weights(wrapper, seed=0)
+        bind_native_custom_ops_on_cpu(wrapper)
+        wrapper.set_sampling_params(do_sample=False)
+
+        layer0_code = torch.tensor([[3]], dtype=torch.long)
+        layer0_embed = torch.randn(1, 1, 48)
+        last_talker_hidden = torch.randn(1, 1, 48)
+
+        with torch.no_grad():
+            ref_codes, ref_proj = wrapper(
+                layer0_code=layer0_code,
+                layer0_embed=layer0_embed,
+                last_talker_hidden=last_talker_hidden,
+                do_sample=False,
+            )
+
+        tpu_dev = torch.device("tpu")
+        tpu_wrapper = CodePredictorWrapper(
+            vllm_config=SimpleNamespace(model_config=SimpleNamespace()),
+            cp_config=TINY_CP_CONFIG,
+            wrapper_config=CodePredictorWrapperConfig(
+                use_parallel_embedding=False,
+                use_projection=True,
+                use_cuda_graphs=False,
+                return_proj_buf=True,
+            ),
+            talker_hidden_size=48,
+        ).eval()
+        tpu_wrapper.load_state_dict(wrapper.state_dict())
+        bind_native_custom_ops_on_cpu(tpu_wrapper)
+        tpu_wrapper.set_sampling_params(do_sample=False)
+        tpu_wrapper = tpu_wrapper.to(tpu_dev)
+
+        with torch.no_grad():
+            tpu_codes, tpu_proj = tpu_wrapper(
+                layer0_code=layer0_code.to(tpu_dev),
+                layer0_embed=layer0_embed.to(tpu_dev),
+                last_talker_hidden=last_talker_hidden.to(tpu_dev),
+                do_sample=False,
+            )
+        assert next(tpu_wrapper.parameters()).device.type == "cpu"
+        assert tpu_codes.device.type == "tpu"
+        assert tpu_proj.device.type == "tpu"
+        assert torch.equal(tpu_codes.cpu(), ref_codes)
+        assert torch.allclose(tpu_proj.cpu(), ref_proj, atol=1e-5)

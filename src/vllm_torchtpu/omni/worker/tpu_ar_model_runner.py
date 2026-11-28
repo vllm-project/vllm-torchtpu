@@ -13,8 +13,10 @@
 # limitations under the License.
 """TPU model runner for autoregressive vLLM-Omni stages."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
@@ -23,6 +25,12 @@ from vllm.multimodal.utils import (
     set_mm_embedding_modality,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVTransferManager,
+)
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -34,16 +42,17 @@ from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _VISION_PATCH_BUCKETS,
     maybe_patch_qwen3_omni_thinker,
 )
-from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
+from vllm_torchtpu.omni.worker.tpu_model_runner import (
+    OmniTPUModelRunner,
+    _unwrap_model,
+)
+from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUModelRunnerOutput
 from vllm_torchtpu.utils import synchronize_tensors
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
-# Model capability flags that ``GPUARModelRunner`` reads (through
-# ``_model_omni_flag``) to drive the per-step preprocess / postprocess hooks.
-# vLLM-Omni models set them in ``__init__``: the Qwen3-Omni thinker sets both
-# to False, the talker sets both to True.
-_UNSUPPORTED_HOOK_FLAGS = ("has_preprocess", "has_postprocess")
+logger = init_logger(__name__)
 
 
 def _slice_mm_embeds_by_row_indices(
@@ -133,37 +142,137 @@ def _expand_mm_dummy_batches(
     return [dummy_batch]
 
 
+def _decode_additional_info(info: Any) -> dict[str, Any]:
+    if not info:
+        return {}
+    if isinstance(info, dict):
+        return info
+    decoded = deserialize_additional_information(info)
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _slice_inter_stage_payload(
+    raw_mm: dict[str, Any],
+    req_idx: int,
+    tok_start: int | None,
+    tok_end: int | None,
+) -> dict[str, Any]:
+    """Slice a chunk's ``multimodal_outputs`` for one request and copy to CPU.
+
+    Note: ``.detach().cpu()`` is intentionally synchronous here because
+    ``OmniConnectorModelRunnerMixin`` serializes ``inter_stage_outputs`` on the
+    host immediately after ``_populate_inter_stage_outputs`` returns.
+    """
+    payload: dict[str, Any] = {}
+    for key, val in raw_mm.items():
+        if key == "hidden_states" and isinstance(val, dict) and "layers" in val:
+            layers = {}
+            for lk, lt in val["layers"].items():
+                if isinstance(lt, torch.Tensor):
+                    sliced = (
+                        lt[tok_start:tok_end]
+                        if tok_start is not None and tok_end is not None
+                        else lt
+                    )
+                    layers[lk] = sliced.detach().cpu()
+                else:
+                    layers[lk] = lt
+            payload["hidden_states"] = {"layers": layers}
+        elif key == "codes" and isinstance(val, dict):
+            codes = {}
+            for ck, cv in val.items():
+                if isinstance(cv, torch.Tensor):
+                    sliced = (
+                        cv[tok_start:tok_end]
+                        if tok_start is not None
+                        and tok_end is not None
+                        and cv.shape[0] >= tok_end
+                        else cv
+                    )
+                    codes[ck] = sliced.detach().cpu()
+                else:
+                    codes[ck] = cv
+            payload["codes"] = codes
+        elif key == "embed" and isinstance(val, dict):
+            embed = {}
+            for ek, ev in val.items():
+                item = ev[req_idx] if isinstance(ev, list) and req_idx < len(ev) else ev
+                embed[ek] = (
+                    item.detach().cpu() if isinstance(item, torch.Tensor) else item
+                )
+            payload["embed"] = embed
+        elif isinstance(val, torch.Tensor):
+            payload[key] = val.detach().cpu()
+        else:
+            payload[key] = val
+    return payload
+
+
+def _merge_chunk_payload(
+    existing: dict[str, Any], new_payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Concatenate per-token payload tensors when a request spans multiple chunks."""
+    merged = dict(existing)
+    for key, val in new_payload.items():
+        if (
+            key == "hidden_states"
+            and isinstance(val, dict)
+            and "layers" in val
+            and isinstance(merged.get("hidden_states"), dict)
+            and "layers" in merged["hidden_states"]
+        ):
+            layers = dict(merged["hidden_states"]["layers"])
+            for lk, lt in val["layers"].items():
+                prev = layers.get(lk)
+                if isinstance(prev, torch.Tensor) and isinstance(lt, torch.Tensor):
+                    layers[lk] = torch.cat([prev, lt], dim=0)
+                else:
+                    layers[lk] = lt
+            merged["hidden_states"] = {"layers": layers}
+        elif (
+            key == "codes"
+            and isinstance(val, dict)
+            and isinstance(merged.get("codes"), dict)
+        ):
+            codes = dict(merged["codes"])
+            for ck, cv in val.items():
+                prev = codes.get(ck)
+                if isinstance(prev, torch.Tensor) and isinstance(cv, torch.Tensor):
+                    codes[ck] = torch.cat([prev, cv], dim=0)
+                else:
+                    codes[ck] = cv
+            merged["codes"] = codes
+        else:
+            merged[key] = val
+    return merged
+
+
 class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
     """TPU runner for autoregressive stages; counterpart of ``GPUARModelRunner``.
 
-    Serves stages that vLLM's own execute-and-sample loop covers, which is
-    what the Qwen3-Omni thinker-only pipeline needs. What ``GPUARModelRunner``
-    adds on top of that loop is refused with ``NotImplementedError`` rather
-    than approximated, each where it can first be seen:
-
-    - at construction, a stage config that needs inter-stage connectors
-      (``needs_omni_connector``): every stage of a multi-stage pipeline sends
-      or receives payloads through them, and they are not wired on TPU;
-    - at construction, speculative decoding (``speculative_config``): draft-model
-      auxiliary hidden states are not verified or wired on ``TPUARModelRunner``;
-    - at ``load_model``, a model that declares the per-step
-      ``preprocess`` / ``postprocess`` hooks (``has_preprocess`` /
-      ``has_postprocess``): the talker path, which runs multi-token
-      prediction around every step.
-
-    ``OmniConnectorModelRunnerMixin`` sits on this leaf, as upstream, so the
-    connector methods have their home when the multi-stage work lands.
+    Serves the Thinker and Talker stages on TPU, wiring inter-stage Omni
+    connectors (with ``OmniKVTransferManager``), multimodal mixed-dimension
+    chunk slicing, and the Talker's ``preprocess``, ``talker_mtp``,
+    ``postprocess``, and ``make_omni_output`` hooks.
     """
+
+    _omni_connector_initialized: bool = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._omni_mm_embeds_list: list[torch.Tensor] | None = None
+        self._omni_chunk_req_slice: tuple[int, int] | None = None
+        self._omni_chunk_outputs: list[
+            tuple[list[tuple[str, int, int, int]], dict[str, Any]]
+        ] = []
+        self.kv_transfer_manager: OmniKVTransferManager | None = None
         if needs_omni_connector(self.model_config):
-            raise NotImplementedError(
-                f"Stage {self.stage_id} ({self.model_stage!r}) needs inter-stage Omni "
-                "connectors, which are not wired on TPU yet. Run the thinker-only "
-                "pipeline (qwen3_omni_moe_thinking.yaml) or another single-stage "
-                "deployment."
+            self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(
+                self.vllm_config, self.model_config
+            )
+            self.init_omni_connectors(
+                model_config=self.model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
             )
         if self.speculative_config is not None:
             raise NotImplementedError(
@@ -172,42 +281,93 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
             )
 
     def load_model(self) -> None:
-        """Load the stage model, then refuse one whose hooks nobody would call."""
+        """Apply Qwen3-Omni stage patches and load the stage model."""
         maybe_patch_qwen3_omni_thinker(
             self.model_config.architectures,
             enforce_eager=self.enforce_eager,
         )
         super().load_model()
-        model = self.get_model()
-        has_unsupported_flags = [
-            flag
-            for flag in _UNSUPPORTED_HOOK_FLAGS
-            if bool(getattr(model, flag, False))
-        ]
-        if len(has_unsupported_flags) > 0:
-            raise NotImplementedError(
-                f"Stage {self.stage_id} ({self.model_stage!r}): "
-                f"{type(model).__name__} declares {', '.join(has_unsupported_flags)}, "
-                "so it relies on the per-step preprocess/postprocess hooks (the "
-                "talker's multi-token prediction), which TPUARModelRunner does not "
-                "run yet."
-            )
 
-    # TODO: retire the row-index proxy (_gather_mm_embeddings / _get_model_inputs /
-    # execute_model cleanup) once core TPUModelRunner.execute_model slices
-    # list[torch.Tensor] per chunk without concatenating via torch.cat.
-    def execute_model(
-        self,
-        scheduler_output: Any,
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> Any:
-        """Run one step and always release cached per-item multimodal embeddings."""
-        try:
-            return super().execute_model(
-                scheduler_output, intermediate_tensors=intermediate_tensors
+    def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
+        """Update Omni buffers and connector state alongside TPU batch state.
+
+        Upstream: ``OmniGPUModelRunner._update_states`` in
+        ``vllm_omni/worker/gpu_model_runner.py``.
+        Stayed the same: pops ``model_intermediate_buffer`` and calls
+        ``cleanup_finished_request`` for ``finished_req_ids``, and merges
+        deserialized ``additional_information`` / ``model_intermediate_buffer``
+        for ``scheduled_new_reqs`` and ``scheduled_cached_reqs``.
+        Adapted for TPU: delegates batch/KV/sampling state updates to
+        ``super()._update_states(scheduler_output)`` (``TPUModelRunner``)
+        instead of re-implementing GPU prefix-cache and block-zeroing internals.
+        """
+        for req_id in scheduler_output.finished_req_ids:
+            self.model_intermediate_buffer.pop(req_id, None)
+            if self._omni_connector_initialized:
+                self.cleanup_finished_request(req_id)
+        res = super()._update_states(scheduler_output)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req_id = new_req.req_id
+            existing = self.model_intermediate_buffer.setdefault(req_id, {})
+            self._update_intermediate_buffer(
+                req_id,
+                _decode_additional_info(
+                    getattr(new_req, "additional_information", None)
+                ),
             )
-        finally:
-            self._omni_mm_embeds_list = None
+            self._update_intermediate_buffer(
+                req_id,
+                _decode_additional_info(
+                    getattr(new_req, "model_intermediate_buffer", None)
+                ),
+            )
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                req_state.additional_information_cpu = existing
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        cached_infos = getattr(cached_reqs, "additional_information", None)
+        if isinstance(cached_infos, dict):
+            for req_id in cached_reqs.req_ids:
+                self._update_intermediate_buffer(
+                    req_id, _decode_additional_info(cached_infos.get(req_id))
+                )
+        return res
+
+    def _prepare_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        start_index: int,
+        num_decode_reqs: int,
+        num_windowed_reqs: int | None = None,
+    ) -> Any:
+        res = super()._prepare_inputs(
+            scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
+        )
+        self._omni_chunk_req_slice = (start_index, res[4])
+        return res
+
+    def _chunk_req_spans(self) -> list[tuple[str, int, int, int]]:
+        if self._omni_chunk_req_slice is None or not hasattr(self, "input_batch"):
+            return []
+        input_batch = self.input_batch
+        query_start_loc = self.query_start_loc_np
+        num_reqs = input_batch.num_reqs
+        start_idx, end_idx = self._omni_chunk_req_slice
+        start_idx = min(start_idx, num_reqs)
+        end_idx = min(end_idx, num_reqs)
+        spans: list[tuple[str, int, int, int]] = []
+        for r_i, req_id in enumerate(input_batch.req_ids[start_idx:end_idx]):
+            if req_id is None or r_i + 1 >= len(query_start_loc):
+                continue
+            spans.append(
+                (
+                    req_id,
+                    start_idx + r_i,
+                    int(query_start_loc[r_i]),
+                    int(query_start_loc[r_i + 1]),
+                )
+            )
+        return spans
 
     def _gather_mm_embeddings(
         self,
@@ -239,7 +399,12 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def capture_model(self) -> None:
         super().capture_model()
-        if self.enforce_eager or not self.supports_mm_inputs or not self._pp_is_first:
+        if (
+            self.enforce_eager
+            or not self.supports_mm_inputs
+            or not self._pp_is_first
+            or self.model_stage not in (None, "thinker")
+        ):
             return
         self._precompile_mm_inputs()
 
@@ -327,7 +492,21 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         input_ids: torch.Tensor,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Resolve 1D row-index ranges and guard DeepStack buffers across steps."""
+        """Resolve MM slices, DeepStack guards, and ``preprocess`` / ``talker_mtp``.
+
+        Upstream: ``GPUARModelRunner`` per-request ``preprocess`` and
+        ``talker_mtp`` execution in ``vllm_omni/worker/gpu_ar_model_runner.py``.
+        Stayed the same: syncs received full-payload stage inputs, calls
+        ``model.preprocess(input_ids=..., input_embeds=..., **req_info)`` per
+        request, updates ``model_intermediate_buffer``, and on decode steps runs
+        ``model.talker_mtp(...)`` to fold residual acoustic embeddings into
+        ``inputs_embeds`` and record ``codes["audio"]``.
+        Adapted for TPU: resolves 1D multimodal row-index slices first via
+        ``_slice_mm_embeds_by_row_indices``, clears/flushes DeepStack buffers
+        across steps, slices/writes ``inputs_embeds[s:e]`` across TPU execution
+        chunks (``_chunk_req_spans``) without CUDAGraph staging buffers, and
+        detaches ``code_predictor_codes`` to CPU.
+        """
         if mm_embed_inputs is not None and self._omni_mm_embeds_list is not None:
             chunk_embeds, is_mm_embed = mm_embed_inputs
             if len(chunk_embeds) == 1 and chunk_embeds[0].ndim == 1:
@@ -348,7 +527,9 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
             self.model._clear_deepstack_input_embeds(
                 self.model.deepstack_input_embeds_num_tokens
             )
-        out_ids, inputs_embeds = super()._get_model_inputs(input_ids, mm_embed_inputs)
+        model_input_ids, inputs_embeds = super()._get_model_inputs(
+            input_ids, mm_embed_inputs
+        )
         if (
             use_deepstack
             and (cleared_deepstack or self.model.deepstack_input_embeds_num_tokens > 0)
@@ -356,7 +537,95 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
             and inputs_embeds.device.type == "tpu"
         ):
             synchronize_tensors(self.model.deepstack_input_embeds, wait=False)
-        return out_ids, inputs_embeds
+        orig_model = _unwrap_model(self.model)
+        chunk_spans = self._chunk_req_spans()
+        if getattr(orig_model, "has_preprocess", False) and chunk_spans:
+            if self._omni_connector_initialized and not getattr(
+                self.model_config, "async_chunk", False
+            ):
+                self._sync_local_stage_payloads()
+            preprocess_ids = (
+                model_input_ids if model_input_ids is not None else input_ids
+            )
+            if inputs_embeds is None and preprocess_ids is not None:
+                embed_fn = getattr(
+                    orig_model,
+                    "embed_input_ids",
+                    getattr(self.model, "embed_input_ids", None),
+                )
+                if callable(embed_fn):
+                    inputs_embeds = embed_fn(preprocess_ids)
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds.clone()
+            num_computed_arr = self.input_batch.num_computed_tokens_cpu
+            mtp_fn = getattr(orig_model, "talker_mtp", None)
+            for req_id, req_idx, s, e in chunk_spans:
+                if s >= e:
+                    continue
+                req_info = self.model_intermediate_buffer.setdefault(req_id, {})
+                num_computed = (
+                    int(num_computed_arr[req_idx])
+                    if req_idx < len(num_computed_arr)
+                    else 0
+                )
+                req_state = self.requests.get(req_id)
+                prompt_token_ids = (
+                    getattr(req_state, "prompt_token_ids", None)
+                    if req_state is not None
+                    else None
+                )
+                prompt_len = len(prompt_token_ids) if prompt_token_ids else 0
+                is_prefill = (
+                    (num_computed < prompt_len)
+                    if prompt_len > 0
+                    else (num_computed == 0)
+                )
+                req_info["_omni_prompt_len"] = prompt_len
+                req_info["_omni_num_computed_tokens"] = num_computed
+                req_info["_omni_is_prefill"] = is_prefill
+                r_ids = preprocess_ids[s:e] if preprocess_ids is not None else None
+                r_embeds = inputs_embeds[s:e] if inputs_embeds is not None else None
+                p_ids, p_embeds, update_dict = orig_model.preprocess(
+                    input_ids=r_ids, input_embeds=r_embeds, **req_info
+                )
+                self._update_intermediate_buffer(req_id, update_dict)
+                if isinstance(p_embeds, torch.Tensor):
+                    if inputs_embeds is None:
+                        total_tokens = (
+                            preprocess_ids.shape[0] if preprocess_ids is not None else e
+                        )
+                        inputs_embeds = torch.zeros(
+                            (total_tokens, p_embeds.shape[-1]),
+                            dtype=p_embeds.dtype,
+                            device=p_embeds.device,
+                        )
+                    p_len = min(e - s, p_embeds.shape[0])
+                    inputs_embeds[s : s + p_len] = p_embeds[:p_len].to(
+                        device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                    )
+                mtp_inputs = req_info.pop("mtp_inputs", None)
+                if (
+                    not is_prefill
+                    and callable(mtp_fn)
+                    and mtp_inputs is not None
+                    and inputs_embeds is not None
+                ):
+                    last_talker_hidden, text_step = mtp_inputs
+                    mtp_embeds, code_predictor_codes = mtp_fn(
+                        p_ids,
+                        inputs_embeds[s:e],
+                        last_talker_hidden.to(device=inputs_embeds.device),
+                        text_step.to(device=inputs_embeds.device),
+                    )
+                    inputs_embeds[s:e] = mtp_embeds.reshape(-1, inputs_embeds.shape[-1])
+                    if isinstance(code_predictor_codes, torch.Tensor):
+                        code_predictor_codes = code_predictor_codes.detach().cpu()
+                    self._update_intermediate_buffer(
+                        req_id, {"codes": {"audio": code_predictor_codes}}
+                    )
+            if inputs_embeds is not None:
+                return None, inputs_embeds
+        return model_input_ids, inputs_embeds
 
     def forward_model(
         self,
@@ -365,23 +634,21 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> tuple[torch.Tensor | IntermediateTensors, torch.Tensor | None]:
-        """Run the stage model and return ``(hidden_states, aux_hidden_states)``.
+        """Run the stage model, execute postprocess hooks, and record chunk outputs.
 
-        vLLM-Omni's runner (``OmniGPUModelRunner._model_forward``) normalises
-        whatever an Omni stage model returns through ``model.make_omni_output``
-        into an ``OmniOutput``: the text hidden states to sample from plus the
-        multimodal sidecar the next stage consumes. ``TPUModelRunner.forward_model``
-        instead unwraps by shape, for vLLM's ``(hidden_states,
-        aux_hidden_states)`` draft-model convention, which an ``OmniOutput``
-        (a four-field NamedTuple) or a staged thinker's ``(hidden_states,
-        captured_layers)`` would match by accident. This override applies the
-        Omni contract when ``make_omni_output`` is present (pipeline-parallel
-        ``IntermediateTensors`` pass through, everything else goes through
-        ``make_omni_output`` and only ``text_hidden_states`` continues; the
-        sidecar is dropped because ``__init__`` refuses multi-stage configs),
-        and falls back to ``TPUModelRunner.forward_model``'s unwrapping for
-        plain vLLM models that do not define ``make_omni_output``.
+        Normalises Omni stage outputs through ``model.make_omni_output`` into an
+        ``OmniOutput`` and records per-chunk ``multimodal_outputs`` in
+        ``_omni_chunk_outputs`` for active execution chunks so
+        ``_populate_inter_stage_outputs`` can slice and attach inter-stage
+        payloads across single-chunk or multi-chunk steps. Consumes
+        ``_omni_chunk_req_slice`` before returning so warmup ``_dummy_run``
+        calls never observe stale request spans, and falls back to
+        ``TPUModelRunner.forward_model``'s unwrapping for plain vLLM models that
+        do not define ``make_omni_output``.
         """
+        chunk_spans = self._chunk_req_spans()
+        self._omni_chunk_req_slice = None
+
         kwargs: dict[str, Any] = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
@@ -397,12 +664,147 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
         # list or tuple; the same unwrap as TPUModelRunner.forward_model.
         if isinstance(out, (list, tuple)) and len(out) == 1:
             out = out[0]
+        orig_model = _unwrap_model(self.model)
+        has_postprocess = bool(getattr(orig_model, "has_postprocess", False))
+        if has_postprocess and chunk_spans and isinstance(out, torch.Tensor):
+            for req_id, _req_idx, s, e in chunk_spans:
+                req_info = self.model_intermediate_buffer.get(req_id, {})
+                post_kwargs = {
+                    k: v for k, v in req_info.items() if k != "hidden_states"
+                }
+                update_dict = orig_model.postprocess(out[s:e], **post_kwargs)
+                self._update_intermediate_buffer(req_id, update_dict)
+
+        make_fn = getattr(orig_model, "make_omni_output", None)
+        aux_hidden: torch.Tensor | None = None
         if isinstance(out, OmniOutput):
-            return out.text_hidden_states, None
-        make_omni_output = getattr(self.model, "make_omni_output", None)
-        if callable(make_omni_output):
-            omni_out = make_omni_output(out)
-            return omni_out.text_hidden_states, None
-        if isinstance(out, (list, tuple)) and len(out) == 2:
-            return out[0], out[1]
-        return out, None
+            omni_out: OmniOutput | None = out
+            text_hidden = out.text_hidden_states
+        elif callable(make_fn) and (chunk_spans or not has_postprocess):
+            make_kwargs: dict[str, Any] = {}
+            if chunk_spans and has_postprocess:
+                make_kwargs["model_intermediate_buffer"] = [
+                    self.model_intermediate_buffer.get(rid, {})
+                    for rid, _, _, _ in chunk_spans
+                ]
+            res = make_fn(out, **make_kwargs)
+            omni_out = res if isinstance(res, OmniOutput) else None
+            # Talker's make_omni_output slices talker_hidden[:span_len] to match
+            # unpadded audio codes, whereas TPUModelRunner.execute_model indexes
+            # the full padded bucket tensor at logits_indices.
+            if has_postprocess and isinstance(out, torch.Tensor):
+                text_hidden = out
+            else:
+                text_hidden = (
+                    omni_out.text_hidden_states if omni_out is not None else res
+                )
+        elif not callable(make_fn):
+            omni_out = None
+            if isinstance(out, (list, tuple)) and len(out) == 2:
+                text_hidden, aux_hidden = out[0], out[1]
+            else:
+                text_hidden = out
+        else:
+            omni_out = None
+            text_hidden = out[0] if isinstance(out, tuple) else out
+
+        if (
+            chunk_spans
+            and omni_out is not None
+            and isinstance(omni_out.multimodal_outputs, dict)
+            and omni_out.multimodal_outputs
+        ):
+            self._omni_chunk_outputs.append((chunk_spans, omni_out.multimodal_outputs))
+
+        return text_hidden, aux_hidden
+
+    def _populate_inter_stage_outputs(self, real_output: ModelRunnerOutput) -> None:
+        chunk_outputs = list(self._omni_chunk_outputs)
+        self._omni_chunk_outputs.clear()
+        req_ids = real_output.req_ids
+        if not chunk_outputs or not req_ids:
+            return
+        payload_by_req_id: dict[str, dict[str, Any]] = {}
+        for chunk_spans, raw_mm in chunk_outputs:
+            for local_idx, (req_id, _batch_idx, tok_start, tok_end) in enumerate(
+                chunk_spans
+            ):
+                sliced = _slice_inter_stage_payload(
+                    raw_mm, local_idx, tok_start, tok_end
+                )
+                if req_id in payload_by_req_id:
+                    payload_by_req_id[req_id] = _merge_chunk_payload(
+                        payload_by_req_id[req_id], sliced
+                    )
+                else:
+                    payload_by_req_id[req_id] = sliced
+        if not payload_by_req_id:
+            return
+        per_req_payloads = [payload_by_req_id.get(rid, {}) for rid in req_ids]
+        real_output.inter_stage_outputs = per_req_payloads  # type: ignore[attr-defined]
+        if (
+            self._omni_connector_initialized
+            and self._should_accumulate_full_payload_output()
+        ):
+            for idx, rid in enumerate(req_ids):
+                req_state = self.requests.get(rid)
+                if req_state is not None and per_req_payloads[idx]:
+                    self.accumulate_full_payload_output(
+                        rid, flatten_payload(per_req_payloads[idx]), req_state
+                    )
+
+    def _with_omni_connector_output(
+        self,
+        output: ModelRunnerOutput | AsyncTPUModelRunnerOutput | None,
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput | None:
+        """Attach inter-stage payloads and connector signals before ``get_output()``."""
+        if output is None:
+            return None
+        if isinstance(output, AsyncTPUModelRunnerOutput):
+            self._populate_inter_stage_outputs(output._model_runner_output)
+            if self._omni_connector_initialized:
+                output._model_runner_output = self.attach_omni_connector_output(
+                    output._model_runner_output
+                )
+            return output
+        self._populate_inter_stage_outputs(output)
+        if self._omni_connector_initialized:
+            return self.attach_omni_connector_output(output)
+        return output
+
+    def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput | None:
+        self._omni_chunk_req_slice = None
+        self._omni_chunk_outputs.clear()
+        if self._omni_connector_initialized:
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if getattr(self, "_pending_full_payload_send", None):
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update(
+                    {
+                        rid
+                        for rid in self._pending_full_payload_send
+                        if rid not in self.requests
+                    }
+                )
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
+        try:
+            return self._with_omni_connector_output(
+                super().execute_model(scheduler_output, intermediate_tensors)
+            )
+        finally:
+            self._omni_chunk_req_slice = None
+            self._omni_mm_embeds_list = None
+
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None = None
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        return self._with_omni_connector_output(  # type: ignore[return-value]
+            super().sample_tokens(grammar_output)
+        )
