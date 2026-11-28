@@ -848,6 +848,9 @@ def _select_fp8_indexer_jax(
         functools.partial(
             indexer.pipeline_score_topk_bounded,
             scheduling_groups=tile_consume is None,
+            # Attention one tile behind its gather (`csa2_adapter`) needs
+            # only the gathered KV, not the next selection.
+            gate_output=tile_consume is None,
         )
         if bounded
         else indexer.pipeline_score_topk_unrolled

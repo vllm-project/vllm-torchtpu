@@ -57,6 +57,7 @@ def pipeline_score_topk_bounded(
     output: Any,
     *,
     scheduling_groups: bool = True,
+    gate_output: bool = True,
 ) -> Any:
     """Bound score lifetime and pair next-tile scoring with current selection.
 
@@ -64,7 +65,10 @@ def pipeline_score_topk_bounded(
     With ``scheduling_groups``, each pair gets a program-unique group so the
     compiler keeps TensorCore scoring between SparseCore selection start and
     completion. A group admits no other work into that window, so a writer
-    that starts SparseCore work of its own runs without groups.
+    that starts SparseCore work of its own runs without groups. With
+    ``gate_output``, each write's output also waits for the next selection;
+    a writer whose output carries work independent of it (attention one tile
+    behind its gather) runs without, so that work need not wait.
     ``write(tile, selected, output, following)`` returns ``(output,
     following)``: ``following`` is the input of the pipeline's next step,
     the next tile's prepared scoring or the last tile's scores (None at the
@@ -99,18 +103,26 @@ def pipeline_score_topk_bounded(
                 # Gating on the output too completes each write within the
                 # next pair, so work the write starts on a tile's selection
                 # overlaps the following scoring instead of trailing it.
-                previous, current, prepared, output = lax.optimization_barrier(
-                    (previous, current, prepared, output)
-                )
+                if gate_output:
+                    previous, current, prepared, output = lax.optimization_barrier(
+                        (previous, current, prepared, output)
+                    )
+                else:
+                    previous, current, prepared = lax.optimization_barrier(
+                        (previous, current, prepared)
+                    )
                 output, prepared = write(tile - 1, previous, output, prepared)
             group = None if group_base is None else group_base + tile
             following = score(prepared, group)
             previous = select(jnp.int32(tile), current, group)
             current = following
         if previous is not None:
-            previous, current, output = lax.optimization_barrier(
-                (previous, current, output)
-            )
+            if gate_output:
+                previous, current, output = lax.optimization_barrier(
+                    (previous, current, output)
+                )
+            else:
+                previous, current = lax.optimization_barrier((previous, current))
             output, current = write(num_tiles - 2, previous, output, current)
         last = num_tiles - 1
         selected = select(jnp.int32(last), current, None)
