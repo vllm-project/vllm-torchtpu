@@ -517,6 +517,10 @@ def block_topk(
                 keys[pl.ds(i * lanes, lanes)] = bits.view(jnp.int32)
                 radix.add(bits)
 
+            if buffers == 1:
+                # The row's scores are last read above, so the next row's copy
+                # overlaps this row's threshold, emission and records.
+                pl.when(row_id + stride < rows)(lambda: start_row(row_id + stride, 0))
             selection = radix.threshold(keys, key_chunks, k)
 
             @pl.when(row_id > first)
@@ -537,8 +541,6 @@ def block_topk(
                 for copy in record_copies(row_id):
                     copy.start()
             pltpu.async_copy(output, out_ref.at[row_id], output_sem)
-            if buffers == 1:
-                pl.when(row_id + stride < rows)(lambda: start_row(row_id + stride, 0))
 
         @pl.when(first < rows)
         def drain():
