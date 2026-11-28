@@ -628,6 +628,7 @@ class StagedTransferScheduler:
         log_interval_s: float = 60.0,
         clock: Callable[[], float] = time.monotonic,
         store_reserve: int = 0,
+        rescue_split: bool = False,
     ):
         self._manager = manager
         # Bytes of one row on one rank (stats only; 0 leaves bytes out).
@@ -646,6 +647,10 @@ class StagedTransferScheduler:
         # a write-back store whose blocks are about to be reallocated needs
         # rows at once. Never so many that a full load part cannot start.
         self.store_reserve = max(0, min(store_reserve, num_rows - self.max_part_rows))
+        # TPU_RAIDEN_STAGED_RESCUE_SPLIT: a flush rescue packs only the
+        # reallocated blocks of a queued part (the rest stays queued), and with
+        # fewer free rows than that packs what fits and cancels only the rest.
+        self.rescue_split = rescue_split
         self._next_part_id = _PART_ID_BASE
         self._parts: dict[int, _Part] = {}
         self._jobs: dict[int, _BaseJob] = {}
@@ -819,6 +824,9 @@ class StagedTransferScheduler:
         if reallocated.isdisjoint(part.device_block_ids):
             self.stats["store_kept_queued_parts"] += 1
             return True
+        if self.rescue_split:
+            self._rescue_split(part, reallocated, out)
+            return True
         rows = self.rows.take(len(part.keys))
         if rows is None:
             return False
@@ -830,6 +838,60 @@ class StagedTransferScheduler:
         self.stats["store_rescued_urgent_parts"] += 1
         self.stats["store_rescued_urgent_blocks"] += len(part.keys)
         return True
+
+    def _rescue_split(
+        self, part: _Part, reallocated: set[int], out: StagedStepOutput
+    ) -> None:
+        """TPU_RAIDEN_STAGED_RESCUE_SPLIT: rescue a queued part block by block.
+
+        Only the part's reallocated blocks lose data this step. They move to a
+        new urgent part that takes free rows now and packs before the forward;
+        the part's other blocks stay queued. A part of up to `max_part_rows`
+        blocks usually has only a few blocks at the free-queue head, so this
+        needs far fewer rows than packing the whole part. With fewer free rows
+        than reallocated blocks, the first ones that fit are packed and only
+        the rest are cancelled (not the whole part)."""
+        job = self._jobs[part.base_job_id]
+        hit = [i for i, b in enumerate(part.device_block_ids) if b in reallocated]
+        n = min(len(hit), self.rows.num_free)
+        take, lost = hit[:n], hit[n:]
+        if take:
+            rows = self.rows.take(n)
+            assert rows is not None
+            urgent = _Part(
+                part_id=self._next_part_id,
+                base_job_id=part.base_job_id,
+                is_store=True,
+                keys=[part.keys[i] for i in take],
+                device_block_ids=[part.device_block_ids[i] for i in take],
+                rows=rows,
+                state="fencing",
+                urgent=True,
+            )
+            self._next_part_id += 1
+            self._parts[urgent.part_id] = urgent
+            job.outstanding.add(urgent.part_id)
+            out.urgent_packs[urgent.part_id] = (
+                list(urgent.device_block_ids),
+                list(rows),
+            )
+            self.stats["store_rescued_urgent_parts"] += 1
+            self.stats["store_rescued_urgent_blocks"] += n
+        if lost:
+            self._manager.on_store_job_cancelled([part.keys[i] for i in lost])
+            self.stats["store_cancelled_queued_parts"] += 1
+            self.stats["store_cancelled_queued_blocks"] += len(lost)
+        moved = set(hit)
+        if len(moved) < len(part.keys):
+            self.stats["store_split_queued_parts"] += 1
+        part.keys = [k for i, k in enumerate(part.keys) if i not in moved]
+        part.device_block_ids = [
+            b for i, b in enumerate(part.device_block_ids) if i not in moved
+        ]
+        if not part.keys:
+            self._store_queue.remove(part.part_id)
+            del self._parts[part.part_id]
+            job.outstanding.discard(part.part_id)
 
     # -- per step ------------------------------------------------------------
 
@@ -895,7 +957,7 @@ class StagedTransferScheduler:
                 "urgent without rows %d jobs; rescue: %d queued parts kept "
                 "(no reallocated block), %d parts (%d blocks) packed before the "
                 "forward, %d packed parts kept, %d queued parts (%d blocks) "
-                "cancelled (no rows)",
+                "cancelled (no rows), %d queued parts split",
                 elapsed,
                 c["store_urgent_parts"],
                 c["store_urgent_no_rows"],
@@ -905,6 +967,7 @@ class StagedTransferScheduler:
                 c["store_rescued_packed_parts"],
                 c["store_cancelled_queued_parts"],
                 c["store_cancelled_queued_blocks"],
+                c["store_split_queued_parts"],
             )
         c.clear()
         return True

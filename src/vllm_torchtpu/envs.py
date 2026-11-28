@@ -286,6 +286,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_WB_DROP_COVERED: bool = False
     TPU_RAIDEN_STAGED_RESCUE: bool = False
     TPU_RAIDEN_STAGING_STORE_RESERVE: int = 0
+    TPU_RAIDEN_STAGED_RESCUE_SPLIT: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1978,6 +1979,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_RAIDEN_STAGED_RESCUE packs) find rows during load bursts. Clamped so
     # a full load part can always start. 0 = loads may take every row.
     "TPU_RAIDEN_STAGING_STORE_RESERVE": env_int("TPU_RAIDEN_STAGING_STORE_RESERVE", 0),
+    # With TPU_RAIDEN_STAGED_RESCUE: rescue a flushed queued part block by
+    # block. Only its reallocated blocks pack before the forward (a new urgent
+    # part); the rest stays queued. Without enough free rows, the blocks that
+    # fit pack and only the others are cancelled. Scheduler-side.
+    "TPU_RAIDEN_STAGED_RESCUE_SPLIT": env_bool(
+        "TPU_RAIDEN_STAGED_RESCUE_SPLIT", default=False
+    ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(

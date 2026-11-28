@@ -714,6 +714,99 @@ class TestStagedStores(unittest.TestCase):
         clamped = rs.StagedTransferScheduler(manager, 4, 2, store_reserve=9)
         self.assertEqual(clamped.store_reserve, 2)
 
+    def test_rescue_split_packs_only_reallocated_blocks(self):
+        """TPU_RAIDEN_STAGED_RESCUE_SPLIT: only the reallocated blocks of a
+        queued part pack before the forward; the rest stays queued."""
+        store = FakeKVCacheStore()
+        manager = make_manager(store, device_block_size_factor=1, num_blocks=64)
+        staged = rs.StagedTransferScheduler(manager, 8, 2, rescue_split=True)
+        keys = [_key(i) for i in range(4)]  # one part of 4
+        manager.prepare_store(keys, SimpleNamespace(req_id="r"))
+        taken = staged.rows.take(7)  # loads hold 7 of 8 rows: the part cannot fit
+        staged.add_store_job(5, keys, [40, 41, 42, 43])
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={43})
+        ((pid, (blocks, rows)),) = out.urgent_packs.items()
+        self.assertEqual(blocks, [43])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(out.finished_store_job_ids, [])
+        for k in keys:
+            self.assertIn(k, manager._inflight_store_keys)
+        self.assertEqual(staged.stats["store_rescued_urgent_blocks"], 1)
+        self.assertEqual(staged.stats["store_split_queued_parts"], 1)
+        self.assertEqual(staged.stats["store_cancelled_queued_parts"], 0)
+        # The urgent part saves from its row; the rest packs once rows return.
+        staged.on_fenced({pid: 2})
+        (insert,) = store.calls_named("insert")
+        self.assertEqual([s.device_block_id for s in insert.args[1]], rows)
+        staged.rows.give(taken)
+        out = _step(staged)
+        ((pid2, (blocks2, _)),) = out.packs.items()
+        self.assertEqual(blocks2, [40, 41, 42])
+
+    def test_rescue_split_cancels_only_blocks_without_rows(self):
+        store = FakeKVCacheStore()
+        manager = make_manager(store, device_block_size_factor=1, num_blocks=64)
+        staged = rs.StagedTransferScheduler(manager, 8, 2, rescue_split=True)
+        keys = [_key(i) for i in range(4)]
+        manager.prepare_store(keys, SimpleNamespace(req_id="r"))
+        staged.rows.take(7)
+        staged.add_store_job(5, keys, [40, 41, 42, 43])
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={41, 43})
+        ((pid, (blocks, _)),) = out.urgent_packs.items()
+        self.assertEqual(blocks, [41])
+        self.assertNotIn(keys[3], manager._inflight_store_keys)
+        for k in keys[:3]:
+            self.assertIn(k, manager._inflight_store_keys)
+        self.assertEqual(staged.stats["store_cancelled_queued_blocks"], 1)
+        # A second flush of the same job leaves the urgent part alone and
+        # keeps the queued remainder [40, 42] (no reallocated block).
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={41})
+        self.assertEqual(out.urgent_packs, {})
+        self.assertEqual(staged.stats["store_kept_queued_parts"], 1)
+
+    def test_rescue_split_whole_part_reallocated_without_rows(self):
+        """Every block reallocated and no free rows: the part is cancelled and
+        the job finishes, as without the split."""
+        store = FakeKVCacheStore()
+        manager = make_manager(store, device_block_size_factor=1, num_blocks=64)
+        staged = rs.StagedTransferScheduler(manager, 4, 2, rescue_split=True)
+        keys = [_key(i) for i in range(2)]
+        manager.prepare_store(keys, SimpleNamespace(req_id="r"))
+        staged.rows.take(4)
+        staged.add_store_job(5, keys, [40, 41])
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={40, 41})
+        self.assertEqual(out.urgent_packs, {})
+        self.assertEqual(out.finished_store_job_ids, [5])
+        for k in keys:
+            self.assertNotIn(k, manager._inflight_store_keys)
+        self.assertFalse(staged.has_pending_work())
+
+    def test_rescue_split_job_finishes_after_urgent_and_queued_parts(self):
+        store = FakeKVCacheStore()
+        manager = make_manager(store, device_block_size_factor=1, num_blocks=64)
+        staged = rs.StagedTransferScheduler(manager, 8, 2, rescue_split=True)
+        keys = [_key(i) for i in range(3)]
+        manager.prepare_store(keys, SimpleNamespace(req_id="r"))
+        taken = staged.rows.take(7)
+        staged.add_store_job(5, keys, [40, 41, 42])
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={40})
+        ((pid, _),) = out.urgent_packs.items()
+        staged.on_fenced({pid: 2})
+        staged.rows.give(taken)
+        out = _step(staged)
+        ((pid2, _),) = out.packs.items()
+        staged.on_fenced({pid2: 2})
+        for save in store.calls_named("save"):
+            store.complete_save(save.args[0])
+        out = _step(staged)
+        self.assertEqual(out.finished_store_job_ids, [5])
+        self.assertEqual(staged.rows.num_free, 8)
+
     def test_flush_without_rescue_still_cancels_whole_job(self):
         store, manager, staged = _staged(rows=4)
         keys = [_key(i) for i in range(4)]

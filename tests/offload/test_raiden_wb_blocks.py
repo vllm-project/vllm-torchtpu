@@ -265,7 +265,9 @@ def test_late_store_job_skips_the_fence():
     mgr.drain_jobs.assert_called_once_with({7})
 
 
-def _staged_late_step(num_rows, taken=0, rescue=False, store_blocks=(6,)):
+def _staged_late_step(
+    num_rows, taken=0, rescue=False, store_blocks=(6,), rescue_split=False
+):
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
         OffloadingConnectorMetadata,
     )
@@ -286,7 +288,7 @@ def _staged_late_step(num_rows, taken=0, rescue=False, store_blocks=(6,)):
     mgr.poll_finished_jobs.return_value = []
     s._raiden_manager = mgr
     s.manager = mgr
-    s._staged = StagedTransferScheduler(mgr, num_rows, 1)
+    s._staged = StagedTransferScheduler(mgr, num_rows, 1, rescue_split=rescue_split)
     if taken:
         s._staged.rows.take(taken)  # rows busy with other transfers
     blocks = list(store_blocks)
@@ -357,6 +359,25 @@ def test_staged_rescue_packs_the_reallocated_part_of_a_late_store():
     assert res.staging_urgent_packs == {}
     cancelled = [c.args[0] for c in mgr.on_store_job_cancelled.call_args_list]
     assert sorted(cancelled) == [[keys[1]], [keys[2]]]
+
+
+def test_staged_rescue_split_packs_only_the_reallocated_block():
+    """TPU_RAIDEN_STAGED_RESCUE_SPLIT: one free row, a queued part [6, 7] of
+    which only 6 is reallocated: 6 packs before the forward, 7 stays queued
+    (without the split the part needs 2 rows and is cancelled)."""
+    s, mgr, keys, res = _staged_late_step(
+        num_rows=4, taken=3, rescue=True, store_blocks=(6, 7), rescue_split=True
+    )
+    ((part_id, (blocks, rows)),) = res.staging_urgent_packs.items()
+    assert blocks == [6] and len(rows) == 1
+    assert part_id in res.fence_job_ids
+    mgr.on_store_job_cancelled.assert_not_called()
+    assert s._staged.stats["store_split_queued_parts"] == 1
+    s, mgr, keys, res = _staged_late_step(
+        num_rows=4, taken=3, rescue=True, store_blocks=(6, 7)
+    )
+    assert res.staging_urgent_packs == {}
+    mgr.on_store_job_cancelled.assert_called_once_with([keys[1], keys[2]])
 
 
 def test_staged_rescue_installs_the_fresh_watch():

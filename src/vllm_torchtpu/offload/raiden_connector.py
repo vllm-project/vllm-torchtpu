@@ -439,17 +439,20 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 self.config.num_workers,
                 row_bytes=row_bytes,
                 store_reserve=tpu_envs.TPU_RAIDEN_STAGING_STORE_RESERVE,
+                rescue_split=self._staged_rescue
+                and bool(tpu_envs.TPU_RAIDEN_STAGED_RESCUE_SPLIT),
             )
             logger.info(
                 "TPURaidenOffloadingConnector: staged offload on (scheduler): "
                 "%d staging rows of ~%d bytes per rank, parts of <= %d blocks; "
                 "transfer stats every 60 s; %d rows reserved for stores, "
-                "staged rescue %s",
+                "staged rescue %s (split %s)",
                 staging_blocks,
                 row_bytes,
                 self._staged.max_part_rows,
                 self._staged.store_reserve,
                 self._staged_rescue,
+                self._staged.rescue_split,
             )
 
     def attach_block_pool(self, block_pool) -> None:
