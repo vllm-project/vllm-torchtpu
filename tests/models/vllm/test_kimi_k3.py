@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import inspect
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -45,6 +46,7 @@ import vllm_torchtpu.models.vllm.kimi_k3 as kimi
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.model as kimi_model
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
+from tests.distributed.tpu_test_utils import run_in_isolated_process
 from vllm_torchtpu.compilation.shape_variants import trace_shape_env, unsupported_reason
 from vllm_torchtpu.distributed import pallas_shapes
 from vllm_torchtpu.kernels.kimi_k3.collectives import ring_tables
@@ -2964,3 +2966,63 @@ def test_kimi_k3_collective_ops_preserve_fake_tensor_shapes(
             assert isinstance(out_tensor.shape[0], torch.SymInt)
             assert statically_known_true(out_tensor.shape[0] == expected_rows)
             assert out_tensor.shape[1] == width
+
+
+# The test below runs on the chip in a spawned child, and spawns_tpu_workers
+# runs it before tests that hold the chip in-process. A TPU compiler abort in
+# the child then fails the test instead of killing pytest.
+
+
+def _run_vision_tower_eagerly(height: int, width: int) -> None:
+    import portpicker
+    from vllm.distributed import (
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+    from vllm.transformers_utils.configs.kimi_k3 import KimiK3VisionConfig
+
+    from vllm_torchtpu import patch_registry
+    from vllm_torchtpu.models.vllm.kimi_k3.kimi_vit import (
+        KimiK3MoonViT3dPretrainedModel,
+    )
+
+    # A worker's setup: DEFER_AND_FUSE eager mode and the TPU vision attention.
+    patch_registry.apply("worker_init")
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"tcp://127.0.0.1:{portpicker.pick_unused_port()}",
+        backend="gloo",
+    )
+    gen = torch.Generator().manual_seed(0)
+    with set_current_vllm_config(VllmConfig()):
+        ensure_model_parallel_initialized(1, 1)
+        # The checkpoint's vision config, with one encoder layer.
+        tower = KimiK3MoonViT3dPretrainedModel(
+            KimiK3VisionConfig(vt_num_hidden_layers=1)
+        )
+        for param in tower.parameters():
+            param.data.normal_(0.0, 0.02, generator=gen)
+        tower = tower.to(device="tpu", dtype=torch.bfloat16)
+        pixels = torch.randn(height * width, 3, 14, 14, generator=gen)
+        with torch.inference_mode():
+            (merged,) = tower(
+                pixels.to(torch.bfloat16).to("tpu"), torch.tensor([[1, height, width]])
+            )
+            got = merged.float().cpu()
+    assert got.shape == (height * width // 4, 4, 1024)
+    assert torch.isfinite(got).all()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+@pytest.mark.parametrize(("height", "width"), [(162, 104), (306, 216)])
+def test_vision_tower_runs_eagerly_on_grids_that_aborted_the_compiler(
+    height: int, width: int
+) -> None:
+    """Eagerly (DEFER_AND_FUSE), the bilinear resize of the position table
+    fused with the patch projection made the TPU compiler abort ("split of a
+    padded window dim is not supported") on these grids; the tower now gives
+    the table a device program of its own."""
+    run_in_isolated_process(partial(_run_vision_tower_eagerly, height, width))
