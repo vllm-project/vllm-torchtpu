@@ -35,6 +35,7 @@ def isolated_environment(monkeypatch):
         "TORCH_TPU_XPROF_SESSION_ID",
         "TPU_NUM_HOSTS",
         "NODE_RANK",
+        "VLLM_DP_INIT_PORTS",
         mp._DONE_SENTINEL,
         mp._DP_DONE_SENTINEL,
     ):
@@ -208,3 +209,82 @@ def test_failed_bootstrap_can_retry(bootstrap):
     rendezvous.side_effect = None
     mp.prepare_mp_multihost_env(config)
     assert os.environ[mp._DONE_SENTINEL] == "2"
+
+
+def test_mp_bootstrap_formats_ipv6_addresses(monkeypatch):
+    rendezvous = Mock(return_value=(["2001:db8::1", "2001:db8::2"], "session"))
+    topology = Mock(return_value="2,2,2")
+    monkeypatch.setattr(mp, "_rendezvous_host_ips", rendezvous)
+    monkeypatch.setattr(tpu_platform, "get_tpu_multihost_topology", topology)
+    config = SimpleNamespace(
+        nnodes=2,
+        node_rank=0,
+        local_world_size=2,
+        master_addr="2001:db8::1",
+        master_port=9000,
+    )
+    mp.prepare_mp_multihost_env(config)
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == (
+        "[2001:db8::1]:8070,[2001:db8::1]:8071,[2001:db8::2]:8070,[2001:db8::2]:8071"
+    )
+
+
+def test_mp_bootstrap_preserves_preset_slicebuilder_addresses(monkeypatch, bootstrap):
+    preset = "[2001:db8::1]:18001,[2001:db8::2]:19005"
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", preset)
+    config = SimpleNamespace(
+        nnodes=2,
+        node_rank=0,
+        local_world_size=1,
+        master_addr="10.0.0.1",
+        master_port=9000,
+    )
+    mp.prepare_mp_multihost_env(config)
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == preset
+    assert os.environ["TORCH_TPU_TOPOLOGY"] == "1,2,2,2"
+
+
+def test_dp_bootstrap_ipv6_preset_addresses_and_dp_init_ports(monkeypatch):
+    rendezvous = Mock(return_value=(["2001:db8::1", "2001:db8::2"], "session"))
+    topology = Mock(return_value="2,2,1")
+    monkeypatch.setattr(mp, "_rendezvous_host_ips", rendezvous)
+    monkeypatch.setattr(tpu_platform, "get_tpu_multihost_topology", topology)
+    monkeypatch.setenv("VLLM_DP_INIT_PORTS", "15000,15001,15002,15003,15004")
+
+    config = SimpleNamespace(
+        data_parallel_size=4,
+        data_parallel_size_local=2,
+        data_parallel_rank=0,
+        data_parallel_rpc_port=9000,
+        data_parallel_master_ip="2001:db8::1",
+        world_size=1,
+    )
+    assert mp.prepare_mp_multihost_dp_env(config, 4)
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == (
+        "[2001:db8::1]:8070,[2001:db8::1]:8071,[2001:db8::2]:8070,[2001:db8::2]:8071"
+    )
+    assert config._data_parallel_master_port_list == [
+        15000,
+        15001,
+        15002,
+        15003,
+        15004,
+    ]
+
+    # Re-entry with pre-set TORCH_TPU_SLICEBUILDER_ADDRESSES on a fresh run
+    monkeypatch.delenv(mp._DP_DONE_SENTINEL)
+    preset = (
+        "[2001:db8::1]:21000,[2001:db8::1]:21007,"
+        "[2001:db8::2]:22001,[2001:db8::2]:22009"
+    )
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", preset)
+    config._data_parallel_master_port_list = [42]
+    assert mp.prepare_mp_multihost_dp_env(config, 4)
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == preset
+    assert config._data_parallel_master_port_list == [
+        15000,
+        15001,
+        15002,
+        15003,
+        15004,
+    ]

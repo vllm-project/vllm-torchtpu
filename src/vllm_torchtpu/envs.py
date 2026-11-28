@@ -208,6 +208,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
     VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
+    VLLM_DP_INIT_PORTS: list[int] | None = None
 
 
 def env_with_choices(
@@ -1322,6 +1323,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When unset, rvllm is looked up on PATH.
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
+    ),
+    # Explicit comma-separated DP-init ports for multi-host `mp` DP launches
+    # in container environments where orchestrators reserve fixed port ranges
+    # and block derived `data_parallel_rpc_port + 100 + i` ports.
+    "VLLM_DP_INIT_PORTS": lambda: (
+        [int(p.strip()) for p in raw.split(",") if p.strip()]
+        if (raw := os.getenv("VLLM_DP_INIT_PORTS")) and raw.strip()
+        else None
     ),
 }
 
