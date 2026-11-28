@@ -189,14 +189,15 @@ def _kernel(
     me = rank_ref[0]
     qmax = float(jnp.finfo(weight_dtype).max)
     chunk = h // n_ranks
-    barrier = pltpu.get_barrier_semaphore()
-    for d in range(n_ranks):
-        pl.semaphore_signal(
-            barrier,
-            inc=1,
-            device_id=(jnp.int32(d),),
-            device_id_type=pl.DeviceIdType.MESH,
-        )
+    barrier = pltpu.get_barrier_semaphore() if n_ranks > 1 else None
+    if barrier is not None:
+        for d in range(n_ranks):
+            pl.semaphore_signal(
+                barrier,
+                inc=1,
+                device_id=(jnp.int32(d),),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
 
     shared_copies = [
         pltpu.make_async_copy(shared_w1_hbm, shared_w1_vmem, shared_sem.at[0]),
@@ -392,6 +393,13 @@ def _kernel(
             first_matmul(w1_ring.at[0]),
         )
 
+    if n_ranks <= 1:
+        if rows is not None:
+            out_ref[...] = acc_ref[: out_ref.shape[0], :].astype(out_ref.dtype)
+        else:
+            out_ref[...] = acc_ref[...].astype(out_ref.dtype)
+        return
+
     def all_to_all_sum(send_slice, dst):
         """Reduce-scatter semantics by a direct all-to-all and a local sum,
         which both output modes end with. send_slice(d) is this rank's partial
@@ -401,6 +409,7 @@ def _kernel(
         concurrent copies, where a ring needs n - 1 dependent steps for the
         same bytes, which suits the latency-bound sizes of decode."""
         # Every peer has entered this call, so its receive buffer is live.
+        assert barrier is not None
         pl.semaphore_wait(barrier, n_ranks)
         copies = [
             pltpu.make_async_remote_copy(
@@ -715,7 +724,7 @@ def fused_moe_decode(
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            collective_id=0,
+            collective_id=0 if n_ranks > 1 else None,
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
         ),
         name=f"fused_moe_decode{'_rs' if rows else ''}-e_{experts}-m_{m}-h_{h}"

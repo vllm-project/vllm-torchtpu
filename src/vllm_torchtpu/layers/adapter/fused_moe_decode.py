@@ -513,6 +513,77 @@ def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
         )
 
 
+_SINGLE_RANK_MESH_CACHE: dict[tuple[int, int, str], Any] = {}
+
+
+def _build_single_rank_mesh() -> Any | None:
+    """Build (and cache) a 1-device JAX mesh over the local TPU at TP=1 / world_size=1.
+
+    `build_ep_mesh()` returns None when `world_size <= 1`; `fused_moe_decode_kernel`
+    handles `n_ranks <= 1` by skipping the entry barrier, remote DMAs, and
+    `collective_id`.
+
+    `torch.tpu.pallas.get_pallas_mesh()` currently assigns device id 0 when
+    `world_size == 1`, which mismatches odd TPU v7x TensorCores (visible chips
+    1, 3, 5, 7) whose PJRT device id is 1. When they differ, re-wrap the single
+    device with `_get_tpu_global_device_id()` so multiple independent TP=1
+    engines can share a multi-core TPU v7x host, and cache the resulting mesh
+    so target and draft models share `_OPS` entries.
+    """
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    if (
+        get_tensor_model_parallel_world_size() != 1
+        or not torch.distributed.is_initialized()
+        or int(torch.distributed.get_world_size()) != 1
+    ):
+        return None
+
+    import numpy as np
+    from jax.sharding import Mesh
+    from torch.tpu.pallas import get_pallas_mesh
+
+    from vllm_torchtpu.distributed.mesh_utils import _get_tpu_global_device_id
+
+    ranked = get_pallas_mesh(axis_names=(EP_AXIS_NAME,))
+    dev0 = ranked.devices.flat[0]
+    dev0_id = int(dev0.id)
+    dev_id = int(_get_tpu_global_device_id())
+    cache_key = (dev0_id, dev_id, str(dev0.device_kind))
+    cached = _SINGLE_RANK_MESH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if dev0_id != dev_id:
+        # TODO(google-pytorch/torch_tpu#7208): remove re-wrap once
+        # torch_tpu's get_pallas_mesh() returns the local PJRT device id
+        # for world_size == 1.
+        from torch_tpu._internal.pallas.pallas import _PallasDevice
+
+        logger.info(
+            "Re-wrapping 1-rank Pallas mesh device id %d -> %d (%s)",
+            dev0_id,
+            dev_id,
+            dev0.device_kind,
+        )
+        mesh = Mesh(
+            np.array(
+                [
+                    _PallasDevice(
+                        id=dev_id,
+                        process_index=0,
+                        device_kind=dev0.device_kind,
+                    )
+                ]
+            ),
+            axis_names=(EP_AXIS_NAME,),
+        )
+    else:
+        mesh = ranked
+    _SINGLE_RANK_MESH_CACHE[cache_key] = mesh
+    return mesh
+
+
 def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
     """Arm every eligible MoE layer of `model`; returns how many were armed.
 
@@ -526,6 +597,8 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         return 0
     try:
         mesh = build_ep_mesh()
+        if mesh is None:
+            mesh = _build_single_rank_mesh()
     except Exception as exc:  # refuse rather than serve a wrong reduction
         logger.warning("Fused MoE decode kernel not armed: no mesh (%s)", exc)
         mesh = None
@@ -558,7 +631,7 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         _check_vmem(max_tokens, layer, shared[2].shape[0], n_ranks)
         start = get_experts_start(layer) or 0
         if _RANK_BUFFER is None:
-            _RANK_BUFFER_INDEX = ep_mesh_index()
+            _RANK_BUFFER_INDEX = 0 if n_ranks == 1 else ep_mesh_index()
             _RANK_BUFFER = torch.tensor(
                 [[_RANK_BUFFER_INDEX, start]],
                 dtype=torch.int32,

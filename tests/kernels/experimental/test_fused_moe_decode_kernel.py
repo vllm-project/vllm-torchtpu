@@ -40,13 +40,12 @@ F8 = jnp.float8_e4m3fn
 GLM_SCALE = 2.5  # GLM-5.2's routed_scaling_factor
 
 
-@pytest.fixture(scope="module")
-def setup():
-    if jax.default_backend() != "tpu" or jax.device_count() < N:
-        pytest.skip("requires 8 TPU devices")
-    mesh = Mesh(np.asarray(jax.devices()[:N]), ("d",))
+def _make_setup(n_ranks: int):
+    if jax.default_backend() != "tpu" or jax.device_count() < n_ranks:
+        pytest.skip(f"requires {n_ranks} TPU device(s)")
+    mesh = Mesh(np.asarray(jax.devices()[:n_ranks]), ("d",))
     sh = NamedSharding(mesh, P("d"))
-    rank = jax.device_put(np.arange(N, dtype=np.int32).reshape(N, 1), sh)
+    rank = jax.device_put(np.arange(n_ranks, dtype=np.int32).reshape(n_ranks, 1), sh)
 
     def gen(r):
         ks = jax.random.split(jax.random.fold_in(jax.random.key(3), r[0, 0]), 4)
@@ -82,6 +81,16 @@ def setup():
         NamedSharding(mesh, P()),
     )
     return mesh, sh, rank, weights, shared_gate_weight
+
+
+@pytest.fixture(scope="module")
+def setup():
+    return _make_setup(N)
+
+
+@pytest.fixture(scope="module", params=[1, N])
+def setup_n(request):
+    return request.param, _make_setup(request.param)
 
 
 def _ffn(x, w1, w1_scale, w2, w2_scale):
@@ -160,6 +169,7 @@ def _fused(
     ep=False,
     glm=False,
     i_block=None,
+    n_ranks=N,
 ):
     return fused_moe_decode(
         rank.reshape(-1),
@@ -175,7 +185,7 @@ def _fused(
         None if glm else shared_gate_weight,
         tw,
         ti,
-        n_ranks=N,
+        n_ranks=n_ranks,
         expert_start=rank.reshape(()) * E if ep else None,
         routed_scale=GLM_SCALE if glm else 1.0,
         i_block=i_block,
@@ -198,6 +208,7 @@ def _fallback(
     ti,
     ep=False,
     glm=False,
+    n_ranks=N,
 ):
     """The adapter's per-rank body with every token count above its cap: the GMM
     MoE + shared expert + psum path that replaces the kernel above it."""
@@ -215,7 +226,7 @@ def _fallback(
         shared_gate_weight,
         tw,
         ti,
-        n_ranks=N,
+        n_ranks=n_ranks,
         topk=TOPK,
         expert_parallel=ep,
         max_tokens=1,
@@ -224,13 +235,13 @@ def _fallback(
     )
 
 
-def _inputs(setup, m, ep, padded, seed):
+def _inputs(setup, m, ep, padded, seed, *, n_ranks=N):
     """(run, ids): random routing for m tokens, replicated on every rank;
-    run(fn) gives each rank's output, [N, m, H]."""
+    run(fn) gives each rank's output, [n_ranks, m, H]."""
     mesh, sh, rank, weights, shared_gate_weight = setup
     rng = np.random.default_rng(seed)
     x = rng.normal(size=(m, H)).astype(np.float32)
-    n_global = N * E if ep else E
+    n_global = n_ranks * E if ep else E
     ids = np.stack(
         [rng.choice(n_global, TOPK, replace=False) for _ in range(m)]
     ).astype(np.int32)
@@ -239,11 +250,11 @@ def _inputs(setup, m, ep, padded, seed):
         tw[m - 3 :] = 0
     args = (
         rank,
-        jax.device_put(jnp.tile(jnp.asarray(x, jnp.bfloat16), (N, 1)), sh),
+        jax.device_put(jnp.tile(jnp.asarray(x, jnp.bfloat16), (n_ranks, 1)), sh),
         *weights,
         shared_gate_weight,
-        jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (N, 1)), sh),
-        jax.device_put(jnp.tile(jnp.asarray(ids), (N, 1)), sh),
+        jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (n_ranks, 1)), sh),
+        jax.device_put(jnp.tile(jnp.asarray(ids), (n_ranks, 1)), sh),
     )
     specs = (P("d"),) * 10 + (P(), P("d"), P("d"))
 
@@ -253,7 +264,7 @@ def _inputs(setup, m, ep, padded, seed):
                 fn, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
             )
         )(*args)
-        return np.asarray(out.astype(jnp.float32)).reshape(N, m, H)
+        return np.asarray(out.astype(jnp.float32)).reshape(n_ranks, m, H)
 
     return run, ids
 
@@ -277,16 +288,19 @@ def _max_rel(a, ref):
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("ep", [False, True])
 @pytest.mark.parametrize("path", ["kernel", "blocked", "gmm_fallback"])
-def test_matches_decomposed_layer(setup, m, padded, ep, path):
+def test_matches_decomposed_layer(setup_n, m, padded, ep, path):
+    n_ranks, setup = setup_n
     if path != "kernel" and padded:
         pytest.skip("one padded case per mode")
     if path == "gmm_fallback" and m != 32:
         pytest.skip("one fallback case per mode")
-    run, ids = _inputs(setup, m, ep, padded, seed=m)
+    if n_ranks == 1 and ep:
+        pytest.skip("EP requires multiple ranks")
+    run, ids = _inputs(setup, m, ep, padded, seed=m, n_ranks=n_ranks)
     fn = _PATHS[path]
-    got = run(functools.partial(fn, ep=ep))
+    got = run(functools.partial(fn, ep=ep, n_ranks=n_ranks))
     ref = run(functools.partial(_reference, ep=ep))
-    assert all(np.array_equal(got[0], got[r]) for r in range(N)), "ranks disagree"
+    assert all(np.array_equal(got[0], got[r]) for r in range(n_ranks)), "ranks disagree"
     assert np.isfinite(got).all()
     # FP8 activations and a BF16 all-reduce against f32 math: a few percent per row.
     assert _max_rel(got[0], ref[0]) < 0.08
