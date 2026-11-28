@@ -32,6 +32,8 @@ from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.eagle3 import (
     DraftChunkInputs,
     Eagle3Proposer,
+    _draft_checkpoint_name_map,
+    _draft_head_modules,
     _force_draft_tp1,
     _maybe_pad_dim0,
     _static_shape_args,
@@ -2950,16 +2952,26 @@ def test_static_shape_args_passes_non_tensors_through():
     assert step_idx == 3 and flag is None and t.shape == (2,)
 
 
-@pytest.mark.parametrize("own_lm_head", [False, True])
-@pytest.mark.parametrize("head_style", ["lm_head", "shared_head"])
+@pytest.mark.parametrize(
+    ("own_lm_head", "head_style", "tied_head"),
+    [
+        (False, "lm_head", False),
+        (True, "lm_head", False),
+        (True, "lm_head", True),
+        (False, "shared_head", False),
+        (True, "shared_head", False),
+    ],
+)
 def test_mtp_draft_borrows_target_head_before_loading_weights(
-    monkeypatch, own_lm_head, head_style
+    monkeypatch, own_lm_head, head_style, tied_head
 ):
     """The target's embed_tokens and lm_head are bound before the draft's
     weights stream in, and only the checkpoint copies of borrowed modules are
     skipped: a draft that keeps its own lm_head still loads it. A
     DeepSeek-style draft keeps its head at ``model.layers.<N>.shared_head.head``
-    and must not load that checkpoint copy over the borrowed target head."""
+    and must not load that checkpoint copy over the borrowed target head. A
+    kept head tied to the replaced embedding (Gemma-4 MTP) is stored only as
+    ``model.embed_tokens.weight`` and loads from it as ``lm_head.weight``."""
     import vllm.model_executor.model_loader.utils as loader_utils
     from vllm.model_executor.model_loader import base_loader
 
@@ -2994,7 +3006,9 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
             self.model = torch.nn.Module()
             self.model.embed_tokens = torch.nn.Embedding(4, 2)
             if head_style == "lm_head":
-                self.lm_head = torch.nn.Linear(2, 4)
+                self.lm_head = torch.nn.Linear(2, 4, bias=False)
+                if tied_head:
+                    self.lm_head.weight = self.model.embed_tokens.weight
             else:
                 layer = torch.nn.Module()
                 layer.shared_head = torch.nn.Module()
@@ -3020,10 +3034,15 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
 
     class _Loader:
         def load_weights(self, model, model_config):
+            seen["embed_unused"] = model.is_unused_checkpoint_weight(
+                "model.embed_tokens.weight"
+            )
+            # A tied head has no checkpoint entry of its own.
+            head_entries = [] if tied_head else [(head_name, 2)]
             model.load_weights(
                 [
                     ("model.embed_tokens.weight", 1),
-                    (head_name, 2),
+                    *head_entries,
                     ("model.layers.92.mlp.gate.weight", 3),
                 ]
             )
@@ -3056,5 +3075,42 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     if own_lm_head:
         expected = [head_name] + expected
     assert seen["names"] == expected
+    assert seen["embed_unused"] is not tied_head
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+@pytest.mark.parametrize(
+    ("tied", "head_on_inner", "share_head", "embed_maps_to", "head_maps_to"),
+    [
+        # Gemma-4 MTP: the kept head is tied to the embedding sharing replaced.
+        (True, False, False, "lm_head.weight", "lm_head.weight"),
+        (True, True, False, "model.lm_head.weight", "model.lm_head.weight"),
+        # An untied kept head loads its own entry; the embedding is dropped.
+        (False, False, False, None, "lm_head.weight"),
+        # Both borrowed: both checkpoint copies are dropped.
+        (True, False, True, None, None),
+    ],
+)
+def test_draft_checkpoint_name_map(
+    tied, head_on_inner, share_head, embed_maps_to, head_maps_to
+):
+    draft = torch.nn.Module()
+    draft.model = torch.nn.Module()
+    draft.model.embed_tokens = torch.nn.Embedding(8, 4)
+    head = torch.nn.Linear(4, 8, bias=False)
+    if tied:
+        head.weight = draft.model.embed_tokens.weight
+    head_owner = draft.model if head_on_inner else draft
+    head_owner.lm_head = head
+    head_name = "model.lm_head.weight" if head_on_inner else "lm_head.weight"
+    before = _draft_head_modules(draft)
+    draft.model.embed_tokens = torch.nn.Embedding(8, 6)  # the target's
+    if share_head:
+        head_owner.lm_head = torch.nn.Linear(6, 8, bias=False)
+    name_map = _draft_checkpoint_name_map(draft, before, _draft_head_modules(draft))
+
+    assert name_map("model.embed_tokens.weight") == embed_maps_to
+    assert name_map(head_name) == head_maps_to
+    layer_name = "model.layers.0.self_attn.q_proj.weight"
+    assert name_map(layer_name) == layer_name
