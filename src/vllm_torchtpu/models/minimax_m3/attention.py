@@ -42,6 +42,7 @@ from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3 import index_reuse as msa_index_reuse
+from vllm_torchtpu.models.minimax_m3 import msa_prefill_dump
 from vllm_torchtpu.models.minimax_m3 import sp_o_proj
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
@@ -472,6 +473,24 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.index_reuse_full = None if plan is None else plan.is_full(layer_id)
         # A DCP group over one KV head reads q head-major (`get_msa_dcp_op`).
         self.q_head_major = self.dcp_size > 1 and self.dcp_kv_heads == 1
+        # TPU_MINIMAX_M3_MSA_PREFILL_DUMP (debug, off by default).
+        self._pf_dump = (
+            msa_prefill_dump.wanted(prefix) and self.fp4 and self.dcp_size > 1
+        )
+        if self._pf_dump:
+            from vllm_torchtpu.distributed.dcp import get_dcp_rank
+
+            self.pfd_dcp_rank = get_dcp_rank()
+            self.pfd_msa_cfg = msa_config
+            msa_prefill_dump.alloc(
+                self,
+                get_current_vllm_config(),
+                prefix,
+                self.num_heads,
+                self.head_dim,
+                self.dcp_kv_heads,
+                int(msa_config[1]),
+            )
         self.norm_rope_op = get_qk_norm_rope_op(
             self.num_heads,
             self.num_kv_heads,
@@ -578,6 +597,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             extra = {"dcp_rank": self.dcp_rank} if self.dcp_size > 1 else {}
             if self.scale_cache is not None:
                 extra["scale_cache"] = self.scale_cache.kv_cache
+                if self._pf_dump:
+                    extra["dump_module"] = self
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
                     if self.dcp_lane is not None:

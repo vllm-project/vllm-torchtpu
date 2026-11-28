@@ -25,7 +25,7 @@ from vllm.distributed import get_tp_group
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.minimax_m3 import dcp_pack
+from vllm_torchtpu.models.minimax_m3 import dcp_pack, msa_prefill_dump
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_dcp,
@@ -1395,9 +1395,11 @@ def _get_msa_dcp_fp4_op(
         index_reuse: dict | None = None,
         full: bool = True,
         dcp_lane: torch.Tensor | None = None,
+        dump_module: Any = None,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
+        q_in, iq_dump = q, index_q
         if dcp_lane is not None:
             # Only the split scoring reads dcp_lane, and only steps of
             # SPLIT_MIN..SPLIT_MAX rows take it. The warmup's shape-variant
@@ -1430,6 +1432,10 @@ def _get_msa_dcp_fp4_op(
             kv_cache.copy_(new_kv_cache)
             index_cache.copy_(new_index_cache)
             scale_cache.copy_(new_scale_cache)
+            if dump_module is not None:
+                msa_prefill_dump.stash(
+                    dump_module, iq_dump, q_in, None, metadata, iq_dump.shape[0]
+                )
             return am_given_op(
                 dcp_rank,
                 q,
@@ -1528,12 +1534,16 @@ def _get_msa_dcp_fp4_op(
                 )
             if kvq is not None:
                 score, score_in = score_hm_op, (kvq,)
+                if dump_module is not None:
+                    hd = kvq.shape[2] // 3
+                    iq_dump = kvq[:, :, 2 * hd :].transpose(0, 1)
             else:
                 if kv_heads > 1:
                     k, v, index_q = gather_group_kv(
                         k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
                     )
                 score, score_in = score_op, (k, v, index_q)
+                iq_dump = index_q
             new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score(
                 *score_in,
                 index_k,
@@ -1549,6 +1559,10 @@ def _get_msa_dcp_fp4_op(
             )
         if index_reuse is not None and not shared and kv_heads > 1:
             index_reuse["candidates"] = candidates
+        if dump_module is not None:
+            msa_prefill_dump.stash(
+                dump_module, iq_dump, q_in, candidates, metadata, iq_dump.shape[0]
+            )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
