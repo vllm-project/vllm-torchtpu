@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.compilation import compile_options
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -153,6 +154,10 @@ class TPUWorker(WorkerBase):
         devices=None,
         ip: str = "localhost",
     ):
+        # Arm this process's tpu_compile functions (tpu_compile options, all
+        # off by default) before any compiled function can run.
+        compile_options.apply(vllm_config)
+
         from vllm_torchtpu import patch_registry
 
         patch_registry.apply("worker_init")

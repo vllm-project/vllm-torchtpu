@@ -40,6 +40,8 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
+from vllm_torchtpu.compilation.decorators import tpu_compile
+
 
 class PromptTokenIdsTensor(torch.Tensor):
     """A 2D CPU torch.Tensor representing batched prompt token IDs.
@@ -490,9 +492,7 @@ def _static_pool_impl(
     return pooled
 
 
-_static_pool_compiled = torch.compile(
-    _static_pool_impl, backend="tpu", fullgraph=True, dynamic=False
-)
+_static_pool_compiled = tpu_compile(_static_pool_impl)
 
 
 @dataclass

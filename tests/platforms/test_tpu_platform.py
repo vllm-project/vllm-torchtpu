@@ -484,6 +484,25 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize(
+        "section,match",
+        [
+            ({"fast_compiled_call": 1}, "must be a bool"),
+            ({"fast_call": True}, "unknown keys"),
+            ("on", "must be a JSON object"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    def test_malformed_tpu_compile_is_refused_at_startup(
+        self, mock_apply_patches, vllm_config, section, match
+    ):
+        """Before any worker arms the options: under a multiprocess executor
+        the workers are spawned only after this check."""
+        vllm_config.additional_config = {"tpu_compile": section}
+        with pytest.raises(ValueError, match=match):
+            TpuPlatform.check_and_update_config(vllm_config)
+        mock_apply_patches.assert_not_called()
+
     @pytest.mark.parametrize("layout", ["HND", "NHD"])
     @pytest.mark.parametrize(
         "swa_head_dim,global_head_dim,refused_under_hnd",

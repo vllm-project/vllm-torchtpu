@@ -89,6 +89,7 @@ from vllm.v1.outputs import (
 from vllm_torchtpu import envs, rope_in_graph_flag, rope_patch, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.connector_names import (
     RAIDEN_PD_CONNECTOR_NAMES,
@@ -336,10 +337,9 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
-_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-_reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
-_rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
-_rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
+_reset_read_offsets_compiled = tpu_compile(_reset_read_offsets_impl)
+_rollback_offsets_seed_compiled = tpu_compile(_rollback_offsets_seed_impl)
+_rollback_offsets_migrate_compiled = tpu_compile(_rollback_offsets_migrate_impl)
 
 
 def _reset_read_offsets(
@@ -418,7 +418,7 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,
@@ -724,9 +724,10 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
-#   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
-#      (backbone, compute_selected_logits, sample_from_logits/structured_decode,
-#      gather_logprobs) so _dummy_run and execute_model trace identically.
+#   2. Forward is split into 4 compiled subgraphs (the backbone, then the
+#      `tpu_compile` functions compute_selected_logits,
+#      sample_from_logits/structured_decode and gather_logprobs) so _dummy_run
+#      and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
@@ -3235,7 +3236,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         return self._tpu_pin_drafts_to_rank0(drafts, self._tp_rank0_mask)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _tpu_pin_drafts_to_rank0(
         self, drafts: torch.Tensor, rank0_mask: torch.Tensor
     ) -> torch.Tensor:
@@ -7786,8 +7787,8 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
 
-        The rejection sampler is ``@torch.compile(backend="tpu",
-        dynamic=False)`` -> a fresh graph per input shape, and the
+        The rejection sampler is compiled with ``tpu_compile``
+        (``dynamic=False``) -> a fresh graph per input shape, and the
         ``logits[...]`` gathers around it are eager. None are covered by
         ``_precompile_sampling_subgraphs`` (non-spec sampling only) or
         ``drafter.precompile()`` (draft forward only), so they recompile every
@@ -9768,7 +9769,7 @@ class TPUModelRunner(GPUModelRunner):
         padded = torch.nn.functional.pad(indices, (0, rows - num_rows))
         return self.compute_selected_logits(hidden_states, padded)[:num_rows]
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_selected_logits(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
@@ -9777,7 +9778,7 @@ class TPUModelRunner(GPUModelRunner):
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_logits_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -9914,7 +9915,7 @@ class TPUModelRunner(GPUModelRunner):
             and not _step_has_min_tokens_or_rep_pen(self)
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_selected_top_tokens(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
@@ -9925,7 +9926,7 @@ class TPUModelRunner(GPUModelRunner):
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_top_tokens_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -9935,7 +9936,7 @@ class TPUModelRunner(GPUModelRunner):
             raise RuntimeError("greedy top-token path requires a greedy head owner")
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, hidden_states)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def spec_bonus_and_target_logits(
         self,
         logits: torch.Tensor,
@@ -9955,7 +9956,7 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_token_ids, target_logits
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def spec_bonus_and_target_tokens(
         self,
         tokens: torch.Tensor,
@@ -9968,7 +9969,7 @@ class TPUModelRunner(GPUModelRunner):
         target_argmax = torch.index_select(tokens, 0, target_logits_indices)
         return bonus_token_ids.view(-1), target_argmax.view(-1)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def spec_gather_bonus_and_target_logits(
         self,
         logits: torch.Tensor,
@@ -9993,9 +9994,7 @@ class TPUModelRunner(GPUModelRunner):
         safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
         return logits / safe_temperatures
 
-    # TODO: Under SPMD mode, sample_from_logits has correctness issue.
-    #       Re-enable the torch.compile once the issue is fixed in torchxla.
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def sample_from_logits(
         self,
         logits: torch.Tensor,
@@ -10027,7 +10026,7 @@ class TPUModelRunner(GPUModelRunner):
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def spec_logprob_row_tokens(
         self,
         next_tokens: torch.Tensor,
@@ -10039,7 +10038,7 @@ class TPUModelRunner(GPUModelRunner):
             next_tokens, bonus_logits_indices, draft_lengths, final_logits_indices
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def gather_logprobs(
         self, logits: torch.Tensor, sampled_tokens: torch.Tensor
     ) -> LogprobsTensors:

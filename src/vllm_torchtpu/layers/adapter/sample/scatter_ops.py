@@ -20,6 +20,8 @@ table write them back with ``scatter_slot_rows``.
 
 import torch
 
+from vllm_torchtpu.compilation.decorators import tpu_compile
+
 
 def scatter_slot_rows(
     table: torch.Tensor, slot_ids: torch.Tensor, rows: torch.Tensor
@@ -52,7 +54,7 @@ def scatter_slot_rows(
     return table.index_put((targets,), torch.where(keep, rows, table[0]))
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def seed_slot_rows(
     table: torch.Tensor,
     seed_slots: torch.Tensor,

@@ -27,6 +27,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.core.attention_metadata import (
@@ -992,7 +993,7 @@ class DFlashProposer:
         for _ in range(num_chunks):
             self._dp_dummy_forward()
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _tpu_precompute_and_update_kv_cache(
         self,
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
@@ -1104,7 +1105,7 @@ class DFlashProposer:
 
         return hidden_states
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,
@@ -1214,7 +1215,7 @@ class DFlashProposer:
         )
         return input_ids, positions, seq_lens
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _tpu_build_dflash_inputs_next_tokens(
         self,
         next_tokens_device: torch.Tensor,
@@ -1297,7 +1298,7 @@ class DFlashProposer:
             base_tokens, base_pos, block_size, padded_len, mask_token_id
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _tpu_build_dflash_inputs_seed(
         self,
         device_seed: torch.Tensor,

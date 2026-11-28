@@ -19,10 +19,11 @@ The seen tokens of each row come as a packed bitmask (``token_bitmask``).
 
 import torch
 
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.layers.adapter.sample.token_bitmask import unpack_token_bitmask
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def apply_repetition_penalty(
     logits: torch.Tensor,
     seen_bitmask: torch.Tensor,

@@ -429,6 +429,10 @@ class _InProcessEngine:
                 num_drafts += metric.value
         return num_drafts
 
+    def collective_rpc(self, method, args: tuple = ()) -> list:
+        """``method(worker, *args)`` in every worker, one result per worker."""
+        return self._llm.llm_engine.collective_rpc(method, args=args)
+
     def shutdown(self) -> None:
         self._llm.llm_engine.engine_core.shutdown()
 
@@ -854,6 +858,65 @@ def test_qwen35_mtp_logprobs_greedy(
             assert ref_top == spec_top, (pos, ref_top, spec_top)
     assert compared > len(prompts) // 2, (
         f"only {compared}/{len(prompts)} outputs matched the reference text"
+    )
+
+
+def _direct_calls(self) -> int:
+    """This worker's direct calls through ``tpu_compile``'s wrappers so far."""
+    from vllm_torchtpu.compilation import fast_dispatch
+
+    return fast_dispatch._STATS[0]
+
+
+@pytest.mark.timeout(1800)
+def test_qwen35_mtp_fast_compiled_call_keeps_greedy_tokens(
+    monkeypatch: pytest.MonkeyPatch, sampling_config: SamplingParams
+):
+    """``tpu_compile.fast_compiled_call`` runs the compiled functions' code
+    directly, without Dynamo's call path around the ``tpu`` backend, so a
+    ``torch_tpu`` change can break it without breaking the default path. It
+    must give Qwen3.5 MTP's greedy tokens exactly as the option off does: one
+    request at a time, the two engines run the same programs on the same
+    batches."""
+    prompts = get_mtp_test_prompts()
+    kwargs = {
+        "max_model_len": 256,
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "max_num_seqs": 1,
+        "tensor_parallel_size": _get_tensor_parallel_size(),
+        "async_scheduling": True,
+        **QWEN35_KWARGS,
+    }
+    armed = {
+        **kwargs,
+        "additional_config": {"tpu_compile": {"fast_compiled_call": True}},
+    }
+    speculative_config = _qwen35_mtp_speculative_config(num_speculative_tokens=2)
+    results = {}
+    with monkeypatch.context() as mp:
+        # collective_rpc ships a Python function to the TPU workers.
+        mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+        for arm, engine_kwargs in (("off", kwargs), ("on", armed)):
+            with _engine(QWEN35_MTP_MODEL, speculative_config, engine_kwargs) as engine:
+                # The warm-up already dispatches directly; count generation only.
+                before = engine.collective_rpc(_direct_calls)
+                outputs = engine.generate_outputs(prompts, sampling_config)
+                after = engine.collective_rpc(_direct_calls)
+                results[arm] = (
+                    [list(output.outputs[0].token_ids) for output in outputs],
+                    [b - a for a, b in zip(before, after, strict=True)],
+                )
+    off_tokens, off_direct = results["off"]
+    on_tokens, on_direct = results["on"]
+    assert on_tokens == off_tokens
+    assert all(n == 0 for n in off_direct), (
+        f"the default engine dispatched directly during generation (the tokens "
+        f"matched): {off_direct}"
+    )
+    # The option took effect while serving: every worker dispatched directly.
+    assert on_direct and all(n > 0 for n in on_direct), (
+        f"the armed engine did not dispatch directly during generation (the tokens "
+        f"matched): {on_direct}"
     )
 
 

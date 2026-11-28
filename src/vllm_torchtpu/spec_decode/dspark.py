@@ -39,6 +39,7 @@ from typing import NamedTuple
 import torch
 from vllm.config import VllmConfig
 
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
@@ -166,7 +167,7 @@ class DSparkProposer(DFlashProposer):
         confidences, self._draft_confidences = self._draft_confidences, None
         return confidences
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,

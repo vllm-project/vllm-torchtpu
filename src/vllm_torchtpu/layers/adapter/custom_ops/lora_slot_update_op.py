@@ -19,6 +19,8 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.compilation.decorators import tpu_compile
+
 
 # Without this op, vLLM's activate_adapter writes an adapter one stacked tensor
 # at a time: for every LoRA module, slice and A/B tensor, reset_lora zeroes the
@@ -74,7 +76,7 @@ _slot_update_op.register_fake(
 )
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _write_adapter_to_slot(
     stacked_weights: list[torch.Tensor],
     slot_weights: torch.Tensor,

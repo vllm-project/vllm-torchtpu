@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -287,7 +288,7 @@ def _staged_walk_products(
     return tuple(outs) + tuple(states) + tuple(ckpts) + tuple(prefill_ckpts)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _staged_walk_products_compiled(
     staged_dev: torch.Tensor,
     seq_lens: torch.Tensor,
