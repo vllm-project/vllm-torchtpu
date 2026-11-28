@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
+    DeepseekV4ScalingRotaryEmbedding,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache, Indexer
@@ -1563,3 +1564,10 @@ class VllmDeepseekScalingRotaryEmbedding(
             query = query_rot
             key = key_rot
         return query, key
+
+
+@DeepseekV4ScalingRotaryEmbedding.register_oot
+class VllmDeepseekV4ScalingRotaryEmbedding(
+    rope_in_graph.Tier1InGraphRopeMixin, DeepseekV4ScalingRotaryEmbedding
+):
+    """Tier-1 RoPE wrapper; DSv4 ops read rows via `rope_in_graph.cos_sin_at`."""

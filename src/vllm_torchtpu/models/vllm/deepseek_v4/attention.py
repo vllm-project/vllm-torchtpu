@@ -193,11 +193,6 @@ class VllmDeepseekV4MLAAttention(
             dsv4_attention.DeepseekV4SWACache = orig_swa_cache
             torch.cuda.Event = orig_cuda_event
 
-        # The Pallas rope, indexer, compressor and o-projection ops take the
-        # table as an operand.
-        rope_in_graph.require_cos_sin_table(self.rotary_emb)
-        rope_in_graph.require_cos_sin_table(self.indexer_rotary_emb)
-
         # Bind compressor key-cache reference to SWA or main layer depending on
         # compression ratio.
         if hasattr(self, "compressor") and self.compressor is not None:

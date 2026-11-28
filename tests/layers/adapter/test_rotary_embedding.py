@@ -459,6 +459,7 @@ def test_vllm_rotary_subclass_exhaustiveness_guard():
         "dynamic_ntk_alpha",
         "yarn",
         "deepseek_scaling",
+        "deepseek_v4_scaling",
         "mrope_contiguous",
         "mrope_yarn",
         "mrope_interleaved",
@@ -479,6 +480,9 @@ def test_in_scope_rotary_classes_match_upstream_cpu_table_and_table_forward(
         Llama3RotaryEmbedding,
         MRotaryEmbeddingInterleaved,
         NTKScalingRotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
     )
     from vllm.model_executor.layers.rotary_embedding.ernie45_vl_rope import (
         Ernie4_5_VLRotaryEmbedding,
@@ -590,6 +594,24 @@ def test_in_scope_rotary_classes_match_upstream_cpu_table_and_table_forward(
                     beta_slow=1,
                     mscale=0.707,
                     mscale_all_dim=0.707,
+                ),
+                pos_1d,
+                None,
+            )
+        if case == "deepseek_v4_scaling":
+            return (
+                DeepseekV4ScalingRotaryEmbedding(
+                    128,
+                    64,
+                    128,
+                    10000.0,
+                    False,
+                    8.0,
+                    torch.bfloat16,
+                    beta_fast=32,
+                    beta_slow=1,
+                    mscale=1.0,
+                    mscale_all_dim=0.0,
                 ),
                 pos_1d,
                 None,
@@ -731,9 +753,11 @@ def test_in_scope_rotary_classes_match_upstream_cpu_table_and_table_forward(
 
     g = torch.Generator().manual_seed(42)
     n_tok = positions.shape[-1]
-    if case == "deepseek_scaling":
-        q = torch.randn(n_tok, 4, 64, generator=g, dtype=torch.float32)
-        k = torch.randn(n_tok, 1, 64, generator=g, dtype=torch.float32)
+    if case in ("deepseek_scaling", "deepseek_v4_scaling"):
+        q_dim = 128 if case == "deepseek_v4_scaling" else 64
+        q_dtype = torch.bfloat16 if case == "deepseek_v4_scaling" else torch.float32
+        q = torch.randn(n_tok, 4, q_dim, generator=g, dtype=q_dtype)
+        k = torch.randn(n_tok, 1, q_dim, generator=g, dtype=q_dtype)
     else:
         q = torch.randn(n_tok, 4 * 64, generator=g, dtype=torch.float32)
         k = torch.randn(n_tok, 2 * 64, generator=g, dtype=torch.float32)
@@ -745,14 +769,22 @@ def test_in_scope_rotary_classes_match_upstream_cpu_table_and_table_forward(
         ref_q, ref_k = ref(positions, q.clone(), k.clone())
         out_q, out_k = uut(positions, q.clone(), k.clone())
 
-    torch.testing.assert_close(out_q, ref_q, rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(out_k, ref_k, rtol=1e-6, atol=1e-6)
+    if case == "deepseek_v4_scaling":
+        assert torch.equal(out_q, ref_q)
+        assert out_k is not None and ref_k is not None
+        assert torch.equal(out_k, ref_k)
+    else:
+        torch.testing.assert_close(out_q, ref_q, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(out_k, ref_k, rtol=1e-6, atol=1e-6)
 
 
 def test_tier1_meta_to_empty_tracks_device():
     """Tier-1 `InGraphCosSinCache` tracks `to_empty()` across rotary families."""
     from vllm.model_executor.layers.rotary_embedding import (
         DeepseekScalingRotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
     )
 
     from vllm_torchtpu import rope_in_graph
@@ -767,15 +799,18 @@ def test_tier1_meta_to_empty_tracks_device():
         ds_rope = DeepseekScalingRotaryEmbedding(
             64, 64, 128, 10000.0, False, 4.0, torch.bfloat16
         )
+        dsv4_rope = DeepseekV4ScalingRotaryEmbedding(
+            128, 64, 128, 10000.0, False, 4.0, torch.bfloat16
+        )
 
-    model = torch.nn.ModuleDict({"r": rope, "m": mrope, "d": ds_rope})
-    for mod in (rope, mrope, ds_rope):
+    model = torch.nn.ModuleDict({"r": rope, "m": mrope, "d": ds_rope, "d4": dsv4_rope})
+    for mod in (rope, mrope, ds_rope, dsv4_rope):
         assert isinstance(mod.cos_sin_cache, rope_in_graph.InGraphCosSinCache)
         assert mod.cos_sin_cache.device.type == "meta"
         assert sum(b.numel() for b in mod.buffers()) == 0
 
     model.to_empty(device="cpu")
-    for mod in (rope, mrope, ds_rope):
+    for mod in (rope, mrope, ds_rope, dsv4_rope):
         assert mod.cos_sin_cache.device == torch.device("cpu")
 
     cos, sin = rope.get_cos_sin(16)
@@ -792,6 +827,9 @@ def test_dynamo_fullgraph_compile_across_tier1_and_tier2_paths():
         DeepseekScalingRotaryEmbedding,
         LinearScalingRotaryEmbedding,
         MRotaryEmbeddingInterleaved,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
     )
     from vllm.model_executor.layers.rotary_embedding.ernie45_vl_rope import (
         Ernie4_5_VLRotaryEmbedding,
@@ -824,6 +862,17 @@ def test_dynamo_fullgraph_compile_across_tier1_and_tier2_paths():
             mscale=0.707,
             mscale_all_dim=0.707,
         )
+        r_dsv4 = DeepseekV4ScalingRotaryEmbedding(
+            64,
+            64,
+            128,
+            10000.0,
+            False,
+            4.0,
+            torch.bfloat16,
+            mscale=0.707,
+            mscale_all_dim=0.707,
+        )
         r_mint = MRotaryEmbeddingInterleaved(
             64, 64, 128, 10000.0, True, torch.bfloat16, mrope_section=[11, 11, 10]
         )
@@ -846,7 +895,7 @@ def test_dynamo_fullgraph_compile_across_tier1_and_tier2_paths():
         )
         rope_patch.patch_in_graph_rotary_embedding(r_phi, allow_table_recovery=False)
 
-    for tier1_mod in (r_std, r_lin, r_ds, r_mint, r_ernie, r_bail):
+    for tier1_mod in (r_std, r_lin, r_ds, r_dsv4, r_mint, r_ernie, r_bail):
         assert isinstance(tier1_mod.cos_sin_cache, rope_in_graph.InGraphCosSinCache)
         assert "cos_sin_cache" not in tier1_mod._buffers
     assert isinstance(r_phi.long_short_cos_sin_cache, rope_in_graph.InGraphCosSinCache)
@@ -863,6 +912,7 @@ def test_dynamo_fullgraph_compile_across_tier1_and_tier2_paths():
         (r_std, (pos1, q2, k2)),
         (r_lin, (pos1, q2, k2, offs)),
         (r_ds, (pos1, q3, k3)),
+        (r_dsv4, (pos1, q3, k3)),
         (r_mint, (pos3, q2, k2)),
         (r_ernie, (pos3, q2, k2)),
         (r_bail, (pos3, q2, k2)),

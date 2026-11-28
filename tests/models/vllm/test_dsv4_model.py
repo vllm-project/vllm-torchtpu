@@ -230,13 +230,14 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
     assert spec.dtype == torch.uint8
 
 
-def test_attention_keeps_real_cos_sin_table_when_in_graph_enabled(monkeypatch, request):
-    """DSv4 Pallas ops read the table as an operand even with `tpu_rope_in_graph`."""
+def test_attention_converts_rope_caches_when_in_graph_enabled(monkeypatch, request):
+    """DSv4 rotary modules convert to in-graph cos/sin when `tpu_rope_in_graph` is on
+    and stay tensor-backed when it is off, with bit-identical `cos_sin_at` rows."""
     from vllm.model_executor.layers import rotary_embedding as rope_lib
     from vllm.platforms import current_platform
 
     import vllm_torchtpu.layers.adapter.rotary_embedding  # noqa: F401
-    from vllm_torchtpu import rope_in_graph_flag, rope_patch
+    from vllm_torchtpu import rope_in_graph, rope_in_graph_flag, rope_patch
 
     monkeypatch.setattr(current_platform, "device_name", "cpu")
     monkeypatch.setattr(current_platform, "device_type", "cpu")
@@ -255,33 +256,35 @@ def test_attention_keeps_real_cos_sin_table_when_in_graph_enabled(monkeypatch, r
     with set_current_vllm_config(config):
         attention = VllmDeepseekV4MLAAttention(config, prefix=prefix)
 
-    assert attention.rotary_emb._tpu_rope_table_required
-    assert attention.indexer_rotary_emb._tpu_rope_table_required
-    assert isinstance(attention.rotary_emb.cos_sin_cache, torch.Tensor)
-    assert "cos_sin_cache" in attention.rotary_emb._buffers
     assert isinstance(ref_attention.rotary_emb.cos_sin_cache, torch.Tensor)
-    assert torch.equal(
-        attention.rotary_emb.cos_sin_cache, ref_attention.rotary_emb.cos_sin_cache
-    )
-    assert isinstance(attention.indexer_rotary_emb.cos_sin_cache, torch.Tensor)
     assert isinstance(ref_attention.indexer_rotary_emb.cos_sin_cache, torch.Tensor)
-    assert torch.equal(
-        attention.indexer_rotary_emb.cos_sin_cache,
-        ref_attention.indexer_rotary_emb.cos_sin_cache,
-    )
+
+    # Tier 1 already converted DSv4 rotary modules at __init__, so Tier 2 is a no-op.
     assert (
         rope_patch.patch_in_graph_rotary_embedding(
             attention, allow_table_recovery=False
         )
         == 0
     )
-    assert torch.equal(
-        attention.rotary_emb.cos_sin_cache, ref_attention.rotary_emb.cos_sin_cache
+    assert isinstance(
+        attention.rotary_emb.cos_sin_cache, rope_in_graph.InGraphCosSinCache
     )
-    assert torch.equal(
-        attention.indexer_rotary_emb.cos_sin_cache,
-        ref_attention.indexer_rotary_emb.cos_sin_cache,
+    assert "cos_sin_cache" not in attention.rotary_emb._buffers
+    assert isinstance(
+        attention.indexer_rotary_emb.cos_sin_cache, rope_in_graph.InGraphCosSinCache
     )
+    assert "cos_sin_cache" not in attention.indexer_rotary_emb._buffers
+
+    positions = torch.tensor([0, 3, 17, 63], dtype=torch.int32)
+    for patched_rope, ref_rope in (
+        (attention.rotary_emb, ref_attention.rotary_emb),
+        (attention.indexer_rotary_emb, ref_attention.indexer_rotary_emb),
+    ):
+        assert patched_rope.cos_sin_cache.shape[-1] == ref_rope.cos_sin_cache.shape[-1]
+        assert torch.equal(
+            rope_in_graph.cos_sin_at(patched_rope, positions),
+            rope_in_graph.cos_sin_at(ref_rope, positions),
+        )
 
 
 @pytest.fixture()
