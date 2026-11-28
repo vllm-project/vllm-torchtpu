@@ -83,6 +83,7 @@ def _make_proposer(
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
             tensor_parallel_size=target_tp,
+            decode_context_parallel_size=1,
             is_moe_model=False,
             use_sequence_parallel_moe=False,
         ),

@@ -32,6 +32,7 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
     get_current_vllm_config_or_none,
+    set_current_vllm_config,
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -57,6 +58,7 @@ from vllm_torchtpu import utils
 from vllm_torchtpu.core.runner_slot_mamba import RunnerSlotMambaSpec
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
+    PallasAttentionBackendImpl,
     PallasBatchedRPAAttentionBackend,
     PallasMLAttentionBackend,
     VllmTPUDeepseekV32IndexerBackend,
@@ -3281,6 +3283,7 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
         vllm_config=SimpleNamespace(
             cache_config=cache_config,
             compilation_config=SimpleNamespace(static_forward_context=layers),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         ),
         shared_kv_cache_layers={},
         runner_only_attn_layers=set(),
@@ -3296,3 +3299,122 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
     kv_cache_specs = KVCacheManager(stub).get_kv_cache_spec()
     assert kv_cache_specs["target.0"].is_draft is False
     assert kv_cache_specs["draft.0"].is_draft is True
+
+
+def _draft_dcp_impl(*, sharded: bool) -> PallasAttentionBackendImpl:
+    """A drafter layer's impl under DCP 2: KV whole on every rank, or sharded
+    over the DCP group through the drafter hook (`enable_sharded_draft_dcp`)."""
+    impl = PallasAttentionBackendImpl(
+        num_heads=4,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="bf16",
+        kv_cache_quantized_dtype=None,
+    )
+    impl.kv_replicated_over_dcp = True
+    if sharded:
+        layer = torch.nn.Module()
+        layer.register_buffer("_k_scale", torch.ones(()))
+        impl.enable_sharded_draft_dcp(
+            layer, impl=MagicMock(), dcp=2, dcp_rank=1, kv_head_replicas=1
+        )
+    return impl
+
+
+def _draft_dcp_runner(*, sharded: bool):
+    """CPU runner under DCP 2 with one drafter attention layer `draft.0`."""
+    runner = _build_mock_cpu_runner(block_size=16)
+    runner.vllm_config.parallel_config.decode_context_parallel_size = 2
+    runner.scheduler_config.disable_hybrid_kv_cache_manager = True
+    with set_current_vllm_config(runner.vllm_config):
+        impl = _draft_dcp_impl(sharded=sharded)
+    layer = _attention_layer_mock(num_kv_heads=1, head_size=128)
+    layer.impl = impl
+    layers = {"draft.0": layer}
+    runner.vllm_config.compilation_config.static_forward_context = layers
+    return runner, layers
+
+
+@pytest.mark.parametrize(
+    ("sharded", "kv_heads", "page_tokens"),
+    [
+        # Whole on every rank: the spec keeps block_size 16 (so it groups
+        # with the DCP-sharded target) and budgets a 16 * 2-token page.
+        (False, 1, 32),
+        # Sharded over DCP 2 (one KV head per rank, kv_head_replicas=1):
+        # 16-token pages whose rows hold both ranks' KV heads.
+        (True, 2, 16),
+    ],
+)
+def test_get_kv_cache_spec_and_allocation_draft_kv_under_dcp(
+    sharded, kv_heads, page_tokens
+):
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+
+    runner, layers = _draft_dcp_runner(sharded=sharded)
+    page_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+        page_tokens, kv_heads, 128, torch.bfloat16
+    )
+    with patch(
+        "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+        return_value=layers,
+    ):
+        specs = runner.get_kv_cache_spec()
+    spec = specs["draft.0"]
+    assert type(spec) is FullAttentionSpec
+    assert (spec.block_size, spec.num_kv_heads) == (16, kv_heads)
+    assert spec.page_size_bytes == page_bytes
+
+    num_blocks = 4
+    groups = get_kv_cache_groups(runner.vllm_config, specs)
+    config = get_kv_cache_config_from_groups(
+        runner.vllm_config, groups, num_blocks * page_bytes
+    )
+    runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(
+        block_table=[
+            SimpleNamespace(
+                max_num_blocks_per_req=num_blocks,
+                get_cpu_tensor=lambda: runner.block_table_cpu,
+            )
+        ]
+    )
+    with (
+        patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+            return_value=False,
+        ),
+    ):
+        runner.initialize_kv_cache(config)
+    cache = bind.call_args.args[0]["draft.0"]
+    assert config.num_blocks == num_blocks
+    assert tuple(cache.shape) == tuple(
+        PallasAttentionBackend.get_kv_cache_shape(
+            num_blocks, page_tokens, kv_heads, 128, torch.bfloat16
+        )
+    )
+    assert cache.nbytes == num_blocks * page_bytes
+
+
+@pytest.mark.parametrize("cause", ["hma", "hybrid_uniform_page"])
+def test_get_kv_cache_spec_rejects_whole_draft_kv_with_hma(cause):
+    runner, layers = _draft_dcp_runner(sharded=False)
+    if cause == "hma":
+        runner.scheduler_config.disable_hybrid_kv_cache_manager = False
+    else:
+        runner._hybrid_uniform_page_size_bytes = 1 << 20
+    with (
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+        pytest.raises(NotImplementedError, match="keeps its KV whole under DCP"),
+    ):
+        runner.get_kv_cache_spec()
