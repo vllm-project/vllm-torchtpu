@@ -208,7 +208,7 @@ run_stages() {
     "${chat[@]}" "${pinned[@]}" --attempts 3 --line-count 120 \
     --logprob-atol "${DIVERGENCE_LOGPROB_ATOL}"
   stage state_contamination python3 \
-    "${script_dir}/smoke_mamba_state_contamination.py" "${target[@]}" \
+    "${script_dir}/smoke_mamba_state_contamination.py" "${chat[@]}" \
     "${pinned[@]}" --rounds 3
 
   stage counters check_counters
