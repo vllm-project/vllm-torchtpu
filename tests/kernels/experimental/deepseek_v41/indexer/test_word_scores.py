@@ -167,15 +167,23 @@ class TestScoreWordRows:
         assert cu_param.default is inspect.Parameter.empty
         assert set(indexer_pkg.__all__) == {
             "BF16_BYTES",
+            "BITS_NEG_INF",
             "DIM",
             "MAX_BLOCK_ROWS",
+            "MAX_N",
+            "MAX_SCORING_TOKENS",
+            "MAX_TOPK",
             "MIN_ROWS",
+            "MIN_SPARSECORE_KEYS",
             "ROW_WORDS",
+            "SC_LANES",
             "SLOTS",
             "SUB_BLOCK_ROWS",
             "WEIGHT_BYTES_PER_HEAD",
             "WORD_BYTES",
+            "paged_indexer_topk",
             "score_word_rows",
+            "sparsecore_topk",
         }
         forbidden_runtime = {"torch", "torch_tpu", "vllm"}
         assert word_scores_imports.isdisjoint(forbidden_runtime | {"os"})
