@@ -500,6 +500,7 @@ class TestTpuCompilerCache:
             "TORCH_TPU_BASE_PORT",
             "TORCH_TPU_MP_RENDEZVOUS_PORT",
             "TPU_LOCAL_RANK_OFFSET",
+            "TPU_WORKER_NUMA_BIND",
             "TPU_SHARDED_LOAD_SYNC_EVERY",
             "VLLM_TPU_DEBUG_PCP_LAYOUT",
             "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
