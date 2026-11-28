@@ -3222,10 +3222,13 @@ class TPURaidenConnectorWorker:
         self._raiden_work_unit = unit
         self._raiden_layout_fingerprint = fingerprint
         self._raiden_layout_fingerprint_payload = dict(fingerprint_payload)
+        # The payload too: after a refused transfer, the two legs' lines show
+        # which field differs, not only two different hashes.
         logger.info(
             "Raiden work unit registered controller=%s unit=%s "
             "data=%s listener=%s page_tokens=%d transfer_rank=%d/%d "
-            "interleave_tokens=%d layout_fingerprint=%s",
+            "interleave_tokens=%d layout_fingerprint=%s "
+            "layout_fingerprint_payload=%s",
             controller_address,
             unit,
             data_address,
@@ -3235,6 +3238,12 @@ class TPURaidenConnectorWorker:
             transfer_parallelism,
             interleave_tokens,
             fingerprint,
+            json.dumps(
+                dict(fingerprint_payload),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
         )
         return {
             "controller_address": controller_address,

@@ -21,6 +21,8 @@ TPU.
 """
 
 import contextlib
+import json
+import logging
 import sys
 import threading
 import time
@@ -315,6 +317,29 @@ def _make_raiden_scheduler(
     cfg.additional_config = {"raiden_pd_send_completion": send_completion}
     cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
     return TPURaidenConnectorScheduler(cfg)
+
+
+class _Records(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.INFO)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def _logged(module: str):
+    """The messages ``module``'s logger emits at INFO and above in the block."""
+    log = logging.getLogger(f"vllm.{module}")  # vllm_torchtpu.logger's name
+    handler, level = _Records(), log.level
+    log.setLevel(logging.INFO)
+    log.addHandler(handler)
+    try:
+        yield handler.records
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(level)
 
 
 def _make_raiden_worker(
@@ -3094,6 +3119,7 @@ class TestTPURaidenConnectorWorker:
                 patch(
                     f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True
                 ),
+                _logged(_MOD) as records,
             ):
                 worker.register_runner(runner)
 
@@ -3113,6 +3139,22 @@ class TestTPURaidenConnectorWorker:
             assert "page_slice_tokens" not in call
             assert call["transfer_parallelism"] == 8
             assert call["transfer_rank"] == transfer_rank
+            # The registration line carries the payload, so after a refused
+            # transfer the two legs' lines show which field differs.
+            (line,) = [
+                r.getMessage()
+                for r in records
+                if r.getMessage().startswith("Raiden work unit registered")
+            ]
+            assert line.endswith(
+                " layout_fingerprint=layout-fingerprint-golden"
+                " layout_fingerprint_payload="
+                + json.dumps(
+                    worker._raiden_layout_fingerprint_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
             assert call["pool_manifest"] == engine.registered_pools
             assert len(call["pool_manifest"]) == 105
             assert [pool["tag"] for pool in call["pool_manifest"]].count("fa") == 15
