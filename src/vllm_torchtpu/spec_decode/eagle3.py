@@ -183,15 +183,16 @@ def _draft_checkpoint_name_map(
     uninitialised and every drafted token wrong. It loads into the head.
     """
     shared_keys = tuple(key for key in before if after.get(key) is not before[key])
-    head = after.get("lm_head")
-    old_embed = before.get("embed_tokens")
-    head_weight = getattr(head, "weight", None)
+    head = cast("torch.nn.Module | None", after.get("lm_head"))
+    old_embed = cast("torch.nn.Module | None", before.get("embed_tokens"))
     tied_head_prefix: str | None = None
+    # A borrowed (target) head never holds the draft's old embedding weight, so
+    # the identity check alone tells a kept, tied head apart.
     if (
         "embed_tokens" in shared_keys
-        and "lm_head" not in shared_keys
-        and head_weight is not None
-        and head_weight is getattr(old_embed, "weight", None)
+        and head is not None
+        and old_embed is not None
+        and head.weight is old_embed.weight
     ):
         tied_head_prefix = (
             "lm_head." if getattr(model, "lm_head", None) is head else "model.lm_head."
@@ -986,8 +987,8 @@ class Eagle3Proposer:
             )
             # A borrowed module already carries the target's weights; a
             # module the draft kept (`has_own_lm_head`) still loads its own.
-            # Keys are the checkpoint-name fragments of each module sharing
-            # can replace, including DeepSeek-style per-layer heads.
+            # `_draft_checkpoint_name_map` decides, per checkpoint name, what
+            # to drop and what loads under another name.
             after = _draft_head_modules(model)
             name_map = _draft_checkpoint_name_map(model, before, after)
             model_load_weights = cast(Callable[..., Any], model.load_weights)
