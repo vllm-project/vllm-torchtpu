@@ -644,7 +644,7 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
         w13_weight_scale=None,
         w2_weight_scale=None,
         _experts_start=28,
-        moe_config=SimpleNamespace(experts_per_token=2),
+        moe_config=SimpleNamespace(experts_per_token=2, is_sequence_parallel=False),
     )
     x = torch.ones(4, 128, dtype=torch.bfloat16)
     ids = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]])
@@ -656,8 +656,9 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
         lambda *args, **kwargs: (calls.append("router") or (weights, ids)),
     )
 
-    def mask(ids, weights, is_local_tensor):
+    def mask(ids, weights, is_local_tensor, is_sequence_parallel=False):
         assert not is_local_tensor
+        assert not is_sequence_parallel
         weights = weights.clone()
         weights[-1] = 0
         return ids, weights

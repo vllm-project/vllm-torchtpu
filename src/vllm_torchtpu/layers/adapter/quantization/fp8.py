@@ -1213,6 +1213,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 topk_ids,
                 topk_weights,
                 is_local_tensor=owns_collectives,
+                is_sequence_parallel=layer.moe_config.is_sequence_parallel,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
@@ -1233,7 +1234,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "activation": activation_str,
         }
         if owns_collectives:
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                **kwargs,
+                is_sequence_parallel=layer.moe_config.is_sequence_parallel,
+            )
 
         from vllm_torchtpu.layers.adapter.fused_moe_decode import (
             fused_moe_decode,
