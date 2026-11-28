@@ -477,6 +477,27 @@ def test_warm_start_reuses_the_cache_without_compiling(tmp_path):
     in_child(partial(_warm_start_reuses_the_cache, str(tmp_path)))
 
 
+def _fresh_aot_compile_skips_the_guard_check(cache_root):
+    from vllm_torchtpu.compilation import aot_guard_skip
+
+    config, _ = prepare(cache_root)
+    aot_guard_skip.patch_aot_guard_skip()
+    starts = count_starts()
+    model = build(FlatModel, config)
+    assert warm(model, config) == 0
+    # A cold start: the function comes from aot_compile, not from the cache,
+    # and vLLM evaluates no guards for this config.
+    assert (starts.traced, starts.loaded) == (1, 0)
+    assert not config.compilation_config.dynamic_shapes_config.evaluate_guards
+    assert model.aot_compiled_fn._guard_check_enabled is False
+    for num_tokens in BUCKETS:
+        assert run(model, config, num_tokens).shape[0] == num_tokens
+
+
+def test_fresh_aot_compile_skips_the_guard_check(tmp_path):
+    in_child(partial(_fresh_aot_compile_skips_the_guard_check, str(tmp_path)))
+
+
 def _session_does_not_outlive_warmup(cache_root):
     config, _ = prepare(cache_root)
     warm(build(FlatModel, config), config)
