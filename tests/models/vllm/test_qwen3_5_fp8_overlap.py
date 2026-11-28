@@ -33,9 +33,11 @@ from vllm.model_executor.models.qwen3_5 import (
 )
 
 from tests.distributed.test_quantized_collectives import FP8_E4M3_UNIT_ROUNDOFF
-from tests.models.vllm.test_qwen3_5_patch import _CpuRMSNorm, _TPCollectiveMock
+from tests.models.vllm.test_qwen3_5_patch import _CpuRMSNorm
+from tests.tp_collective_test_utils import TPCollectiveMock
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.layers.adapter import dense_sequence_parallel
 from vllm_torchtpu.models.vllm import qwen3_5_patch, qwen3_next_patch
 from vllm_torchtpu.models.vllm.qwen3_5_patch import (
     _overlap_forward,
@@ -456,20 +458,9 @@ def _assert_tight_fp8_ref_parity(
     return rel_rmse_budget, atol
 
 
-class _RankThread(threading.Thread):
-    """Worker thread carrying a simulated TP rank attribute."""
-
-    def __init__(
-        self,
-        rank: int,
-        target: Callable[[int], None],
-    ) -> None:
-        """Store TP rank and initialize thread target with rank argument."""
-        super().__init__(target=target, args=(rank,))
-        self.rank = rank
-
-
-def _run_on_tp_threads[T](tp_size: int, fn: Callable[[int], T]) -> list[T]:
+def _run_on_tp_threads[T](
+    tp_size: int, fn: Callable[[int], T], mock: TPCollectiveMock
+) -> list[T]:
     """Run fn(rank) on tp_size threads and propagate any worker exception."""
     results: dict[int, T] = {}
     errors: list[BaseException | None] = [None] * tp_size
@@ -477,12 +468,14 @@ def _run_on_tp_threads[T](tp_size: int, fn: Callable[[int], T]) -> list[T]:
     def worker(rank: int) -> None:
         """Execute fn(rank) and record any raised exception."""
         try:
+            mock.rank.value = rank
             results[rank] = fn(rank)
         except BaseException as exc:
             errors[rank] = exc
+            mock.barrier.abort()
             raise
 
-    threads = [_RankThread(rank, worker) for rank in range(tp_size)]
+    threads = [threading.Thread(target=worker, args=(rank,)) for rank in range(tp_size)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -500,25 +493,25 @@ def _install_logged_collectives(
     monkeypatch: pytest.MonkeyPatch,
     tp_size: int,
     wire_log: list[tuple[str, torch.Size, torch.dtype]],
-) -> None:
+) -> TPCollectiveMock:
     """Install thread-synchronized TP collectives recording rank-0 wire traffic."""
-    mock = _TPCollectiveMock(tp_size)
+    mock = TPCollectiveMock(tp_size)
 
     def logged_reduce_scatter(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
         """Log rank-0 reduce-scatter shape and dtype."""
-        if getattr(threading.current_thread(), "rank", 0) == 0:
+        if mock.rank.value == 0:
             wire_log.append(("reduce_scatter", tensor.shape, tensor.dtype))
         return mock.reduce_scatter(tensor, dim=dim)
 
     def logged_all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
         """Log rank-0 all-gather shape and dtype."""
-        if getattr(threading.current_thread(), "rank", 0) == 0:
+        if mock.rank.value == 0:
             wire_log.append(("all_gather", tensor.shape, tensor.dtype))
         return mock.all_gather(tensor, dim=dim)
 
     def logged_all_reduce(tensor: torch.Tensor) -> torch.Tensor:
         """Log rank-0 all-reduce shape and dtype."""
-        if getattr(threading.current_thread(), "rank", 0) == 0:
+        if mock.rank.value == 0:
             wire_log.append(("all_reduce", tensor.shape, tensor.dtype))
         return mock.all_reduce(tensor)
 
@@ -527,7 +520,7 @@ def _install_logged_collectives(
         qwen3_5_patch, "tensor_model_parallel_reduce_scatter", logged_reduce_scatter
     )
     monkeypatch.setattr(
-        qwen3_5_patch, "tensor_model_parallel_all_gather", logged_all_gather
+        dense_sequence_parallel, "tensor_model_parallel_all_gather", logged_all_gather
     )
     monkeypatch.setattr(qwen3_5_patch, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(
@@ -536,6 +529,7 @@ def _install_logged_collectives(
     monkeypatch.setattr(
         qwen3_5_patch, "tensor_model_parallel_all_reduce", logged_all_reduce
     )
+    return mock
 
 
 def _run_single_layer_with_wire_capture(
@@ -582,7 +576,7 @@ def _run_single_layer_with_wire_capture(
 
     wire_log: list[tuple[str, torch.Size, torch.dtype]] = []
     experts_dtypes: list[torch.dtype] = []
-    _install_logged_collectives(monkeypatch, cfg.tp_size, wire_log)
+    mock = _install_logged_collectives(monkeypatch, cfg.tp_size, wire_log)
     sharded_in = overlap and fp8_all_gather and cfg.with_residual
 
     def run_rank(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -644,7 +638,7 @@ def _run_single_layer_with_wire_capture(
         assert residual_out is not None
         return out, residual_out
 
-    pairs = _run_on_tp_threads(cfg.tp_size, run_rank)
+    pairs = _run_on_tp_threads(cfg.tp_size, run_rank, mock)
     if overlap and fp8_all_gather:
         out_full = torch.cat([p[0] for p in pairs], dim=0)
         residual_full = torch.cat([p[1] for p in pairs], dim=0)
@@ -961,7 +955,7 @@ def _run_two_layer_stub_stack(
     positions = torch.arange(inputs.shape[0])
     effective_aux = aux_layers
     wire_log: list[tuple[str, torch.Size, torch.dtype]] = []
-    _install_logged_collectives(monkeypatch, tp_size, wire_log)
+    mock = _install_logged_collectives(monkeypatch, tp_size, wire_log)
 
     def run_rank(
         rank: int,
@@ -980,7 +974,7 @@ def _run_two_layer_stub_stack(
         assert isinstance(out, torch.Tensor | tuple)
         return out
 
-    rank_outputs = _run_on_tp_threads(tp_size, run_rank)
+    rank_outputs = _run_on_tp_threads(tp_size, run_rank, mock)
     rank0_ops = [
         f"all_gather:{dtype}" if op == "all_gather" else op for op, _, dtype in wire_log
     ]
@@ -1216,7 +1210,7 @@ def test_overlap_model_forward_shape_variants_handover_across_traces(
 
     tp_group = _make_tp_group(repeat_all_gather)
     monkeypatch.setattr(
-        qwen3_5_patch, "tensor_model_parallel_all_gather", repeat_all_gather
+        dense_sequence_parallel, "tensor_model_parallel_all_gather", repeat_all_gather
     )
     monkeypatch.setattr(qwen3_5_patch, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(

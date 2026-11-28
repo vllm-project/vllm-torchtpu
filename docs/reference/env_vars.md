@@ -95,6 +95,10 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_MOE_REQUANT_CHUNK_BYTES` | `1073741824` (1 GiB) | Float32 bytes one load-time MoE requantization chunk materializes on the device. Must be > 0. Lower it if requantization runs out of device memory after loading. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
 
+### Dense sequence parallelism
+
+`--additional-config '{"tpu_dense_sequence_parallel": true}'` (default `false`) enables sequence parallelism for dense tensor-parallel decoder layers (the dense counterpart of `TPU_MOE_SEQUENCE_PARALLEL`), wired for dense Gemma 4 with per-channel or per-tensor FP8 linears. On padded buckets with `>= 128` tokens per TP rank (`>= 1024` at `TP=8`), row-parallel outputs are reduce-scattered along tokens, norms and dynamic FP8 row quantization run on each rank's token shard, and 1-byte FP8 rows plus `float32` row scales are all-gathered into the next linear. A non-bool value fails at startup; startup also rejects `TP=1`, pipeline parallelism, context parallelism (`PCP` / `DCP`), LoRA, and any speculative decoding method other than `ngram`. Non-Gemma 4 models log a warning and ignore the setting. Off by default until KV-shared, MoE, PLE, and unquantized Gemma 4 variants are supported.
+
 ### MoE reference parity
 
 RL and distillation workloads that compare TPU rollouts with an unfused `bfloat16` MoE (the GPU vLLM path: `w13` GEMM -> `bfloat16` -> `SiluAndMul` -> `w2` GEMM -> `bfloat16` -> top-k combine) can turn on two independent `--additional-config` settings, each of which changes one rounding point:

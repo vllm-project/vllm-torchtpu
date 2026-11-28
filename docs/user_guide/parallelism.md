@@ -84,6 +84,8 @@ On multi-chip and multi-host slices, `vllm-torchtpu` provides specialized MoE ex
 | `TPU_MOE_SEQUENCE_PARALLEL` | `0` | Keeps activations sequence-parallel entering MoE layers to replace all-reduce with reduce-scatter + all-gather. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `0` | Shards MLA latent projections across the 2 cores of each physical TPU v7x chip even when `TP=1`. |
 
+For dense tensor-parallel models, pass `--additional-config '{"tpu_dense_sequence_parallel": true}'` (default `false`) to enable sequence parallelism around dense decoder layers (currently wired for dense Gemma 4 with per-channel/per-tensor FP8 linears). On padded buckets with at least `128` tokens per TP rank (`>= 1024` at `TP=8`), row-parallel outputs are reduce-scattered along tokens, RMSNorms and dynamic FP8 quantization run on each rank's token shard, and 1-byte FP8 rows plus `float32` row scales are all-gathered into the next projection. Requires `TP > 1` and dense Gemma 4 without KV sharing, per-layer embeddings, pipeline parallelism, context parallelism (`PCP` / `DCP`), LoRA, or a draft speculative model (`ngram` is supported).
+
 ---
 
 ## 4. Pipeline Parallelism (`--pipeline-parallel-size`)

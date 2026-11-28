@@ -431,6 +431,7 @@ class TestTpuCompilerCache:
         }
         assert {
             "vllm_torchtpu/distributed/collectives.py",
+            "vllm_torchtpu/layers/adapter/dense_sequence_parallel.py",
             "vllm_torchtpu/models/vllm/qwen3_next_patch.py",
         } <= hashed
 
