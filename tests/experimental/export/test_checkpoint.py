@@ -26,8 +26,14 @@ import portpicker
 import pytest
 import torch
 import torch.nn as nn
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.fused_moe import GateLinear
 
-from vllm_torchtpu.experimental.export import checkpoint
+from vllm_torchtpu.experimental.export import checkpoint, tpu_lowering
+from vllm_torchtpu.layers.adapter.gate_linear import (
+    BF16X3_WEIGHT_BUFFER,
+    TpuGateLinear,
+)
 
 _TP2 = {"data": 1, "model": 2}
 
@@ -94,6 +100,99 @@ def test_checkpoint_shards_rejects_mismatches() -> None:
         checkpoint.checkpoint_shards(
             inputs, {"w": torch.ones(8, 6, dtype=torch.bfloat16)}, _TP2
         )
+
+
+def _load(gate: TpuGateLinear, weight: torch.Tensor) -> TpuGateLinear:
+    gate.weight.weight_loader(gate.weight, weight)
+    gate.quant_method.process_weights_after_loading(gate)
+    return gate
+
+
+@pytest.mark.usefixtures("tensor_parallel_group")
+@pytest.mark.parametrize("weight_values", ["bf16-values", "non-finite"])
+def test_a_gate_loaded_without_a_split_gets_one_built_from_its_weight(
+    weight_values: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gate loaded with these weights builds no split, but the artifact traced
+    with dummy weights reads one: the checkpoint saves `bf16(W)` as its first
+    term and two zero terms, which sum back to W."""
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))):
+        gate = GateLinear(
+            256, 32, bias=False, params_dtype=torch.float32,
+            out_dtype=torch.float32, prefix="gate",
+        )  # fmt: skip
+    assert type(gate) is TpuGateLinear
+    name = f"gate.{BF16X3_WEIGHT_BUFFER}"
+    model = nn.Module()
+    # The dummy-weight load the artifact is traced with builds the split.
+    generator = torch.Generator().manual_seed(0)
+    model.gate = _load(
+        gate, torch.empty(32, 256).uniform_(-1e-3, 1e-3, generator=generator)
+    )
+    split = checkpoint.local_tensors(model)[name]
+    spec = _spec(
+        name, list(split.shape), tpu_lowering.dtype_name(split.dtype),
+        [None, None, None],
+    )  # fmt: skip
+    inputs = [dict(spec, arg_index=0)]
+    meta = {
+        "functions": {"abstract_params": {"default": {"inputs": inputs}}},
+        "mesh": {"axis_names": list(_TP2), "mesh_shape": list(_TP2.values())},
+    }
+    (tmp_path / "metadata.json").write_text(json.dumps(meta))
+    weight = torch.randn(32, 256, generator=generator).bfloat16().float()
+    if weight_values == "non-finite":
+        weight[3, 7] = float("inf")
+    _load(gate, weight)
+    assert name not in checkpoint.local_tensors(model)
+    saved = []
+    monkeypatch.setattr(
+        checkpoint,
+        "save_checkpoint",
+        lambda inputs, shards, sizes, data_dir: saved.extend(shards),
+    )
+
+    checkpoint.save_model_checkpoint(
+        checkpoint.local_tensors(model), str(tmp_path), str(tmp_path / "data")
+    )
+
+    [terms] = [torch.from_numpy(shard.astype(np.float32)) for shard in saved]
+    assert torch.equal(terms[0], weight)
+    assert not terms[1:].any()
+    assert torch.equal(terms.sum(0), weight)
+
+
+def test_a_router_split_the_model_has_is_kept() -> None:
+    name = f"gate.{BF16X3_WEIGHT_BUFFER}"
+    inputs = [_spec(name, [3, 4, 8], "bf16", [None, None, None])]
+    split = torch.ones(3, 4, 8, dtype=torch.bfloat16)
+    assert checkpoint.fill_router_splits(inputs, {name: split})[name] is split
+
+
+def test_a_missing_router_split_is_built_from_an_fp32_weight() -> None:
+    name = f"gate.{BF16X3_WEIGHT_BUFFER}"
+    inputs = [_spec(name, [3, 4, 8], "bf16", [None, None, None])]
+    weight = torch.randn(4, 8, generator=torch.Generator().manual_seed(0))
+    tensors = checkpoint.fill_router_splits(inputs, {"gate.weight": weight})
+    assert torch.equal(tensors[name].double().sum(0), weight.double())
+
+
+_WEIGHT = torch.randn(4, 8, generator=torch.Generator().manual_seed(0))
+
+
+@pytest.mark.parametrize(
+    "loaded",
+    [{}, {"gate.weight": _WEIGHT.bfloat16()}, {"gate.weight": _WEIGHT.T}],
+    ids=["missing", "bf16", "transposed"],
+)
+def test_a_router_split_without_an_fp32_weight_is_rejected(
+    loaded: dict[str, torch.Tensor],
+) -> None:
+    inputs = [_spec(f"gate.{BF16X3_WEIGHT_BUFFER}", [3, 4, 8], "bf16", [None] * 3)]
+    with pytest.raises(ValueError, match=r"no fp32 \[4, 8\] gate.weight"):
+        checkpoint.fill_router_splits(inputs, loaded)
 
 
 def test_abstract_params_inputs_are_in_argument_order(tmp_path: Path) -> None:

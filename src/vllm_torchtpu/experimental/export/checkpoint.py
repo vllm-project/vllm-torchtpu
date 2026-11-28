@@ -148,6 +148,55 @@ def to_numpy(tensor: Any) -> Any:
     return t.numpy()
 
 
+def fill_router_splits(
+    inputs: Sequence[Mapping[str, Any]], tensors: Mapping[str, Any]
+) -> dict[str, Any]:
+    """`tensors` plus each router weight split the artifact reads but the model lacks.
+
+    `TpuGateLinear` splits an fp32 router weight only when the split changes the
+    logits, so an artifact traced with dummy weights reads a split that a gate
+    loaded with bf16-valued (or non-finite) weights does not have. The missing
+    split is built from `{prefix}.weight`: bf16 terms that sum to it, or, for a
+    non-finite weight, `bf16(W)` and two zero terms, so the artifact routes with
+    `bf16(W)` as the gate's fallback does.
+    """
+    import torch
+    from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_rocm import (
+        BF16X3_TERMS,
+        split_bf16x3,
+    )
+
+    from vllm_torchtpu.layers.adapter.gate_linear import BF16X3_WEIGHT_BUFFER
+
+    filled = dict(tensors)
+    for spec in inputs:
+        name = spec["name"]
+        prefix, _, buffer = name.rpartition(".")
+        if name in filled or buffer != BF16X3_WEIGHT_BUFFER:
+            continue
+        weight = filled.get(f"{prefix}.weight")
+        # The split is replicated, so its global shape is the local one.
+        if (
+            weight is None
+            or weight.dtype != torch.float32
+            or [BF16X3_TERMS, *weight.shape] != list(spec["shape"])
+        ):
+            found = None if weight is None else (weight.dtype, list(weight.shape))
+            raise ValueError(
+                f"{name}: the artifact reads a router weight split, but the "
+                f"loaded model has no fp32 {list(spec['shape'][1:])} {prefix}.weight "
+                f"to build it from (found {found})"
+            )
+        weight = weight.detach().cpu()
+        if torch.isfinite(weight).all():
+            filled[name] = split_bf16x3(weight)
+        else:
+            hi = weight.bfloat16()
+            zeros = hi.new_zeros(BF16X3_TERMS - 1, *hi.shape)
+            filled[name] = torch.cat([hi[None], zeros])
+    return filled
+
+
 def iter_checkpoint_shards(
     inputs: Sequence[Mapping[str, Any]],
     tensors: Mapping[str, Any],
@@ -369,6 +418,7 @@ def save_model_checkpoint(
     """Saves this rank's `tensors`, by name, for the artifact in `artifact_dir`."""
     inputs = abstract_params_inputs(artifact_dir)
     sizes = mesh_axis_sizes(artifact_dir)
+    tensors = fill_router_splits(inputs, tensors)
     shards = iter_checkpoint_shards(inputs, tensors, sizes)
     save_checkpoint(inputs, shards, sizes, data_dir)
 

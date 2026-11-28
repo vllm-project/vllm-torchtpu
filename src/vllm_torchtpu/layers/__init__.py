@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Imported for their registration side effects; the out-of-tree
-# RowParallelLinear in `linear` only affects layers built after the import, so
-# this module must be imported before any model is constructed.
+# RowParallelLinear in `linear` and GateLinear in `gate_linear` only affect
+# layers built after the import, so this module must be imported before any
+# model is constructed.
 from vllm_torchtpu.layers.adapter import attention as attention
+from vllm_torchtpu.layers.adapter import gate_linear as gate_linear
 from vllm_torchtpu.layers.adapter import linear as linear
 from vllm_torchtpu.models import register_model_directories
 from vllm_torchtpu.models.vllm import register_models

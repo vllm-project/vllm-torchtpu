@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -28,6 +29,8 @@ from unittest import mock
 import pytest
 import torch
 import torch.nn as nn
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.fused_moe import GateLinear
 
 from vllm_torchtpu.experimental.export import (
     api,
@@ -40,6 +43,7 @@ from vllm_torchtpu.experimental.export import (
     validator,
     weight_mapper,
 )
+from vllm_torchtpu.layers.adapter.gate_linear import BF16X3_WEIGHT_BUFFER, TpuGateLinear
 
 
 @pytest.fixture(autouse=True)
@@ -1365,6 +1369,46 @@ def test_build_export_config_req_buckets_cover_speculative_verify_rows(
         64,
         128,
         256,
+    )
+
+
+def test_a_gate_weight_split_is_laid_out_as_a_replicated_weight(
+    tensor_parallel_group,
+) -> None:
+    """A loaded TpuGateLinear's split, too large for a constant, is laid out as a
+    replicated weight in a tensor-parallel export."""
+    # The gate is built at one rank; the export lays it out over two.
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))):
+        gate = GateLinear(
+            256, 32, bias=False, params_dtype=torch.float32,
+            out_dtype=torch.float32, prefix="gate",
+        )  # fmt: skip
+    assert type(gate) is TpuGateLinear
+    gate.weight.weight_loader(
+        gate.weight, torch.randn(32, 256, generator=torch.Generator().manual_seed(0))
+    )
+    gate.quant_method.process_weights_after_loading(gate)
+    name = f"gate.{BF16X3_WEIGHT_BUFFER}"
+    model = nn.Module()
+    model.gate = gate
+    model.register_buffer("rank", torch.zeros(1, dtype=torch.int32))
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, num_partitions=2
+    )
+    adapter = object.__new__(universal_adapter.UniversalVllmExportableLLM)
+    adapter._export_config = cfg
+    adapter._model = model
+
+    assert adapter.constant_names() == {"rank"}
+    params = {
+        n: s for n, s in adapter.abstract_params().items() if n.startswith("gate.")
+    }
+    layouts = exporter._tensor_layouts(
+        adapter, params, frozenset(adapter.constant_names()), exporter._axis_sizes(cfg)
+    )
+    assert math.prod(params[name].shape) > universal_adapter._MAX_CONSTANT_ELEMENTS
+    assert layouts[name] == exporter._TensorLayout(
+        shape=[3, 32, 256], sharding=[None, None, None], lowered_shape=(3, 32, 256)
     )
 
 
