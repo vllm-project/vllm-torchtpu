@@ -26,9 +26,6 @@ from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.kernel import (
-    PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
-)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper import (
     PCP_AXIS_NAME,
     TP_AXIS_NAME,
@@ -196,7 +193,7 @@ def make_pcp_streaming_rpa_kernel(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     cp_kv_cache_interleave_size: int,
-    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+    q_block_size: int | None = None,
     q_compute_size: int | None = None,
     kv_layout: batched_rpa_configs.KVLayout = (
         batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE

@@ -717,6 +717,7 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(monkeypatch
         attention_sink=None,
         sm_scale=0.25,
         cp_kv_cache_interleave_size=interleave_size,
+        q_block_size=512,
     )
 
     expected_descriptors, expected_num_segments = (
@@ -740,7 +741,19 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(monkeypatch
     assert new_cache.shape == (local_kv_cache_num_blocks, page_size, 2, 1, 128)
 
 
-def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,head_dim,capacity_mib,expected_tile",
+    [
+        (64, 8, 128, 64, 256),
+        (32, 32, 256, 64, 128),  # One Q per KV pads to two.
+        (32, 8, 256, 64, 256),
+        (16, 4, 256, 64, 512),
+        (64, 8, 128, 128, 512),
+    ],
+)
+def test_sharded_wrapper_masks_output_with_query_validity(
+    monkeypatch, q_heads, kv_heads, head_dim, capacity_mib, expected_tile
+):
     query_rows = pcp_wrapper._PCPQueryRowMapping(
         absolute_positions=jnp.array([0, -1, 2, -1], dtype=jnp.int32),
         request_indices=jnp.array([0, -1, 0, -1], dtype=jnp.int32),
@@ -769,6 +782,8 @@ def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
         **_kwargs,
     ):
         captured["writeback_called"] = True
+        captured["q_block_size"] = _kwargs["q_block_size"]
+        captured["padded_heads"] = q_streaming.shape[1] * q_streaming.shape[2]
         return jnp.full_like(q_streaming, 5), kv_cache
 
     def fake_prepare_current(k_local, _v_local, cache, **_kwargs):
@@ -798,13 +813,18 @@ def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
     )
     monkeypatch.setattr(pcp_wrapper.jax, "shard_map", fake_shard_map)
 
+    monkeypatch.setattr(
+        pcp_wrapper.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=capacity_mib * 1024**2),
+    )
     num_tokens = 4
     page_size = 4
     mesh = SimpleNamespace(axis_names=("pcp",), shape={"pcp": 1})
-    q = jnp.ones((num_tokens, 2, 128), dtype=jnp.float32)
-    k = jnp.ones((num_tokens, 1, 128), dtype=jnp.float32)
-    v = jnp.ones((num_tokens, 1, 128), dtype=jnp.float32)
-    kv_cache = jnp.zeros((1, page_size, 2, 1, 128), dtype=jnp.float32)
+    q = jnp.ones((num_tokens, q_heads, head_dim), dtype=jnp.bfloat16)
+    k = jnp.ones((num_tokens, kv_heads, head_dim), dtype=jnp.bfloat16)
+    v = jnp.ones((num_tokens, kv_heads, head_dim), dtype=jnp.bfloat16)
+    kv_cache = jnp.zeros((1, page_size, kv_heads, 2, head_dim), dtype=jnp.bfloat16)
 
     output, _ = pcp_wrapper.sharded_pcp_ragged_paged_attention(
         mesh=mesh,
@@ -822,7 +842,9 @@ def test_sharded_wrapper_masks_output_with_query_validity(monkeypatch):
     )
 
     assert captured["writeback_called"]
-    expected_output = np.zeros((num_tokens, 2, 128), dtype=np.float32)
+    assert captured["q_block_size"] == expected_tile
+    assert captured["padded_heads"] == (64 if q_heads == kv_heads else q_heads)
+    expected_output = np.zeros((num_tokens, q_heads, head_dim), dtype=np.float32)
     expected_output[[0, 2]] = 5
     np.testing.assert_array_equal(np.asarray(output), expected_output)
 
@@ -834,3 +856,28 @@ def test_reshape_packed_kv_cache_for_attention_rejects_ambiguous_layout():
 
     with pytest.raises(ValueError, match="packing does not match"):
         pcp_wrapper._reshape_packed_kv_cache_for_attention(kv_cache)
+
+
+@pytest.mark.parametrize("interleave_size", [256, 512])
+def test_default_q_tile_rejects_interleave_floor(monkeypatch, interleave_size):
+    monkeypatch.setattr(
+        pcp_wrapper.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
+    q = SimpleNamespace(shape=(512, 32, 2, 256), dtype=jnp.dtype(jnp.bfloat16))
+    cache = SimpleNamespace(shape=(1, 256, 32, 2, 256), dtype=q.dtype)
+    with pytest.raises(ValueError, match="interleave floor"):
+        pcp_wrapper._default_q_block_size(q, cache, interleave_size)
+
+
+def test_default_q_tile_reserves_large_kv_pages(monkeypatch):
+    monkeypatch.setattr(
+        pcp_wrapper.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
+    q = SimpleNamespace(shape=(512, 8, 4, 128), dtype=jnp.dtype(jnp.bfloat16))
+    # Two 24 MiB KV pages leave less than 10 MiB for Q scratch.
+    cache = SimpleNamespace(shape=(1, 6144, 8, 2, 128), dtype=q.dtype)
+    assert pcp_wrapper._default_q_block_size(q, cache, 128) == 128
