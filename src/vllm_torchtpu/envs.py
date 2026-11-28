@@ -284,6 +284,8 @@ if TYPE_CHECKING:
     TPU_RAIDEN_FLUSH_REAL_REUSE: bool = False
     TPU_RAIDEN_LOSS_TRACE: bool = False
     TPU_RAIDEN_WB_DROP_COVERED: bool = False
+    TPU_RAIDEN_STAGED_RESCUE: bool = False
+    TPU_RAIDEN_STAGING_STORE_RESERVE: int = 0
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1964,6 +1966,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_WB_DROP_COVERED": env_bool(
         "TPU_RAIDEN_WB_DROP_COVERED", default=False
     ),
+    # Staged offload (staging_blocks > 0): a flush of a store job cancels only
+    # the parts that lose data. Parts with no block the pool hands out fresh
+    # this step stay queued (a flush names a whole job, i.e. every chunk a
+    # write-back holder stores in that step); parts with a reallocated block
+    # take free staging rows and pack before the step's forward (like a late
+    # store), and are cancelled only without free rows; packed parts are kept.
+    # Scheduler-side.
+    "TPU_RAIDEN_STAGED_RESCUE": env_bool("TPU_RAIDEN_STAGED_RESCUE", default=False),
+    # Staged offload: staging rows loads leave free, so write-back stores (and
+    # TPU_RAIDEN_STAGED_RESCUE packs) find rows during load bursts. Clamped so
+    # a full load part can always start. 0 = loads may take every row.
+    "TPU_RAIDEN_STAGING_STORE_RESERVE": env_int("TPU_RAIDEN_STAGING_STORE_RESERVE", 0),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(

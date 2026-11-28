@@ -359,6 +359,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     _flush_real_reuse = False
     _wb_drop_covered = False
     _loss_trace = False
+    _staged_rescue = False
     _fresh_block_ids: set[int] | None = None
     # Unstaged unless the connector config asks for staging
     # (class default also covers instances built without __init__).
@@ -405,6 +406,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._flush_real_reuse = bool(tpu_envs.TPU_RAIDEN_FLUSH_REAL_REUSE)
         self._loss_trace = bool(tpu_envs.TPU_RAIDEN_LOSS_TRACE)
         self._wb_drop_covered = bool(tpu_envs.TPU_RAIDEN_WB_DROP_COVERED)
+        # Per-part flushes of staged stores; needs the pool's fresh blocks.
+        self._staged_rescue = bool(tpu_envs.TPU_RAIDEN_STAGED_RESCUE) and bool(
+            getattr(spec, "staging_blocks", 0)
+        )
         self._traced_req_ids: set[str] = set()
         if self._loss_trace:
             self._raiden_manager.enable_loss_trace()
@@ -433,14 +438,18 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 staging_blocks,
                 self.config.num_workers,
                 row_bytes=row_bytes,
+                store_reserve=tpu_envs.TPU_RAIDEN_STAGING_STORE_RESERVE,
             )
             logger.info(
                 "TPURaidenOffloadingConnector: staged offload on (scheduler): "
                 "%d staging rows of ~%d bytes per rank, parts of <= %d blocks; "
-                "transfer stats every 60 s",
+                "transfer stats every 60 s; %d rows reserved for stores, "
+                "staged rescue %s",
                 staging_blocks,
                 row_bytes,
                 self._staged.max_part_rows,
+                self._staged.store_reserve,
+                self._staged_rescue,
             )
 
     def attach_block_pool(self, block_pool) -> None:
@@ -462,7 +471,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         late_store = self._write_back is not None and self._write_back.late_store
         if (
-            self._flush_real_reuse or self._wb_drop_covered or late_store
+            self._flush_real_reuse
+            or self._wb_drop_covered
+            or late_store
+            or self._staged_rescue
         ) and not getattr(block_pool, "_tpu_raiden_fresh_watch", False):
             fresh: set[int] = set()
             pool_get_new_blocks = block_pool.get_new_blocks
@@ -891,6 +903,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        # This step's fresh blocks, before the base's _update_req_states
+        # clears the watch (TPU_RAIDEN_STAGED_RESCUE).
+        reallocated = (
+            set(self._fresh_block_ids)
+            if self._staged_rescue and self._fresh_block_ids is not None
+            else None
+        )
         if self._write_back is not None and self._write_back.per_block:
             scheduler_output = self._write_back_output_blocks(scheduler_output)
             meta = self._wb_build_partial(scheduler_output)
@@ -902,7 +921,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         urgent_reqs = getattr(self, "_wb_urgent", None) or set()
         self._wb_urgent = set()
         if self._staged is not None:
-            return self._build_staged_meta(meta, self._staged, urgent_reqs)
+            return self._build_staged_meta(
+                meta, self._staged, urgent_reqs, reallocated=reallocated
+            )
 
         manager = self._raiden_manager
 
@@ -1229,6 +1250,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         meta: OffloadingConnectorMetadata,
         staged: StagedTransferScheduler,
         urgent_reqs: set[str] | frozenset[str] = frozenset(),
+        reallocated: set[int] | None = None,
     ) -> RaidenOffloadingConnectorMetadata:
         """`build_connector_meta` with staging rows between HBM and Raiden.
 
@@ -1242,6 +1264,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         step) takes rows at once and packs in the workers' start_load_kv,
         before the forward; without free rows it queues and the flush cancels
         it, as any store of reused blocks.
+
+        `reallocated` (TPU_RAIDEN_STAGED_RESCUE): this step's fresh blocks;
+        the flush then cancels only parts that lose data
+        (`StagedTransferScheduler.flush`), so a late store that does not fit
+        the free rows as a whole still packs the parts that do.
         """
         out = StagedStepOutput()
         for job_id, job in meta.store_jobs.items():
@@ -1266,7 +1293,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 job.req_id,
                 pinned=src_spec.pinned,
             )
-        staged.flush(set(meta.jobs_to_flush or ()), out)
+        staged.flush(set(meta.jobs_to_flush or ()), out, reallocated=reallocated)
         staged.step(out)
         return RaidenOffloadingConnectorMetadata(
             load_jobs={},  # pyrefly: ignore[unexpected-keyword]

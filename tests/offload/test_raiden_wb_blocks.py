@@ -265,7 +265,7 @@ def test_late_store_job_skips_the_fence():
     mgr.drain_jobs.assert_called_once_with({7})
 
 
-def _staged_late_step(num_rows, taken=0):
+def _staged_late_step(num_rows, taken=0, rescue=False, store_blocks=(6,)):
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
         OffloadingConnectorMetadata,
     )
@@ -278,9 +278,10 @@ def _staged_late_step(num_rows, taken=0):
     from vllm_torchtpu.offload.raiden_store import RaidenLoadStoreSpec
 
     s, pool = _late_scheduler(window_blocks=1)
-    keys, _ = _held(s, "r", [5, 6])
+    keys, _ = _held(s, "r", [5, 6, 7])
     _step(s)
     s._fresh_block_ids.update({6})
+    s._staged_rescue = rescue
     mgr = MagicMock()
     mgr.poll_finished_jobs.return_value = []
     s._raiden_manager = mgr
@@ -288,10 +289,13 @@ def _staged_late_step(num_rows, taken=0):
     s._staged = StagedTransferScheduler(mgr, num_rows, 1)
     if taken:
         s._staged.rows.take(taken)  # rows busy with other transfers
+    blocks = list(store_blocks)
     job = SimpleNamespace(
         req_id="r",
-        src_spec=GPULoadStoreSpec([6], group_sizes=[1], block_indices=[1]),
-        dst_spec=RaidenLoadStoreSpec([keys[1]]),
+        src_spec=GPULoadStoreSpec(
+            blocks, group_sizes=[len(blocks)], block_indices=[1]
+        ),
+        dst_spec=RaidenLoadStoreSpec([keys[b - 5] for b in blocks]),
     )
     meta = OffloadingConnectorMetadata(
         load_jobs={}, store_jobs={7: job}, jobs_to_flush={7}
@@ -333,6 +337,37 @@ def test_late_store_under_staging_without_rows_is_cancelled():
     assert res.staging_urgent_packs == {} and res.staging_packs == {}
     mgr.submit_store_job.assert_not_called()
     mgr.on_store_job_cancelled.assert_called_once_with([keys[1]])
+
+
+def test_staged_rescue_packs_the_reallocated_part_of_a_late_store():
+    """TPU_RAIDEN_STAGED_RESCUE: a late store that does not fit the free rows
+    as a whole still packs its reallocated part before the forward; the part
+    whose block is not reallocated stays queued instead of being cancelled."""
+    s, mgr, keys, res = _staged_late_step(
+        num_rows=2, taken=1, rescue=True, store_blocks=(6, 7)
+    )
+    ((part_id, (blocks, rows)),) = res.staging_urgent_packs.items()
+    assert blocks == [6] and len(rows) == 1
+    assert part_id in res.fence_job_ids
+    mgr.on_store_job_cancelled.assert_not_called()
+    assert s._staged.stats["store_urgent_no_rows"] == 1
+    assert s._staged.stats["store_kept_queued_parts"] == 1
+    # Without the flag the same step cancels the whole job.
+    s, mgr, keys, res = _staged_late_step(num_rows=2, taken=1, store_blocks=(6, 7))
+    assert res.staging_urgent_packs == {}
+    cancelled = [c.args[0] for c in mgr.on_store_job_cancelled.call_args_list]
+    assert sorted(cancelled) == [[keys[1]], [keys[2]]]
+
+
+def test_staged_rescue_installs_the_fresh_watch():
+    s, pool = _scheduler(window_blocks=1)
+    s._fresh_block_ids = None
+    pool2 = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+    s._staged_rescue = True
+    s.attach_block_pool(pool2)
+    assert s._fresh_block_ids is not None
+    pool2.get_new_blocks(2)
+    assert len(s._fresh_block_ids) == 2
 
 
 def test_worker_start_load_kv_packs_urgent_rows_first():

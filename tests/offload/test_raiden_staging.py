@@ -623,6 +623,109 @@ class TestStagedStores(unittest.TestCase):
         self.assertEqual(out.finished_store_job_ids, [5])
         self.assertEqual(staged.rows.num_free, 2)
 
+    def test_rescue_flush_keeps_parts_without_reallocated_blocks(self):
+        """TPU_RAIDEN_STAGED_RESCUE: a flush names the whole job; only the
+        part holding a reallocated block is affected, and with free rows it
+        packs before the forward instead of being cancelled."""
+        store, manager, staged = _staged(rows=4)  # parts of 2
+        keys = [_key(i) for i in range(6)]
+        manager.prepare_store(keys, SimpleNamespace(req_id="r"))
+        staged.rows.take(2)  # a load holds 2 rows
+        staged.add_store_job(5, keys, [40, 41, 42, 43, 44, 45])
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={44})
+        # Part [44, 45] took the 2 free rows as an urgent pack; [40, 41] and
+        # [42, 43] stay queued; nothing is cancelled.
+        ((pid, (blocks, rows)),) = out.urgent_packs.items()
+        self.assertEqual(blocks, [44, 45])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(out.finished_store_job_ids, [])
+        for k in keys:
+            self.assertIn(k, manager._inflight_store_keys)
+        self.assertEqual(staged.stats["store_rescued_urgent_parts"], 1)
+        self.assertEqual(staged.stats["store_kept_queued_parts"], 2)
+        # The urgent part saves from its rows once every rank fenced it.
+        staged.on_fenced({pid: 2})
+        (insert,) = store.calls_named("insert")
+        self.assertEqual([s.device_block_id for s in insert.args[1]], rows)
+
+    def test_rescue_flush_cancels_reallocated_part_without_rows(self):
+        store, manager, staged = _staged(rows=4)
+        keys = [_key(i) for i in range(4)]
+        manager.prepare_store(keys, SimpleNamespace(req_id="r"))
+        staged.rows.take(4)  # loads hold every row
+        staged.add_store_job(5, keys, [40, 41, 42, 43])
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={41})
+        self.assertEqual(out.urgent_packs, {})
+        self.assertNotIn(keys[0], manager._inflight_store_keys)
+        self.assertNotIn(keys[1], manager._inflight_store_keys)
+        self.assertIn(keys[2], manager._inflight_store_keys)
+        self.assertEqual(staged.stats["store_cancelled_queued_parts"], 1)
+        # The kept part packs once rows come back.
+        staged.rows.give(staged.rows._taken.copy())
+        out = _step(staged)
+        ((pid, (blocks, _)),) = out.packs.items()
+        self.assertEqual(blocks, [42, 43])
+
+    def test_rescue_flush_keeps_packed_part(self):
+        """A part packed in an earlier step keeps its save: its rows were
+        filled before this step's forward can overwrite the blocks."""
+        store, manager, staged = _staged(rows=2)
+        keys = [_key(1)]
+        manager.prepare_store(keys, SimpleNamespace(req_id="r"))
+        staged.add_store_job(5, keys, [40])
+        out = _step(staged)
+        ((pid, _),) = out.packs.items()
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={40})
+        self.assertEqual(staged.stats["store_rescued_packed_parts"], 1)
+        self.assertEqual(staged.stats["store_cancelled_parts"], 0)
+        staged.on_fenced({pid: 2})
+        (save,) = store.calls_named("save")
+        store.complete_save(save.args[0])
+        out = _step(staged)
+        self.assertEqual(out.finished_store_job_ids, [5])
+        self.assertEqual(staged.rows.num_free, 2)
+
+    def test_store_reserve_leaves_rows_for_stores(self):
+        store = FakeKVCacheStore()
+        manager = make_manager(store, device_block_size_factor=1, num_blocks=64)
+        staged = rs.StagedTransferScheduler(manager, 4, 2, store_reserve=1)
+        self.assertEqual(staged.store_reserve, 1)
+        keys = [_key(10 + i) for i in range(4)]
+        for k in keys:
+            seed_host_entries(store, k, 1)
+        manager.prepare_load(keys, SimpleNamespace(req_id="r"))
+        staged.add_load_job(6, keys, [50, 51, 52, 53], "r")  # parts of 2
+        manager.prepare_store([_key(1)], SimpleNamespace(req_id="w"))
+        staged.add_store_job(5, [_key(1)], [40])
+        out = _step(staged)
+        # One load part (2 rows) fits with 1 row reserved; the second does
+        # not, and queued stores still wait behind it (loads first).
+        self.assertEqual(len(store.calls_named("load")), 1)
+        self.assertEqual(staged.rows.num_free, 2)
+        self.assertEqual(out.packs, {})
+        # A rescue finds the reserved rows even while a load waits.
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out, reallocated={40})
+        self.assertEqual(len(out.urgent_packs), 1)
+        # The reserve never blocks a full load part on an idle pool.
+        clamped = rs.StagedTransferScheduler(manager, 4, 2, store_reserve=9)
+        self.assertEqual(clamped.store_reserve, 2)
+
+    def test_flush_without_rescue_still_cancels_whole_job(self):
+        store, manager, staged = _staged(rows=4)
+        keys = [_key(i) for i in range(4)]
+        manager.prepare_store(keys, SimpleNamespace(req_id="r"))
+        staged.rows.take(4)
+        staged.add_store_job(5, keys, [40, 41, 42, 43])
+        out = rs.StagedStepOutput()
+        staged.flush({5}, out)
+        self.assertEqual(out.finished_store_job_ids, [5])
+        for k in keys:
+            self.assertNotIn(k, manager._inflight_store_keys)
+
     def test_store_created_and_flushed_same_step(self):
         store, manager, staged = _staged(rows=2)
         staged.add_store_job(5, [_key(1)], [40])

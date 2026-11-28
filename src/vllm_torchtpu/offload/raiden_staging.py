@@ -627,6 +627,7 @@ class StagedTransferScheduler:
         row_bytes: int = 0,
         log_interval_s: float = 60.0,
         clock: Callable[[], float] = time.monotonic,
+        store_reserve: int = 0,
     ):
         self._manager = manager
         # Bytes of one row on one rank (stats only; 0 leaves bytes out).
@@ -641,6 +642,10 @@ class StagedTransferScheduler:
         # Half the rows at most, so a load can always start while stores hold
         # the rest.
         self.max_part_rows = max(1, num_rows // 2)
+        # Rows loads leave free for stores (TPU_RAIDEN_STAGING_STORE_RESERVE):
+        # a write-back store whose blocks are about to be reallocated needs
+        # rows at once. Never so many that a full load part cannot start.
+        self.store_reserve = max(0, min(store_reserve, num_rows - self.max_part_rows))
         self._next_part_id = _PART_ID_BASE
         self._parts: dict[int, _Part] = {}
         self._jobs: dict[int, _BaseJob] = {}
@@ -753,13 +758,29 @@ class StagedTransferScheduler:
 
     # -- flush ---------------------------------------------------------------
 
-    def flush(self, job_ids: set[int], out: StagedStepOutput) -> None:
+    def flush(
+        self,
+        job_ids: set[int],
+        out: StagedStepOutput,
+        reallocated: set[int] | None = None,
+    ) -> None:
         """Source blocks of these store jobs are about to be reused.
 
         A part not yet packed is cancelled. A packed part (its pack was
         shipped in an earlier step) is cancelled too; its rows come back once
         every rank reports the pack retired. A launched part keeps going: its
         save reads the staging rows, not the reused blocks, so nothing waits.
+
+        `reallocated` (TPU_RAIDEN_STAGED_RESCUE: the block ids the pool hands
+        out fresh this step) narrows this to the parts that lose data:
+        - a queued part none of whose blocks is reallocated stays queued (a
+          flush names whole jobs, and one job holds every chunk a holder
+          stores this step, many parts deep; a prefix hit keeps contents);
+        - a queued part with a reallocated block takes free rows now and packs
+          before this step's forward (`out.urgent_packs`, as a late store);
+          only without free rows is it cancelled;
+        - a packed part is kept: its pack was enqueued in an earlier step,
+          before this step's forward, so its rows already hold the data.
         """
         for job_id in job_ids:
             job = self._jobs.get(job_id)
@@ -769,9 +790,14 @@ class StagedTransferScheduler:
                 part = self._parts[part_id]
                 if part.urgent:
                     continue
+                if reallocated is not None and self._rescue(part, reallocated, out):
+                    continue
                 if part.state == "queued":
                     self._store_queue.remove(part_id)
                     del self._parts[part_id]
+                    if reallocated is not None:
+                        self.stats["store_cancelled_queued_parts"] += 1
+                        self.stats["store_cancelled_queued_blocks"] += len(part.keys)
                 elif part.state == "fencing":
                     part.state = "cancelled"
                     self.stats["store_cancelled_parts"] += 1
@@ -780,6 +806,30 @@ class StagedTransferScheduler:
                 self._manager.on_store_job_cancelled(part.keys)
                 job.outstanding.discard(part_id)
             self._maybe_finish(job, out)
+
+    def _rescue(
+        self, part: _Part, reallocated: set[int], out: StagedStepOutput
+    ) -> bool:
+        """TPU_RAIDEN_STAGED_RESCUE: True if `part` survives this flush."""
+        if part.state == "fencing":
+            self.stats["store_rescued_packed_parts"] += 1
+            return True
+        if part.state != "queued":
+            return False
+        if reallocated.isdisjoint(part.device_block_ids):
+            self.stats["store_kept_queued_parts"] += 1
+            return True
+        rows = self.rows.take(len(part.keys))
+        if rows is None:
+            return False
+        self._store_queue.remove(part.part_id)
+        part.rows = rows
+        part.state = "fencing"
+        part.urgent = True
+        out.urgent_packs[part.part_id] = (list(part.device_block_ids), list(rows))
+        self.stats["store_rescued_urgent_parts"] += 1
+        self.stats["store_rescued_urgent_blocks"] += len(part.keys)
+        return True
 
     # -- per step ------------------------------------------------------------
 
@@ -829,13 +879,44 @@ class StagedTransferScheduler:
             self.rows.num_free,
             self.rows.num_rows,
         )
+        if any(
+            k.startswith(
+                (
+                    "store_urgent",
+                    "store_rescued",
+                    "store_kept",
+                    "store_cancelled_queued",
+                )
+            )
+            for k in c
+        ):
+            logger.info(
+                "Raiden staged store flushes (%.0f s): urgent %d parts, "
+                "urgent without rows %d jobs; rescue: %d queued parts kept "
+                "(no reallocated block), %d parts (%d blocks) packed before the "
+                "forward, %d packed parts kept, %d queued parts (%d blocks) "
+                "cancelled (no rows)",
+                elapsed,
+                c["store_urgent_parts"],
+                c["store_urgent_no_rows"],
+                c["store_kept_queued_parts"],
+                c["store_rescued_urgent_parts"],
+                c["store_rescued_urgent_blocks"],
+                c["store_rescued_packed_parts"],
+                c["store_cancelled_queued_parts"],
+                c["store_cancelled_queued_blocks"],
+            )
         c.clear()
         return True
 
     def _pump(self, out: StagedStepOutput) -> None:
         while self._load_queue:
             part = self._parts[self._load_queue[0]]
-            rows = self.rows.take(len(part.keys))
+            rows = (
+                self.rows.take(len(part.keys))
+                if len(part.keys) + self.store_reserve <= self.rows.num_free
+                else None
+            )
             if rows is None:
                 # Loads first: stores wait until the head load fits.
                 return
