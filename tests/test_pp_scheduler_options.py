@@ -814,50 +814,91 @@ def test_prefix_aware_resolves_a_divergent_hit_through_the_connector(
     assert seen == [12288]
 
 
-def test_a_kv_consumer_keeps_a_divergent_hit_for_its_transfer_connector():
-    """On a KV consumer the transfer connector loads a diverged hit's suffix
-    (Stage-3), which the resolver, a host-tier decision, knows nothing of: the
-    resolver is not asked and the base hit stands, as with a transfer
-    connector that has no resolver."""
-    asked = []
+@pytest.mark.parametrize(
+    ("kv_role", "asked"),
+    [("kv_consumer", False), ("kv_producer", True), ("kv_both", True)],
+)
+def test_a_decode_leg_keeps_a_divergent_hit_for_its_transfer_connector(
+    kv_role, asked, caplog
+):
+    """A decode leg's (kv_consumer's) transfer connector loads a diverged
+    hit's suffix (Stage-3), which the resolver, a host-tier decision, knows
+    nothing of: the scheduler does not take the resolver there, and the base
+    hit stands. Every other engine (kv_both has neither role) asks it; here
+    it answers None, which cuts the hit to the reconciled one."""
+    asked_with = []
+
+    class Resolver(_HookedConnector):
+        def resolve_divergent_local_hit_tokens(self, *args):
+            asked_with.append(args[1:])
+            return None
+
+    connector = Resolver()
+    with caplog.at_level("WARNING"):
+        built, _ = _built(
+            {"tpu_pp_scheduler": {"prefix_aware": True}},
+            kv_role=kv_role,
+            connector=connector,
+        )
+    assert built._hit_resolver is (connector if asked else None)
+    assert "has no" not in caplog.text
 
     def base(self, request, max_cache_hit_length=None):
         return "blocks", 8192, 0, True
 
     kvm = SimpleNamespace(
-        get_computed_blocks=lambda request, cap: asked.append("reconcile")
-        or ("reconciled", 2048, 777),
-    )
-    connector = SimpleNamespace(
-        supports_divergent_local_hybrid_hits=True,
-        resolve_divergent_local_hit_tokens=lambda *a: asked.append(a),
+        get_computed_blocks=lambda request, cap: ("reconciled", 2048, 777),
     )
     request = _req(0, 16384)
     with patch.object(Scheduler, "_get_local_prefix_cache_hit", base):
         s = _sched(
-            connector=connector,
-            _hit_resolver=connector,
+            connector=SimpleNamespace(supports_divergent_local_hybrid_hits=True),
+            _hit_resolver=built._hit_resolver,
             _prefix_aware=True,
-            _is_kv_consumer=True,
             kv_cache_manager=kvm,
         )
         s._get_block_size = lambda: 2048
         got = s._get_local_prefix_cache_hit(request, 12288)
-    assert got == ("blocks", 8192, 0, True)
-    assert asked == []
-    assert request._tpu_local_hit_tokens == 8192
+    if asked:
+        assert asked_with == [(8192, 2048, 2048)]
+        assert got == ("reconciled", 2048, 777, False)
+    else:
+        assert asked_with == []
+        assert got == ("blocks", 8192, 0, True)
 
 
-def test_the_ext_room_reads_vllms_reservation_not_the_prefetch_counter():
-    """_free_blocks_for_ext runs on every sort and promotion. It reads vLLM's
-    own _inflight_prefill_reserved_blocks (a sum of block counts taken with
-    the admission cap, which writes no state), not PrefixAwareScheduler's
-    override, which counts a call at the prefetch cap as a refused load."""
-    assert PrefixAwareScheduler not in TpuPipelineChunkScheduler.__mro__
+def test_a_decode_leg_is_not_warned_about_the_resolver(caplog):
+    """A decode leg never asks the resolver, so a connector without one is
+    not named for it; the hooks it would use still are."""
+    with caplog.at_level("WARNING"):
+        _built(
+            {"tpu_pp_scheduler": {"prefix_aware": True}},
+            kv_role="kv_consumer",
+            connector=object(),
+        )
     assert (
-        TpuPipelineChunkScheduler._inflight_prefill_reserved_blocks
-        is Scheduler._inflight_prefill_reserved_blocks
+        "has no estimate_external_hit_tokens or poll_and_complete_transfers;"
+        in caplog.text
     )
+
+
+def test_the_ext_room_reads_the_reservation_and_changes_nothing():
+    """_free_blocks_for_ext runs on every sort and promotion. It takes vLLM's
+    reservation for the in-flight async loads (_inflight_prefill_reserved_blocks,
+    the blocks each still needs) from the free blocks. Two calls give the same
+    room and write nothing: PrefixAwareScheduler's override, which counts a
+    call at the prefetch cap as a refused load, is not used here."""
+    s = _sched(
+        kv_cache_manager=SimpleNamespace(
+            block_pool=SimpleNamespace(get_num_free_blocks=lambda: 100)
+        ),
+        _inflight_prefills={"a", "b"},
+    )
+    s._request_remaining_blocks = {"a": 30, "b": 12}.get
+    before = dict(vars(s))
+    assert s._free_blocks_for_ext() == 58
+    assert s._free_blocks_for_ext() == 58
+    assert vars(s) == before
 
 
 def test_without_prefix_aware_the_resend_is_not_trimmed():

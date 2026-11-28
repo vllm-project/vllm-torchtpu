@@ -269,20 +269,24 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         self._transfer_poller: TransferPoller | None = (
             self.connector if isinstance(self.connector, TransferPoller) else None
         )
+        # A decode leg (kv_consumer) keeps vLLM's handling of a diverged hit:
+        # its transfer connector loads the suffix (Stage-3), which the
+        # resolver, a host-tier decision, knows nothing of.
         self._hit_resolver: DivergentHitResolver | None = (
-            self.connector if isinstance(self.connector, DivergentHitResolver) else None
+            self.connector
+            if not self._is_kv_consumer
+            and isinstance(self.connector, DivergentHitResolver)
+            else None
         )
         self._poll_failures = 0
         if self._prefix_aware and self.connector is not None:
-            missing = [
-                name
-                for name, hook in (
-                    ("estimate_external_hit_tokens", self._hit_estimator),
-                    ("poll_and_complete_transfers", self._transfer_poller),
-                    ("resolve_divergent_local_hit_tokens", self._hit_resolver),
-                )
-                if hook is None
+            hooks: list[tuple[str, object]] = [
+                ("estimate_external_hit_tokens", self._hit_estimator),
+                ("poll_and_complete_transfers", self._transfer_poller),
             ]
+            if not self._is_kv_consumer:
+                hooks.append(("resolve_divergent_local_hit_tokens", self._hit_resolver))
+            missing = [name for name, hook in hooks if hook is None]
             if missing:
                 logger.warning(
                     "Pipeline chunk scheduler: the KV connector %s has no %s; "
@@ -684,10 +688,7 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         if hit is not None:
             request._tpu_local_hit_tokens = hit[1]
             return hit
-        # A KV consumer keeps vLLM's handling of a diverged hit: its transfer
-        # connector loads the suffix (Stage-3), which the resolver, a host-tier
-        # decision, does not know about.
-        resolver = None if self._is_kv_consumer else self._hit_resolver
+        resolver = self._hit_resolver
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
             super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         )
