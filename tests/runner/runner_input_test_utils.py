@@ -333,7 +333,9 @@ def _make_sample_runner(
     is_eagle3 = spec_k is not None and spec_method == "eagle3"
     runner = SimpleNamespace(
         device=torch.device("cpu"),
-        model_config=SimpleNamespace(max_logprobs=2, seed=7),
+        model_config=SimpleNamespace(
+            max_logprobs=2, seed=7, logprobs_mode="raw_logprobs"
+        ),
         execute_model_state=None,
         input_batch=SimpleNamespace(
             max_num_logprobs=None,

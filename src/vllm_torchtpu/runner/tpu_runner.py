@@ -46,6 +46,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
+from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
@@ -146,9 +147,12 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampl
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     SAMPLING_EPS,
+    apply_temperature_fp32,
     apply_top_k_top_p,
     gumbel_noise_from_uniform,
     random_sampler_variants,
+    reconstruct_processed_logits,
+    sample_masked,
     select_topk_candidates,
     should_apply_top_k_top_p,
     topk_candidate_blocks,
@@ -5483,14 +5487,23 @@ class TPUModelRunner(GPUModelRunner):
         all_greedy: bool,
         grammar_output: "GrammarOutput | None",
         sampling_generator: torch.Generator | None,
-    ) -> tuple[torch.Tensor, _ChunkSamplingParams | None]:
+        need_processed_logits: bool = False,
+    ) -> tuple[torch.Tensor, _ChunkSamplingParams | None, torch.Tensor | None]:
         """Samples one token per row of a chunk's ``[rows, vocab]`` logits.
 
-        Returns the ``[rows, 1]`` token IDs and, for a sampled (not all-greedy)
-        chunk, the padded sampling params that drew them.
+        Returns the ``[rows, 1]`` token IDs, the padded sampling params for a
+        sampled (not all-greedy) chunk, and, when ``need_processed_logits`` is
+        set, the logits ``processed_*`` logprobs modes read (post-processor
+        ``logits`` on ``all_greedy``, else the temperature-scaled and
+        top-k/top-p masked logits that ``sample_with_processed_logits`` drew
+        from).
         """
         if all_greedy:
-            return self._greedy_sample(logits), None
+            return (
+                self._greedy_sample(logits),
+                None,
+                logits if need_processed_logits else None,
+            )
         temperatures, top_k, top_p = self._build_padded_sampling_params(
             cur_start_idx, cur_end_idx, logits
         )
@@ -5500,7 +5513,19 @@ class TPUModelRunner(GPUModelRunner):
             top_p,
             self._sampler_topk_candidates(cur_start_idx, cur_end_idx, grammar_output),
         )
+        apply_topk_topp = self._sampler_applies_topk_topp()
         u = torch.rand_like(logits, dtype=torch.float32, generator=sampling_generator)
+        if need_processed_logits:
+            token_ids, processed_logits = self.sample_with_processed_logits(
+                logits,
+                temperatures,
+                u,
+                top_k,
+                top_p,
+                topk_candidates=params.topk_candidates,
+                apply_topk_topp=apply_topk_topp,
+            )
+            return token_ids, params, processed_logits
         token_ids = self.sample_from_logits_func(
             logits,
             temperatures,
@@ -5509,9 +5534,9 @@ class TPUModelRunner(GPUModelRunner):
             top_p,
             all_greedy=False,
             topk_candidates=params.topk_candidates,
-            apply_topk_topp=self._sampler_applies_topk_topp(),
+            apply_topk_topp=apply_topk_topp,
         )
-        return token_ids, params
+        return token_ids, params, None
 
     def _sample_plain_chunk(
         self,
@@ -5531,6 +5556,7 @@ class TPUModelRunner(GPUModelRunner):
         min_toks: min_tokens_mask.MinTokensState,
         rep_pen: bool = False,
         processors: Sequence[chunk_processors.PlainChunkProcessor] = (),
+        need_processed_logits: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Mask and sample a plain chunk ``[cur_start_idx, cur_end_idx)``.
 
@@ -5544,10 +5570,11 @@ class TPUModelRunner(GPUModelRunner):
         penalty, in order
         (``chunk_processors.PlainChunkProcessor``).
 
-        Returns ``(selected_token_ids, logprob_logits)``. Logprobs come from the
-        logits before the min_tokens mask and the repetition penalty, as vLLM's
-        default raw_logprobs mode precedes its logits processors (the TPU runner
-        has no logprobs_mode).
+        Returns ``(selected_token_ids, logprob_logits)``. For ``raw_*`` modes,
+        logprobs come from the post-grammar logits before ``min_tokens``,
+        ``repetition_penalty``, and ``processors``; with
+        ``need_processed_logits``, they come from the post-processor logits (as
+        they are on ``all_greedy``, or after temperature and top-k/top-p).
         """
         if distributed_mode is not None:
             assert (
@@ -5605,23 +5632,28 @@ class TPUModelRunner(GPUModelRunner):
         if not top_tokens:
             for proc in processors:
                 logits = proc.apply(logits)
+        processed_logits: torch.Tensor | None = None
         with self._stage_timing.stage("sample"):
             if top_tokens:
                 selected = logits
                 for proc in processors:
                     selected = proc.override_top_tokens(selected)
             else:
-                selected, _ = self._sample_chunk_logits(
+                selected, _, processed_logits = self._sample_chunk_logits(
                     logits,
                     cur_start_idx=cur_start_idx,
                     cur_end_idx=cur_end_idx,
                     all_greedy=all_greedy,
                     grammar_output=grammar_output,
                     sampling_generator=sampling_generator,
+                    need_processed_logits=need_processed_logits,
                 )
             for proc in processors:
                 proc.on_sampled(selected)
-        return selected, logprob_logits
+        return (
+            selected,
+            logprob_logits if processed_logits is None else processed_logits,
+        )
 
     def _sample_spec_verify_chunk(
         self,
@@ -5735,7 +5767,7 @@ class TPUModelRunner(GPUModelRunner):
                         md.group_indices,
                         max_draft_tokens,
                     )
-                bonus_token_ids, params = self._sample_chunk_logits(
+                bonus_token_ids, params, _ = self._sample_chunk_logits(
                     bonus_logits,
                     cur_start_idx=cur_start_idx,
                     cur_end_idx=cur_end_idx,
@@ -5824,6 +5856,10 @@ class TPUModelRunner(GPUModelRunner):
                 "with the merged vLLM v1 sampler path yet."
             )
         needs_logprobs = max_num_logprobs is not None
+        need_processed_logits = (
+            needs_logprobs
+            and self.model_config.logprobs_mode in PROCESSED_LOGPROBS_MODES
+        )
         # step_eligible keeps grammar and logprobs steps on the full logits.
         assert not state.top_tokens or (
             grammar_output is None
@@ -6049,11 +6085,13 @@ class TPUModelRunner(GPUModelRunner):
                     min_toks=min_toks,
                     rep_pen=rep_pen,
                     processors=(tb_chunk,) if tb_chunk is not None else (),
+                    need_processed_logits=need_processed_logits,
                 )
-                # NOTE (NickLucche) Use the original logits (before any penalties or
-                # temperature scaling) for the top-k logprobs. We can't enforce it
-                # due to recompilations outside torch.compiled code, so just make
-                # sure `sample_from_logits` does not modify the logits in-place.
+                # NOTE (NickLucche) For raw_* modes, use the original logits
+                # (before any penalties or temperature scaling) for the top-k
+                # logprobs. We can't enforce it due to recompilations outside
+                # torch.compiled code, so just make sure `sample_from_logits`
+                # does not modify the logits in-place.
                 if needs_logprobs:
                     logprobs_chunks.append(
                         LogprobsChunk(
@@ -7699,7 +7737,38 @@ class TPUModelRunner(GPUModelRunner):
                     torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device),
                 )
                 synchronize_tensors(out.logprobs)
+                if self.model_config.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+                    self._precompile_processed_logits(num_reqs)
                 logger.info("  -- num_seqs: %d", num_reqs)
+
+    def _precompile_processed_logits(self, num_reqs: int) -> None:
+        """Warm `sample_with_processed_logits` (and fp32 `gather_logprobs`)
+        for the variants `sample_tokens` runs."""
+        logits = self._dummy_logits(num_reqs)
+        temperatures = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+        u = torch.rand_like(logits, dtype=torch.float32)
+        top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
+        top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+        processed = None
+        for topk_candidates, apply_topk_topp in random_sampler_variants(
+            self._topk_candidate_blocks()
+        ):
+            tokens, processed = self.sample_with_processed_logits(
+                logits,
+                temperatures,
+                u,
+                top_k,
+                top_p,
+                topk_candidates=topk_candidates,
+                apply_topk_topp=apply_topk_topp,
+            )
+            synchronize_tensors((tokens, processed))
+        if processed is not None and processed.dtype != logits.dtype:
+            out = self.gather_logprobs(
+                processed,
+                torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device),
+            )
+            synchronize_tensors(out.logprobs)
 
     def _precompile_spec_logprobs(self) -> None:
         """Warm the logprobs graphs of a spec-decode verify step.
@@ -9678,7 +9747,15 @@ class TPUModelRunner(GPUModelRunner):
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
         padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=temp_dtype or logits.dtype)
+        if temp_dtype is None:
+            model_config = getattr(self, "model_config", None)
+            temp_dtype = (
+                torch.float32
+                if model_config is not None
+                and model_config.logprobs_mode in PROCESSED_LOGPROBS_MODES
+                else logits.dtype
+            )
+        temps_cpu = torch.ones(padded_num_reqs, dtype=temp_dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
@@ -9990,8 +10067,8 @@ class TPUModelRunner(GPUModelRunner):
     def _apply_temperature(
         self, logits: torch.Tensor, temperatures: torch.Tensor
     ) -> torch.Tensor:
-        safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
-        return logits / safe_temperatures
+        safe = torch.where(temperatures == 0.0, 1.0, temperatures)
+        return logits / safe
 
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
@@ -10013,19 +10090,45 @@ class TPUModelRunner(GPUModelRunner):
         """
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
-        is_greedy = temperatures <= SAMPLING_EPS
-        scaled_logits = self._apply_temperature(logits, temperatures)
-        if apply_topk_topp:
-            masked_logits = apply_top_k_top_p(
-                scaled_logits, top_k, top_p, topk_candidates
-            )
-        else:
-            # No request sets top-k/top-p: skip the two 32-step vocabulary
-            # bisections (separate graph, warmed in the precompile).
-            masked_logits = scaled_logits
-        noisy_logits = masked_logits + gumbel_noise_from_uniform(u)
-        final_logits = torch.where(is_greedy, logits, noisy_logits)
-        return torch.argmax(final_logits, dim=-1, keepdim=True)
+        tokens, _ = sample_masked(
+            logits,
+            self._apply_temperature(logits, temperatures),
+            temperatures,
+            u,
+            top_k,
+            top_p,
+            topk_candidates,
+            apply_topk_topp,
+        )
+        return tokens
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def sample_with_processed_logits(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        u: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        topk_candidates: int = 0,
+        apply_topk_topp: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample a batch and return processed logits for processed_* logprobs modes."""
+        scaled_logits = apply_temperature_fp32(logits, temperatures)
+        tokens, masked_logits = sample_masked(
+            logits,
+            scaled_logits,
+            temperatures,
+            u,
+            top_k,
+            top_p,
+            topk_candidates,
+            apply_topk_topp,
+        )
+        processed = reconstruct_processed_logits(
+            scaled_logits, masked_logits, apply_topk_topp
+        )
+        return tokens, processed
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_logprob_row_tokens(
@@ -10047,24 +10150,32 @@ class TPUModelRunner(GPUModelRunner):
         Gather the top_logprobs with corresponding tokens. Use a fixed number
         of logprobs as an alternative to having multiple pre-compiled graphs.
         Select the number of logprobs actually demanded by each request on CPU.
+
+        `logits` are raw or processed per `logprobs_mode`; the `*_logits`
+        modes return them unnormalized.
         """
         token_ids = sampled_tokens.to(torch.int64)
         token_logits = logits.gather(-1, token_ids)
         token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
-        # Normalize in FP32: a BF16 logsumexp/subtraction can round the selected
-        # token's logprob to 0.0 and make the top-k probabilities sum to > 1.
-        # Only the [N, 1] normalizer is materialized in FP32; the upcast feeds
-        # straight into the reduction and the FP32 subtraction is done on the
-        # gathered [N, k] values rather than on a full-vocab log_softmax.
-        log_normalizers = torch.logsumexp(
-            logits.to(torch.float32), dim=-1, keepdim=True
+        token_logprobs = token_logits.to(torch.float32)
+        normalize = self.model_config.logprobs_mode not in (
+            "raw_logits",
+            "processed_logits",
         )
-        token_logprobs = token_logits.to(torch.float32) - log_normalizers
+        if normalize:
+            # Normalize in FP32: a BF16 logsumexp/subtraction can round the
+            # selected token's logprob to 0.0 and make top-k probs sum to > 1.
+            log_normalizers = torch.logsumexp(
+                logits.to(torch.float32), dim=-1, keepdim=True
+            )
+            token_logprobs = token_logprobs - log_normalizers
 
         max_logprobs = self.model_config.max_logprobs
         if max_logprobs > 0:
             topk_logits, topk_indices = torch.topk(logits, max_logprobs, dim=-1)
-            topk_logprobs = topk_logits.to(torch.float32) - log_normalizers
+            topk_logprobs = topk_logits.to(torch.float32)
+            if normalize:
+                topk_logprobs = topk_logprobs - log_normalizers
             logprob_token_ids = torch.cat((token_ids, topk_indices), dim=1)
             logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
         else:

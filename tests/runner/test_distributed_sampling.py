@@ -1044,7 +1044,7 @@ def test_runner_execute_model_and_sample_tokens_with_distributed_owner(
         ),
         _sample_chunk_logits=lambda logits, cur_start_idx, cur_end_idx, **_kw: (
             full_sample_calls.append((cur_start_idx, cur_end_idx))
-            or (torch.full((logits.shape[0], 1), 11, dtype=torch.int64), None)
+            or (torch.full((logits.shape[0], 1), 11, dtype=torch.int64), None, None)
         ),
         _attn_metadata_builder_ctx=SimpleNamespace(
             mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None

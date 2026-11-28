@@ -636,6 +636,77 @@ def test_plain_step_masks_random_sampling_below_min_tokens(num_output, expected)
     assert run_sample_tokens(runner).sampled_token_ids == [[expected]]
 
 
+@pytest.mark.parametrize(
+    ("logprobs_mode", "temperature", "unnormalized"),
+    [
+        ("raw_logprobs", 1.0, False),
+        ("processed_logprobs", 0.7, False),
+        ("raw_logits", 1.0, True),
+        ("processed_logits", 0.7, True),
+    ],
+)
+def test_plain_step_logprobs_follow_logprobs_mode(
+    logprobs_mode, temperature, unnormalized
+):
+    """Random sampling at temperature 0.7 through the runner's own sampler:
+    processed_* scales by 0.7 while raw_* uses 1.0; *_logits skips log_softmax."""
+    logits = torch.tensor([[2.0, 1.0, 0.5, -1.0, 0.0, 0.3, 1.5, -0.2]])
+    runner = _plain_step_runner(None, logits)
+    runner.model_config = SimpleNamespace(logprobs_mode=logprobs_mode, max_logprobs=0)
+    runner.input_batch.max_num_logprobs = 0
+    runner.input_batch.all_greedy = False
+    runner._build_padded_sampling_params = lambda *_args: (
+        torch.full((1, 1), 0.7),
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.ones((1, 1)),
+    )
+    runner._sampler_topk_candidates = lambda *_args: 0
+    runner._sampler_applies_topk_topp = (
+        TPUModelRunner._sampler_applies_topk_topp.__get__(runner)
+    )
+    runner._get_sampling_generator = lambda: torch.Generator().manual_seed(0)
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    runner.sample_from_logits_func = TPUModelRunner.sample_from_logits.__get__(runner)
+    runner.sample_with_processed_logits = (
+        TPUModelRunner.sample_with_processed_logits.__get__(runner)
+    )
+    runner.gather_logprobs = TPUModelRunner.gather_logprobs.__get__(runner)
+
+    output = run_sample_tokens(runner)
+
+    token = output.sampled_token_ids[0][0]
+    scaled = logits.double() / temperature
+    expected = (scaled if unnormalized else torch.log_softmax(scaled, dim=-1))[0, token]
+    assert output.logprobs.logprob_token_ids[0][0] == token
+    assert output.logprobs.logprobs[0][0] == pytest.approx(expected.item(), abs=1e-6)
+
+
+@pytest.mark.parametrize("logprobs_mode", ["processed_logprobs", "processed_logits"])
+def test_plain_step_all_greedy_processed_logprobs_include_min_tokens(logprobs_mode):
+    """An all-greedy step below min_tokens: processed_* sees the post-min_tokens
+    logits unscaled (stop token 3 is -inf, sampled token 6 wins)."""
+    logits = torch.tensor([[2.0, 1.0, 0.5, 5.0, 0.0, 0.3, 3.5, -0.2]])
+    runner = _plain_step_runner(1, logits)
+    runner.model_config = SimpleNamespace(logprobs_mode=logprobs_mode, max_logprobs=2)
+    runner.input_batch.max_num_logprobs = 2
+    runner.input_batch.all_greedy = True
+    runner._greedy_sample = lambda x: torch.argmax(x, dim=-1, keepdim=True)
+    runner.gather_logprobs = TPUModelRunner.gather_logprobs.__get__(runner)
+
+    output = run_sample_tokens(runner)
+
+    assert output.sampled_token_ids == [[6]]
+    masked_ref = logits.double().clone()
+    masked_ref[0, 3] = float("-inf")
+    expected = (
+        torch.log_softmax(masked_ref, dim=-1)[0, 6].item()
+        if logprobs_mode == "processed_logprobs"
+        else 3.5
+    )
+    assert output.logprobs.logprobs[0][0] == pytest.approx(expected, abs=1e-6)
+    assert 3 not in output.logprobs.logprob_token_ids[0].tolist()
+
+
 def test_sample_tokens_settles_async_placeholders_before_it_counts():
     runner = _plain_step_runner(1, torch.zeros(1, 8))
     calls = []

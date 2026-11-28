@@ -3644,7 +3644,11 @@ def test_unmap_keeps_async_results_until_sample_tokens_waits(
 def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):
     """Covers bf16 and fp32 inputs, large-offset logits, a sampled token outside
     the top-k, and a row with a single finite logit."""
-    runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=max_logprobs))
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_logprobs=max_logprobs, logprobs_mode="raw_logprobs"
+        )
+    )
     logits = torch.tensor(
         [
             [20, 16, 15, 13, 12],
@@ -3682,6 +3686,105 @@ def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):
         atol=1e-5,
     )
     torch.testing.assert_close(logits, original_logits, rtol=0, atol=0)
+
+
+def _processed_logprobs(logprobs_mode, logits, temperatures, top_k, sampled):
+    """sample_with_processed_logits then gather_logprobs of `sampled`, as
+    sample_tokens runs them for the processed_* modes."""
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(max_logprobs=2, logprobs_mode=logprobs_mode)
+    )
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    with torch.compiler.set_stance("force_eager"):
+        _, processed = TPUModelRunner.sample_with_processed_logits(
+            runner,
+            logits,
+            temperatures,
+            torch.rand_like(logits),
+            top_k,
+            torch.ones_like(temperatures, dtype=torch.float32),
+        )
+        return processed, TPUModelRunner.gather_logprobs(runner, processed, sampled)
+
+
+def test_processed_logprobs_follow_temperature():
+    """processed_logprobs at temperature 0.7 is log_softmax(logits / 0.7)."""
+    logits = torch.tensor([[2.0, 1.0, 0.5, -1.0], [0.3, 2.5, -0.7, 1.1]])
+    temperatures = torch.full((2, 1), 0.7)
+    sampled = torch.tensor([[1], [3]])
+    _, result = _processed_logprobs(
+        "processed_logprobs",
+        logits,
+        temperatures,
+        torch.zeros((2, 1), dtype=torch.int32),
+        sampled,
+    )
+    expected = torch.log_softmax(logits.double() / 0.7, dim=-1)
+    torch.testing.assert_close(
+        result.logprobs.double(),
+        expected.gather(-1, result.logprob_token_ids.long()),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    # Unprocessed logprobs differ, so the test tells the two modes apart.
+    raw = torch.log_softmax(logits.double(), dim=-1).gather(-1, sampled)
+    assert not torch.allclose(result.logprobs[:, :1].double(), raw)
+
+
+def test_processed_logits_apply_top_k_and_keep_greedy_rows():
+    """processed_logits: top-k masked to -inf, temperature-scaled and
+    unnormalized; a greedy row (temperature 0) keeps its logits."""
+    logits = torch.tensor([[2.0, 1.0, 0.5, -1.0], [0.3, 2.5, -0.7, 1.1]])
+    temperatures = torch.tensor([[0.5], [0.0]])
+    processed, result = _processed_logprobs(
+        "processed_logits",
+        logits,
+        temperatures,
+        torch.tensor([[2], [0]], dtype=torch.int32),
+        torch.tensor([[0], [1]]),
+    )
+    masked = float("-inf")
+    expected = torch.tensor([[4.0, 2.0, masked, masked], logits[1].tolist()])
+    torch.testing.assert_close(processed, expected, rtol=0, atol=0)
+    assert result.logprobs[:, 0].tolist() == [4.0, 2.5]
+    assert result.selected_token_ranks.tolist() == [1, 1]
+
+
+def test_precompile_processed_logits_warms_fast_path_and_fp32_logprobs(monkeypatch):
+    """`_precompile_processed_logits` warms random_sampler_variants with
+    float32 temperatures, and warms `gather_logprobs` on float32 processed
+    logits when model logits are bfloat16."""
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    sample_calls: list[tuple[int, bool, torch.dtype]] = []
+    gather_dtypes: list[torch.dtype] = []
+
+    def fake_sample(
+        logits, temperatures, u, top_k, top_p, topk_candidates=0, apply_topk_topp=True
+    ):
+        sample_calls.append((topk_candidates, apply_topk_topp, temperatures.dtype))
+        return (
+            torch.zeros((logits.shape[0], 1), dtype=torch.int64),
+            logits.to(torch.float32),
+        )
+
+    def fake_gather(logits, tokens):
+        gather_dtypes.append(logits.dtype)
+        return SimpleNamespace(logprobs=torch.zeros((logits.shape[0], 1)))
+
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+        _topk_candidate_blocks=lambda: 4,
+        sample_with_processed_logits=fake_sample,
+        gather_logprobs=fake_gather,
+    )
+    TPUModelRunner._precompile_processed_logits(runner, 4)
+    assert sample_calls == [
+        (0, True, torch.float32),
+        (0, False, torch.float32),
+        (4, True, torch.float32),
+    ]
+    assert gather_dtypes == [torch.float32]
 
 
 def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
@@ -3922,7 +4025,9 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
             logits_list,
             num_reqs_list,
             scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
-            model_config=SimpleNamespace(max_logprobs=max_logprobs),
+            model_config=SimpleNamespace(
+                max_logprobs=max_logprobs, logprobs_mode="raw_logprobs"
+            ),
             # Temperature 0: every row samples its argmax, whatever the noise.
             _build_padded_sampling_params=lambda start, end, logits: (
                 torch.zeros((logits.shape[0], 1)),

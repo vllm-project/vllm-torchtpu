@@ -52,7 +52,9 @@ def _runner(max_logprobs=3, **overrides):
         model=SimpleNamespace(compute_logits=lambda h: h @ WEIGHT.T),
         is_pooling_model=False,
         model_config=SimpleNamespace(
-            max_logprobs=max_logprobs, get_hidden_size=lambda: HIDDEN
+            max_logprobs=max_logprobs,
+            logprobs_mode="raw_logprobs",
+            get_hidden_size=lambda: HIDDEN,
         ),
         max_num_reqs=8,
         device=torch.device("cpu"),
@@ -345,3 +347,34 @@ def test_last_logits_call_pads_to_its_own_bucket_outside_lockstep():
     runner.compute_selected_logits = compute_selected_logits
     _run_steps(runner, [[{"d": 19, "a": 7}]], 32)
     assert sizes == [16, 8]
+
+
+@pytest.mark.parametrize(
+    ("logprobs_mode", "unnormalized"),
+    [
+        ("raw_logprobs", False),
+        ("processed_logprobs", False),
+        ("raw_logits", True),
+        ("processed_logits", True),
+    ],
+)
+def test_prompt_logprobs_honor_logprobs_mode(logprobs_mode, unnormalized):
+    """Prompt tokens skip sampling processors, so processed_* equals raw_* and
+    *_logits returns unnormalized prompt logits."""
+    runner = _runner(max_logprobs=3)
+    runner.model_config.logprobs_mode = logprobs_mode
+
+    (completed,) = _run_steps(runner, [[{"a": 7, "b": 5, "c": 4}]])
+
+    for req_id, num_logprobs in NUM_PROMPT_LOGPROBS.items():
+        result = completed[req_id]
+        prompt = torch.tensor(PROMPTS[req_id])
+        logits = (HIDDEN_STATES[req_id][:-1] @ WEIGHT.T).double()
+        ids = torch.cat(
+            [prompt[1:, None], logits.topk(num_logprobs, dim=-1).indices], dim=1
+        )
+        ref = (logits if unnormalized else torch.log_softmax(logits, dim=-1)).gather(
+            -1, ids
+        )
+        assert torch.equal(result.logprob_token_ids.long(), ids)
+        torch.testing.assert_close(result.logprobs.double(), ref, rtol=0, atol=1e-5)

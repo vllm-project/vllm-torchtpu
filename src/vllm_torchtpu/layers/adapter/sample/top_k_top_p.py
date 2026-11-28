@@ -372,3 +372,49 @@ def gumbel_noise_from_uniform(u: torch.Tensor) -> torch.Tensor:
     finfo = torch.finfo(u.dtype)
     u_clamped = torch.clamp(u, min=finfo.tiny, max=1.0 - finfo.eps)
     return -torch.log(-torch.log(u_clamped))
+
+
+def apply_temperature_fp32(
+    logits: torch.Tensor, temperatures: torch.Tensor
+) -> torch.Tensor:
+    """Scale logits by temperatures in float32, leaving greedy rows (T=0) at scale 1."""
+    safe = torch.where(temperatures == 0.0, 1.0, temperatures).to(torch.float32)
+    return logits.to(torch.float32) / safe
+
+
+def sample_masked(
+    logits: torch.Tensor,
+    scaled_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    u: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    topk_candidates: int,
+    apply_topk_topp: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample a mixed greedy/random batch with Gumbel-max and return masked logits."""
+    if apply_topk_topp:
+        masked_logits = apply_top_k_top_p(
+            scaled_logits, top_k, top_p, topk_candidates
+        )
+    else:
+        masked_logits = scaled_logits
+    noisy_logits = masked_logits + gumbel_noise_from_uniform(u)
+    is_greedy = temperatures <= SAMPLING_EPS
+    final_logits = torch.where(is_greedy, logits.to(noisy_logits.dtype), noisy_logits)
+    return torch.argmax(final_logits, dim=-1, keepdim=True), masked_logits
+
+
+def reconstruct_processed_logits(
+    scaled_logits: torch.Tensor,
+    masked_logits: torch.Tensor,
+    apply_topk_topp: bool,
+) -> torch.Tensor:
+    """Replace MASKED_LOGIT_VALUE sentinels with -inf for processed_* logprobs."""
+    if not apply_topk_topp:
+        return scaled_logits
+    return torch.where(
+        masked_logits > MASKED_LOGIT_VALUE,
+        masked_logits,
+        torch.full_like(masked_logits, float("-inf")),
+    )

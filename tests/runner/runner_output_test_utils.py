@@ -87,6 +87,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
         _pp_handoff=None,
         _dp_step_other_decode=False,
         speculative_config=None,
+        model_config=SimpleNamespace(max_logprobs=0, logprobs_mode="raw_logprobs"),
         scheduler_config=SimpleNamespace(async_scheduling=False),
         _is_async_drafter=False,
         _is_dspark_pd_producer=False,
