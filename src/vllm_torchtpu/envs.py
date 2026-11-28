@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS: int = 1024
     TPU_EXPERT_PLACEMENT: str = ""
+    TPU_LATENT_PROJ_TP: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -919,6 +920,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS": env_nonnegative_int(
         "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS", 1024
     ),
+    # Column-shard latent-MoE down/up projections across the full TP group with
+    # all_gather(dim=-1) to divide per-rank weight HBM on memory-constrained or
+    # single-core TPUs (e.g. TPU v6e). Off by default.
+    "TPU_LATENT_PROJ_TP": env_bool("TPU_LATENT_PROJ_TP"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
