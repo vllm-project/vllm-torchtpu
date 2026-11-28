@@ -20,7 +20,9 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.sparse_core import ragged_gather as ragged_gather_mod
 from vllm_torchtpu.kernels.sparse_core import ragged_gather_v2 as ragged_gather_v2_mod
+from vllm_torchtpu.kernels.sparse_core import ragged_scatter as ragged_scatter_mod
 from vllm_torchtpu.kernels.sparse_core import support
 
 
@@ -33,7 +35,7 @@ from vllm_torchtpu.kernels.sparse_core import support
         (pltpu.ChipVersion.TPU_7X, True),
         (pltpu.ChipVersion.TPU_V5E, False),  # No SparseCore.
         (pltpu.ChipVersion.TPU_8I, False),  # Not validated.
-        (pltpu.ChipVersion.TPU_8T, False),  # Not validated.
+        (pltpu.ChipVersion.TPU_8T, True),
     ],
 )
 def test_get_sparse_core_info(chip, expected):
@@ -92,3 +94,40 @@ def test_ragged_gather_v2_falls_back_on_unvalidated_chip(monkeypatch):
     )
 
     np.testing.assert_array_equal(np.asarray(out), np.asarray(x)[[3, 1, 7, 0]])
+
+
+def _column_tile_bytes(info, col_size):
+    return info.sparse_core.num_lanes * col_size * 4
+
+
+@pytest.mark.parametrize("kernel", [ragged_gather_mod, ragged_scatter_mod])
+@pytest.mark.parametrize(
+    ("chip", "hidden_size", "col_size"),
+    [
+        (pltpu.ChipVersion.TPU_V6E, 7168, 3584),
+        (pltpu.ChipVersion.TPU_V6E, 8192, 4096),
+        (pltpu.ChipVersion.TPU_7X, 7168, 3584),
+        (pltpu.ChipVersion.TPU_7X, 8192, 4096),
+    ],
+)
+def test_column_tiles_unchanged_on_v6e_and_7x(
+    monkeypatch, kernel, chip, hidden_size, col_size
+):
+    info = pltpu.get_tpu_info_for_chip(chip, 1)
+    monkeypatch.setattr(kernel.pltpu, "get_tpu_info", lambda: info)
+    assert kernel.calculate_col_size(hidden_size) == col_size
+
+
+@pytest.mark.parametrize("kernel", [ragged_gather_mod, ragged_scatter_mod])
+@pytest.mark.parametrize(
+    "chip",
+    [pltpu.ChipVersion.TPU_V5P, pltpu.ChipVersion.TPU_V6E, pltpu.ChipVersion.TPU_8T],
+)
+def test_column_tile_is_sized_to_sparse_core_vmem(monkeypatch, kernel, chip):
+    """The column tile fills more than half of the 80% SparseCore VMEM budget
+    without exceeding it."""
+    info = pltpu.get_tpu_info_for_chip(chip, 1)
+    monkeypatch.setattr(kernel.pltpu, "get_tpu_info", lambda: info)
+    budget = info.sparse_core.vmem_capacity_bytes * 0.8
+    tile_bytes = _column_tile_bytes(info, kernel.calculate_col_size(8192))
+    assert budget / 2 < tile_bytes <= budget
