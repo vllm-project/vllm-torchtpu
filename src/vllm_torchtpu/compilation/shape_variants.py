@@ -52,6 +52,7 @@ import sympy
 import torch
 import torch.fx as fx
 
+from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -235,8 +236,9 @@ class BucketExecutables:
         Built sizes cannot answer this: every module compiled inside the
         window shares one window, so a bucket some other module built would
         mask this one's refusal. A refusal is recorded only once the hand-over
-        lookup has missed, and :func:`retrace` clears the set, so what is left
-        is exactly what the traces made so far cannot serve.
+        lookup has missed, and :func:`retrace` clears the refusals of the
+        modules it retraces (all of them unless the model routes buckets), so
+        what is left is exactly what the live traces cannot serve.
         """
         return size in self.refused
 
@@ -321,7 +323,9 @@ def aot_cache_tag() -> str | None:
     return f"trace{_session.traces}" if _session is not None else None
 
 
-def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
+def retrace(
+    model: torch.nn.Module, vllm_config: VllmConfig, size: int | None = None
+) -> None:
     """Give the model's compiled modules a fresh, untraced torch.compile wrapper.
 
     ``VllmBackend`` refuses a second call ("VllmBackend can only be called
@@ -334,17 +338,17 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     puts a wrapper wherever it is applied, which for a per-layer model is every
     decoder layer, and the wrappers are what hold the bytecode hooks that have
     to be dropped before they are replaced.
+
+    With ``size``, only the wrappers serving that bucket are replaced (see
+    compilation/bucket_filter): a model routing buckets to two compiled modules
+    retraces one without dropping the other's graph, which the ladder may
+    already be past.
     """
     from vllm.compilation.wrapper import (
         TorchCompileWithNoGuardsWrapper,
         reset_compile_wrapper,
     )
     from vllm.config import set_current_vllm_config
-
-    if _session is not None:
-        _session.traces += 1
-        # The refusals belong to the traces being replaced.
-        _session.refused.clear()
 
     wrappers = (
         [model]
@@ -353,6 +357,39 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
             m for m in model.modules() if isinstance(m, TorchCompileWithNoGuardsWrapper)
         ]
     )
+    # Only a model that assigned buckets to its modules retraces part of itself.
+    owner: object = None
+    partial = size is not None and any(bucket_filter.is_assigned(w) for w in wrappers)
+    if partial:
+        owners = [
+            w
+            for w in wrappers
+            if bucket_filter.is_assigned(w) and bucket_filter.module_serves(w, size)
+        ]
+        # One routing function gives each bucket one module; a route that
+        # returns none of the model's assigned modules would reset nothing.
+        assert len(owners) == 1, (
+            f"bucket {size} is served by {len(owners)} assigned compiled modules"
+        )
+        owner = owners[0]
+        # Unassigned wrappers (e.g. a vision encoder's) serve every bucket and
+        # are reset as on a full retrace.
+        wrappers = [w for w in wrappers if bucket_filter.module_serves(w, size)]
+
+    if _session is not None:
+        _session.traces += 1
+        # The refusals belong to the traces being replaced. On a partial
+        # retrace only the owner's trace is replaced: keep every refusal the
+        # owner does not serve, which another module's live trace still owes.
+        if partial:
+            _session.refused = {
+                refused
+                for refused in _session.refused
+                if not bucket_filter.module_serves(owner, refused)
+            }
+        else:
+            _session.refused.clear()
+
     for wrapper in wrappers:
         wrapper.cleanup()  # drop its bytecode hook before replacing it
 
@@ -363,7 +400,11 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     config = vllm_config.compilation_config
     saved = (config.cache_dir, config.local_cache_dir)
     with set_current_vllm_config(vllm_config):
-        reset_compile_wrapper(model)
+        if partial:
+            for wrapper in wrappers:
+                reset_compile_wrapper(wrapper)
+        else:
+            reset_compile_wrapper(model)
     config.cache_dir, config.local_cache_dir = saved
 
 
@@ -463,6 +504,9 @@ def defer(backend: Any) -> None:
         entry.runnable = placeholder(size)
         entry.compiled = True
     backend._tpu_trace = _session.traces
+    # Which compiled module this trace belongs to, when the model routes
+    # buckets to several (compilation/bucket_filter); None otherwise.
+    backend._tpu_serves = bucket_filter.current()
     _deferred.backends.append(backend)
 
 
