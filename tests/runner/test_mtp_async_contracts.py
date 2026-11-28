@@ -346,6 +346,8 @@ def substitution_runner(device, k):
     runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
     runner._fast_token_substitution = False
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
     return runner
 
 
