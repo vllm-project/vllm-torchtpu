@@ -64,6 +64,16 @@ class ShapeSpecializationError(RuntimeError):
     """A token bucket cannot be served by the graph asked to compile it."""
 
 
+class _UncompiledRunnable:
+    """Placeholder for a bucket refused by a trace; never executed."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def __call__(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise ShapeSpecializationError(self._message)
+
+
 # ---------------------------------------------------------------------------
 # What a trace assumed about the token count
 # ---------------------------------------------------------------------------
@@ -290,13 +300,10 @@ def runnable_for(
     assert size is not None
     _session.refused.add(size)
 
-    def refuse(*_args: Any, **_kwargs: Any) -> Any:
-        raise ShapeSpecializationError(
-            f"{key} was left to a later trace ({reason}) and never compiled; "
-            "the warmup ladder is out of step with the partition."
-        )
-
-    return refuse
+    return _UncompiledRunnable(
+        f"{key} was left to a later trace ({reason}) and never compiled; "
+        "the warmup ladder is out of step with the partition."
+    )
 
 
 def remember(
@@ -468,13 +475,9 @@ def defer(backend: Any) -> None:
 
 def refusing_runnable(key: str) -> Callable[..., Any]:
     """The runnable of a bucket an earlier, replaced trace refused: never run."""
-
-    def refuse(*_args: Any, **_kwargs: Any) -> Any:
-        raise ShapeSpecializationError(
-            f"{key} belongs to a replaced trace and was never compiled there"
-        )
-
-    return refuse
+    return _UncompiledRunnable(
+        f"{key} belongs to a replaced trace and was never compiled there"
+    )
 
 
 def _placeholder_runnable(

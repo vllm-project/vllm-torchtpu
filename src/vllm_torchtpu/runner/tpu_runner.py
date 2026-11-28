@@ -8319,6 +8319,44 @@ class TPUModelRunner(GPUModelRunner):
         top = _get_padded_token_len(self.num_tokens_paddings, cap)
         return [n for n in self.num_tokens_paddings if n <= top]
 
+    def _precompile_backbone_pass(
+        self,
+        token_paddings: Sequence[int],
+        *,
+        trace_first: bool,
+    ) -> shape_variants.BucketExecutables:
+        """Run one backbone warmup pass over `token_paddings` and return its session."""
+        with shape_variants.warmup() as buckets:
+            with (
+                shape_variants.trace_only() if trace_first else contextlib.nullcontext()
+            ) as deferred:
+                for num_tokens in token_paddings:
+                    logger.info("  -- num_tokens: %d", num_tokens)
+                    if buckets.needs_retrace(num_tokens):
+                        shape_variants.retrace(self.model, self.vllm_config)
+                    self._backbone_dummy_runs(num_tokens)
+                if buckets.refused:
+                    # A refusal that no trace picked up leaves a raising
+                    # closure in the live graph, which would surface as a
+                    # failed request. Fail the start instead, where it can be
+                    # read.
+                    raise shape_variants.ShapeSpecializationError(
+                        "warmup left token buckets uncompiled: "
+                        f"{sorted(buckets.refused)}"
+                    )
+            if deferred is not None:
+                started = time.perf_counter()
+                deferred.compile()
+                logger.info(
+                    "Deferred precompile of %d traces took %.1f s",
+                    buckets.traces + 1,
+                    time.perf_counter() - started,
+                )
+        if trace_first:
+            for num_tokens in token_paddings:
+                self._backbone_dummy_runs(num_tokens)
+        return buckets
+
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.
 
@@ -8345,35 +8383,10 @@ class TPUModelRunner(GPUModelRunner):
                 "before deferred compiles finish, writing an empty artifact. "
                 "Set VLLM_USE_MEGA_AOT_ARTIFACT=0 (the TPU default)."
             )
-        with shape_variants.warmup() as buckets:
-            with (
-                shape_variants.trace_only() if trace_first else contextlib.nullcontext()
-            ) as deferred:
-                for num_tokens in self._backbone_token_paddings():
-                    logger.info("  -- num_tokens: %d", num_tokens)
-                    if buckets.needs_retrace(num_tokens):
-                        shape_variants.retrace(self.model, self.vllm_config)
-                    self._backbone_dummy_runs(num_tokens)
-                if buckets.refused:
-                    # A refusal that no trace picked up leaves a raising
-                    # closure in the live graph, which would surface as a
-                    # failed request. Fail the start instead, where it can be
-                    # read.
-                    raise shape_variants.ShapeSpecializationError(
-                        "warmup left token buckets uncompiled: "
-                        f"{sorted(buckets.refused)}"
-                    )
-            if deferred is not None:
-                started = time.perf_counter()
-                deferred.compile()
-                logger.info(
-                    "Deferred precompile of %d traces took %.1f s",
-                    buckets.traces + 1,
-                    time.perf_counter() - started,
-                )
-        if trace_first:
-            for num_tokens in self._backbone_token_paddings():
-                self._backbone_dummy_runs(num_tokens)
+        self._precompile_backbone_pass(
+            self._backbone_token_paddings(),
+            trace_first=trace_first,
+        )
         if self._pp_handoff is not None:
             self._warmup_handoff_forwards()
 
