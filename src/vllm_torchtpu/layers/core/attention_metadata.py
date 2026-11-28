@@ -203,6 +203,14 @@ class AttentionMetadataBuilderContext:
     staged_mamba_products: dict | None = None
 
 
+@dataclass(frozen=True)
+class _TableGeometryInputs:
+    """The builder-context fields `_block_table_geometry` reads."""
+
+    use_max_model_len: bool
+    mamba_ckpt_window: int
+
+
 def _gather_prefill_ckpt_ids(
     table: torch.Tensor,
     state_cols: torch.Tensor,
@@ -482,11 +490,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         return plan
 
     def _block_table_geometry(
-        self, ctx: AttentionMetadataBuilderContext
+        self, ctx: AttentionMetadataBuilderContext | _TableGeometryInputs
     ) -> tuple[Any, int]:
         """The (block_table_obj, target_num_blocks) this group's build() uses.
 
-        Shared with `stage_block_table_uploads`, which must pack each group's
+        Shared with `block_table_walk_plan`, which must pack each group's
         rows with exactly the width the group's build() will slice back out.
         """
         runner = self.runner
@@ -685,6 +693,181 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         )
 
 
+@dataclass(frozen=True)
+class BlockTableWalkPlan:
+    """The staged layout of one block-table walk, in build order.
+
+    - entries: (kv_cache_group_id, block_table_obj, target_num_blocks) per
+      staged group, shared group ids deduplicated.
+    - table_geom: (offset, num_reqs_padded, target_num_blocks) per entry in
+      the flat staged buffer.
+    - mamba_geom: (entry_index, num_blocks, block_size,
+      prefill_ckpt_spec_blocks) per unified-pool mamba entry, the static
+      argument of `_staged_walk_products`.
+    - total: int32 elements of the flat staged buffer.
+    """
+
+    entries: tuple[tuple[int, Any, int], ...]
+    table_geom: tuple[tuple[int, int, int], ...]
+    mamba_geom: tuple[tuple[int, int, int, int | None], ...]
+    total: int
+
+    @property
+    def gids(self) -> tuple[int, ...]:
+        return tuple(gid for gid, _, _ in self.entries)
+
+    @property
+    def mamba_entry_indices(self) -> tuple[int, ...]:
+        """The entry index of each mamba_geom item."""
+        return tuple(entry_index for entry_index, _, _, _ in self.mamba_geom)
+
+    @property
+    def single_table(self) -> bool:
+        """One group and no mamba derivation: the flat upload is the table."""
+        return len(self.entries) == 1 and not self.mamba_geom
+
+
+def _walk_derives_unified_mamba(runner: Any, compact_slot_ids: bool) -> bool:
+    """Whether a walk derives unified-pool mamba indices from its staged
+    tables: with the unified layout, unless the builders get compact slot
+    ids, which win in build()."""
+    return runner._unified_kv_layout and not compact_slot_ids
+
+
+def block_table_walk_plan(
+    runner: Any,
+    use_max_model_len: bool,
+    mamba_ckpt_window: int,
+    num_reqs_padded: int,
+    gids: set[int] | None = None,
+    *,
+    unified_mamba: bool | None = None,
+) -> BlockTableWalkPlan | None:
+    """The layout `stage_block_table_uploads` stages for a walk.
+
+    `gids` limits the walk to a subset of groups; None walks every group.
+    `unified_mamba` says whether the walk derives unified-pool mamba indices
+    from the staged tables; None takes the serving walk's choice, which hands
+    the builders compact slot ids instead whenever the runner keeps a compact
+    mamba slot pool. Returns None when no group participates.
+    """
+    geometry_inputs = _TableGeometryInputs(use_max_model_len, mamba_ckpt_window)
+    # Walk in the same order the builds will, deduping shared group ids.
+    entries: list[tuple[int, Any, int]] = []
+    entry_builders: list[Any] = []
+    seen: set[int] = set()
+    for group_list in runner.attn_groups:
+        for group in group_list:
+            builder = group.metadata_builders[0]
+            gid = builder.kv_cache_group_id
+            if gid in seen or (gids is not None and gid not in gids):
+                continue
+            seen.add(gid)
+            block_table_obj, target_num_blocks = builder._block_table_geometry(
+                geometry_inputs
+            )
+            entries.append((gid, block_table_obj, target_num_blocks))
+            entry_builders.append(builder)
+    if not entries:
+        return None
+
+    table_geom: list[tuple[int, int, int]] = []
+    offset = 0
+    for _, _, target_num_blocks in entries:
+        table_geom.append((offset, num_reqs_padded, target_num_blocks))
+        offset += num_reqs_padded * target_num_blocks
+
+    if unified_mamba is None:
+        # The runner hands the builders compact slot ids exactly when it
+        # keeps a compact mamba slot pool.
+        unified_mamba = _walk_derives_unified_mamba(runner, runner._has_mamba_state)
+    mamba_geom: list[tuple[int, int, int, int | None]] = []
+    if unified_mamba:
+        for i, builder in enumerate(entry_builders):
+            if builder.is_mamba_group:
+                mamba_geom.append(
+                    (
+                        i,
+                        table_geom[i][2],
+                        builder.target_block_size,
+                        builder.prefill_ckpt_spec_blocks,
+                    )
+                )
+    return BlockTableWalkPlan(
+        entries=tuple(entries),
+        table_geom=tuple(table_geom),
+        mamba_geom=tuple(mamba_geom),
+        total=offset,
+    )
+
+
+def split_staged_walk_products(
+    gids: tuple[int, ...],
+    mamba_geom: tuple[tuple[int, int, int, int | None], ...],
+    mamba_ckpt_window: int,
+    with_prefill_ckpts: bool,
+    products: tuple,
+) -> tuple[dict[int, torch.Tensor], dict[int, tuple] | None]:
+    """Maps the outputs of `_staged_walk_products` back to group ids.
+
+    Returns ({gid: table}, {gid: (state, ckpt | None, prefill_ckpt | None)}),
+    the second None without mamba entries. `with_prefill_ckpts` says whether
+    the products were computed with prefill checkpoint offsets.
+    """
+    n_tables = len(gids)
+    n_mamba = len(mamba_geom)
+    tables = {gid: products[i] for i, gid in enumerate(gids)}
+    if not n_mamba:
+        return tables, None
+    states = products[n_tables : n_tables + n_mamba]
+    rest = products[n_tables + n_mamba :]
+    if mamba_ckpt_window > 1:
+        ckpts = rest[:n_mamba]
+        rest = rest[n_mamba:]
+    else:
+        ckpts = (None,) * n_mamba
+    # Prefill checkpoint ids follow, one per group that declares them.
+    prefill_ckpts = iter(rest)
+    mamba_products: dict[int, tuple] = {}
+    for j, (entry_index, _, _, prefill_ckpt_spec_blocks) in enumerate(mamba_geom):
+        prefill_ckpt = (
+            next(prefill_ckpts)
+            if with_prefill_ckpts and prefill_ckpt_spec_blocks is not None
+            else None
+        )
+        mamba_products[gids[entry_index]] = (states[j], ckpts[j], prefill_ckpt)
+    return tables, mamba_products
+
+
+def install_staged_walk_products(
+    ctx: AttentionMetadataBuilderContext,
+    plan: BlockTableWalkPlan,
+    staged_dev: torch.Tensor,
+    products: tuple | None,
+) -> None:
+    """Hands every group's build() its staged table and mamba indices.
+
+    `products` is the `_staged_walk_products` output for `plan`, or None on
+    the single-table path, where `staged_dev` already is the table.
+    """
+    if products is None:
+        assert plan.single_table
+        gid, _, target_num_blocks = plan.entries[0]
+        length = plan.table_geom[0][1] * target_num_blocks
+        ctx.staged_block_tables = {gid: staged_dev[:length]}
+        return
+    tables, mamba_products = split_staged_walk_products(
+        plan.gids,
+        plan.mamba_geom,
+        ctx.mamba_ckpt_window,
+        ctx.mamba_prefill_ckpt_offsets is not None,
+        products,
+    )
+    ctx.staged_block_tables = tables
+    if mamba_products is not None:
+        ctx.staged_mamba_products = mamba_products
+
+
 def stage_block_table_uploads(
     runner: Any,
     ctx: AttentionMetadataBuilderContext,
@@ -705,33 +888,31 @@ def stage_block_table_uploads(
         # groups exist; each build() synthesizes its own table there.
         return
 
-    # Walk in the same order the builds will, deduping shared group ids.
-    entries: list[tuple[int, Any, int]] = []
-    entry_builders: list[Any] = []
-    seen: set[int] = set()
-    for group_list in runner.attn_groups:
-        for group in group_list:
-            builder = group.metadata_builders[0]
-            gid = builder.kv_cache_group_id
-            if gid in seen or (gids is not None and gid not in gids):
-                continue
-            seen.add(gid)
-            block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
-            entries.append((gid, block_table_obj, target_num_blocks))
-            entry_builders.append(builder)
-    if not entries:
+    # Mirror of build()'s branch order: the compact path
+    # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
+    # per-group indices — which is what the walk program batches.
+    plan = block_table_walk_plan(
+        runner,
+        ctx.use_max_model_len,
+        ctx.mamba_ckpt_window,
+        num_reqs_padded,
+        gids,
+        unified_mamba=_walk_derives_unified_mamba(
+            runner, ctx.mamba_state_indices is not None
+        ),
+    )
+    if plan is None:
         return
 
-    total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
     # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
     # drains, so a later chunk or draft walk must not refill a shared scratch
     # (see `stage_h2d_upload`).
-    flat = zeros_h2d_source(runner, total)
+    flat = zeros_h2d_source(runner, plan.total)
 
     # The PCP manager's layers read block tables inside pcp_metadata.
     if ctx.position_ids_override is None and runner.pcp_manager is None:
         offset = 0
-        for _, block_table_obj, target_num_blocks in entries:
+        for _, block_table_obj, target_num_blocks in plan.entries:
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
                 num_reqs_padded, target_num_blocks
             )
@@ -744,43 +925,16 @@ def stage_block_table_uploads(
 
     staged_dev = stage_h2d_upload(runner, flat)
 
-    # One compiled program splits the staged tensor into per-group tables
-    # and derives every unified-pool mamba group's state/checkpoint indices
-    # (replaces one micro-program per group per step).
-    table_geom: list[tuple[int, int, int]] = []
-    offset = 0
-    for _, _, target_num_blocks in entries:
-        table_geom.append((offset, num_reqs_padded, target_num_blocks))
-        offset += num_reqs_padded * target_num_blocks
-
-    # Mirror of build()'s branch order: the compact path
-    # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
-    # per-group indices — which is what this precompute batches.
-    unified_mamba = ctx.mamba_state_indices is None and runner._unified_kv_layout
-    mamba_geom: list[tuple[int, int, int, int | None]] = []
-    mamba_entry_indices: list[int] = []
-    if unified_mamba:
-        for i, builder in enumerate(entry_builders):
-            if builder.is_mamba_group:
-                mamba_geom.append(
-                    (
-                        i,
-                        table_geom[i][2],
-                        builder.target_block_size,
-                        builder.prefill_ckpt_spec_blocks,
-                    )
-                )
-                mamba_entry_indices.append(i)
-
-    if len(entries) == 1 and not mamba_geom:
+    if plan.single_table:
         # Exactly one group with no mamba derivation: the flat upload is
         # already the complete table view; avoid launching an unnecessary
         # device clone program.
-        gid, _, target_num_blocks = entries[0]
-        length = num_reqs_padded * target_num_blocks
-        ctx.staged_block_tables = {gid: staged_dev[:length]}
+        install_staged_walk_products(ctx, plan, staged_dev, None)
         return
 
+    # One compiled program splits the staged tensor into per-group tables
+    # and derives every unified-pool mamba group's state/checkpoint indices
+    # (replaces one micro-program per group per step).
     walk = (
         _staged_walk_products_compiled
         if staged_dev.device.type == "tpu"
@@ -789,37 +943,9 @@ def stage_block_table_uploads(
     products = walk(
         staged_dev,
         ctx.seq_lens,
-        tuple(table_geom),
-        tuple(mamba_geom),
+        plan.table_geom,
+        plan.mamba_geom,
         ctx.mamba_ckpt_window,
         ctx.mamba_prefill_ckpt_offsets,
     )
-
-    n_tables = len(entries)
-    n_mamba = len(mamba_geom)
-    ctx.staged_block_tables = {
-        gid: products[i] for i, (gid, _, _) in enumerate(entries)
-    }
-    if n_mamba:
-        states = products[n_tables : n_tables + n_mamba]
-        rest = products[n_tables + n_mamba :]
-        if ctx.mamba_ckpt_window > 1:
-            ckpts = rest[:n_mamba]
-            rest = rest[n_mamba:]
-        else:
-            ckpts = (None,) * n_mamba
-        # Prefill checkpoint ids follow, one per group that declares them.
-        prefill_ckpts = iter(rest)
-        ctx.staged_mamba_products = {}
-        for j, ei in enumerate(mamba_entry_indices):
-            prefill_ckpt = (
-                next(prefill_ckpts)
-                if ctx.mamba_prefill_ckpt_offsets is not None
-                and mamba_geom[j][3] is not None
-                else None
-            )
-            ctx.staged_mamba_products[entries[ei][0]] = (
-                states[j],
-                ckpts[j],
-                prefill_ckpt,
-            )
+    install_staged_walk_products(ctx, plan, staged_dev, products)
