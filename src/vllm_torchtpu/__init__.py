@@ -611,7 +611,19 @@ def _patch_vllm_compile_all_ranges() -> None:
                 del range_entry._tpu_deferred
                 range_entry.compiled = False
                 range_entry.runnable = None
-                if mode == "compile":
+                if mode == "skip":
+                    skip_tag = range_entry._tpu_skip_tag
+                    del range_entry._tpu_skip_tag
+                    size = (
+                        range_entry.compile_range.start
+                        if range_entry.compile_range.is_single_size()
+                        else None
+                    )
+                    range_entry.runnable = shape_variants.skipped_runnable(
+                        str(range_entry.compile_range), size, skip_tag
+                    )
+                    range_entry.compiled = True
+                elif mode == "compile":
                     to_compile.append((backend, range_entry))
                 else:
                     to_hand_over.append((backend, range_entry))
@@ -1635,21 +1647,36 @@ def _patch_vllm_reset_compile_wrapper() -> None:
 
 
 def _patch_vllm_piecewise_backend() -> None:
-    """Pick the compiled token-count bucket from a tensor's leading dimension.
+    """Register PiecewiseBackends for variant warmup and patch bucket dispatch.
 
     A graph is compiled once per bucket of token counts, and vLLM decides
     which one a call needs by reading an argument that is a `SymInt`. A layer
     whose arguments are all tensors has no such argument, so vLLM assumes only
-    one bucket was compiled and asserts when several were.
+    one bucket was compiled and asserts when several were. When an opt-in
+    decode-only variant is attached to a bucket, dispatch delegates to
+    ``shape_variants.decode_only_runnable``.
     """
     import torch
     from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+    from vllm_torchtpu.compilation import shape_variants
+
+    original_init = PiecewiseBackend.__init__
+    if not original_init.__dict__.get("_tpu_piecewise_backend_init_patch", False):
+
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            shape_variants.register_backend(self)
+
+        patched_init.__dict__["_tpu_piecewise_backend_init_patch"] = True
+        PiecewiseBackend.__init__ = patched_init
 
     original_call = PiecewiseBackend.__call__
     if getattr(original_call, "_tpu_piecewise_backend_patch", False):
         return
 
     def patched_call(self, *args, **kwargs):
+        runtime_shape: int | None = None
         if self.sym_shape_indices:
             runtime_shape = args[self.sym_shape_indices[0]]
             range_entry = self._find_range_for_shape(runtime_shape)
@@ -1685,17 +1712,24 @@ def _patch_vllm_piecewise_backend() -> None:
                 f"compilation, but found {len(compiled_entries)}"
             )
             range_entry = compiled_entries[0]
+            if range_entry.compile_range.is_single_size():
+                runtime_shape = range_entry.compile_range.start
 
         assert range_entry.compiled, (
             "All ranges should be compiled or loaded up front in "
             "PiecewiseBackend.__init__. "
             f"range_entry={range_entry.compile_range}"
         )
+        decode_runnable = shape_variants.decode_only_runnable(self, runtime_shape)
+        if decode_runnable is not None:
+            return decode_runnable(*args, **kwargs)
         return range_entry.runnable(*args, **kwargs)
 
     patched_call._tpu_piecewise_backend_patch = True
     PiecewiseBackend.__call__ = patched_call
-    logger.info("Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
+    logger.info(
+        "Applied TPU patch: PiecewiseBackend variant registration and bucket dispatch."
+    )
 
 
 def _patch_vllm_compile_prefix_isolation() -> None:

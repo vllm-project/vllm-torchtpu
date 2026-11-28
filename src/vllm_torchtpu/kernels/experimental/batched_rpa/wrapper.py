@@ -526,6 +526,7 @@ def calculate_block_sizes(
         "return_lse",
         "mask_invalid_v",
         "return_raw_output",
+        "decode_only",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -571,6 +572,7 @@ def ragged_paged_attention(
     mask_invalid_v: bool | None = None,
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
     return_raw_output: bool = False,
+    decode_only: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -638,6 +640,10 @@ def ragged_paged_attention(
             dynamic_v_scale must be None (prepare_inputs applies them).
         return_raw_output: If True, return the kernel's output buffer as is,
             without prepare_outputs, slicing or reshaping.
+        decode_only: If True, statically omit the RpaCase.MIXED schedule and
+            kernel launch (preserving kv_cache input-output aliasing without
+            jax.lax.cond). Callers must guarantee distribution[0] ==
+            distribution[2].
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -906,9 +912,10 @@ def ragged_paged_attention(
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
     )
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
-    )
+    if not decode_only:
+        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+        )
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     if return_raw_output:

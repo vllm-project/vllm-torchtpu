@@ -223,6 +223,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
+        decode_only: bool = False,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -416,6 +417,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
             mask_invalid_v=mask_invalid_v,
+            decode_only=decode_only,
         )
         output = output[: cu_q_lens[distribution[-1]]]
 
@@ -648,8 +650,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
     @parameterized.product(
         dtype=[jnp.float32, jnp.bfloat16],
+        decode_only=[False, True],
     )
-    def test_ragged_paged_attention_spec_decode(self, dtype):
+    def test_ragged_paged_attention_spec_decode(self, dtype, decode_only):
         # Multi-token decode queries (e.g. speculative decoding verification)
         # where K > 1 new tokens are added to sequences at various existing lengths
         # including page-boundary crossings (page_size = 16).
@@ -690,6 +693,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             num_pages,
             distribution=distribution,
             decode_query_size=4,
+            decode_only=decode_only,
         )
 
     @parameterized.product(
@@ -699,9 +703,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             configs.KVLayout.SEQ_ALONG_LANE,
         ],
         q_len=[1, 4],
+        decode_only=[False, True],
     )
     def test_ragged_paged_attention_nan_kv_stays_in_its_sequence(
-        self, dtype, kv_layout, q_len
+        self, dtype, kv_layout, q_len, decode_only
     ):
         # The kernel carries its running max, sum and output from one sequence
         # to the next. NaN in one sequence's cached KV (e.g. written mid-batch
@@ -726,6 +731,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
             decode_query_size=q_len,
             nan_kv_seq_idx=1,
+            decode_only=decode_only,
         )
 
     @parameterized.product(
@@ -953,8 +959,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             configs.KVLayout.HEAD_ALONG_SUBLANE,
             configs.KVLayout.SEQ_ALONG_LANE,
         ],
+        decode_only=[False, True],
     )
-    def test_ragged_paged_attention_1m_context(self, kv_layout):
+    def test_ragged_paged_attention_1m_context(self, kv_layout, decode_only):
         kv_len = 1024 * 1024
         num_seqs = 2
         seq_lens = [(1, kv_len)] * num_seqs
@@ -981,6 +988,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             max_num_seq=192,
             kv_layout=kv_layout,
             distribution=jnp.array([num_seqs] * 3, dtype=jnp.int32),
+            decode_only=decode_only,
         )
 
     @parameterized.product(sliding_window=[None, 1024])

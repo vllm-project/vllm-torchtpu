@@ -171,6 +171,7 @@ from vllm_torchtpu.runner import (
     chunk_processors,
     greedy_top_tokens,
     prompt_logprobs,
+    rpa_decode_only_graph,
     spec_boundary_state,
     thinking_budget_tracker,
 )
@@ -563,6 +564,15 @@ MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
+def _rpa_num_decode_reqs(
+    reorder_batch_threshold: int | None,
+    num_decode_reqs: int,
+    num_windowed_reqs: int,
+) -> int:
+    assert reorder_batch_threshold is not None
+    return num_windowed_reqs if reorder_batch_threshold > 1 else num_decode_reqs
+
+
 def _compute_num_reqs_in_chunk(
     runner: Any,
     start_index: int,
@@ -718,6 +728,9 @@ class TPUModelRunner(GPUModelRunner):
     # Default for a runner built without __init__.
     _pp_handoff: PPBuffered | None = None
     _dp_step_other_decode: bool = False
+    _dp_step_has_rpa_mixed: bool = False
+    _chunk_is_rpa_decode_only: bool = False
+    _has_rpa_decode_only_graph: bool = False
     _adaptive_verification: AdaptiveVerificationManager | None = None
     _thinking_budget: thinking_budget_tracker.ThinkingBudgetTracker | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
@@ -3483,9 +3496,8 @@ class TPUModelRunner(GPUModelRunner):
     ):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
-        assert self.reorder_batch_threshold is not None
-        rpa_num_decode_reqs = (
-            num_windowed_reqs if self.reorder_batch_threshold > 1 else num_decode_reqs
+        rpa_num_decode_reqs = _rpa_num_decode_reqs(
+            self.reorder_batch_threshold, num_decode_reqs, num_windowed_reqs
         )
         assert scheduler_output.total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -3844,6 +3856,7 @@ class TPUModelRunner(GPUModelRunner):
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_static_verify_end
             self._request_distribution_cpu[2] = rd_num_reqs
+            self._chunk_is_rpa_decode_only = chunk_num_decode == rd_num_reqs
 
         if (
             can_cache_decode_metadata
@@ -3920,6 +3933,7 @@ class TPUModelRunner(GPUModelRunner):
             combined[0] = chunk_num_decode
             combined[1] = chunk_num_decode
             combined[2] = num_reqs
+            self._chunk_is_rpa_decode_only = chunk_num_decode == num_reqs
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
             combined[5] = num_reqs
@@ -4226,10 +4240,12 @@ class TPUModelRunner(GPUModelRunner):
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
         local_prompt_logprob_rows: int = 0,
+        local_has_rpa_mixed: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._dp_step_other_decode = False
         self._dp_step_prompt_logprob_rows = 0
+        self._dp_step_has_rpa_mixed = False
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -4251,6 +4267,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_any_decode) * (dp_rank + 1),
                 int(local_any_decode) * (dp_size - dp_rank),
                 int(local_prompt_logprob_rows),
+                int(local_has_rpa_mixed),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -4266,6 +4283,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
         self._dp_step_prompt_logprob_rows = int(t[6].item())
+        self._dp_step_has_rpa_mixed = bool(t[7].item())
         highest, lowest = int(t[4].item()) - 1, dp_size - int(t[5].item())
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
@@ -4343,6 +4361,9 @@ class TPUModelRunner(GPUModelRunner):
             self.max_num_blocks_per_req,
             use_max_model_len=True,
             dp_lockstep=True,
+            rpa_decode_only=(
+                self._has_rpa_decode_only_graph and not self._dp_step_has_rpa_mixed
+            ),
         )
 
     def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
@@ -4433,6 +4454,24 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
+        if self._has_rpa_decode_only_graph:
+            rpa_num_decode_reqs_step = _rpa_num_decode_reqs(
+                self.reorder_batch_threshold, num_decode_reqs, num_windowed_reqs
+            )
+            # Keep every EP-lockstep DP rank on the exact same compiled program
+            # (avoiding cross-executable collective scheduling/fusion divergence
+            # when another DP rank executes mixed/prefill). Also force mixed
+            # when `_readmit_trimmed_drafts` can turn 1-token decodes into mixed
+            # rows after `_dp_coordinated_step`.
+            local_has_rpa_mixed = (
+                rpa_num_decode_reqs_step < self.input_batch.num_reqs
+                or (
+                    self._adaptive_verification is not None
+                    and self.reorder_batch_threshold == 1
+                )
+            )
+        else:
+            local_has_rpa_mixed = False
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,
@@ -4442,6 +4481,7 @@ class TPUModelRunner(GPUModelRunner):
             local_prompt_logprob_rows=self._dp_local_prompt_logprob_rows(
                 scheduler_output
             ),
+            local_has_rpa_mixed=local_has_rpa_mixed,
         )
         self._dp_step_num_chunks = target_num_chunks
         readmitted = self._readmit_trimmed_drafts(
@@ -4712,6 +4752,11 @@ class TPUModelRunner(GPUModelRunner):
                     mesh=self.mesh,
                     vllm_config=self.vllm_config,
                     kv_cache_bundle=self._kv_cache_bundle,
+                    rpa_decode_only=(
+                        self._has_rpa_decode_only_graph
+                        and self._chunk_is_rpa_decode_only
+                        and not self._dp_step_has_rpa_mixed
+                    ),
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
@@ -6642,6 +6687,7 @@ class TPUModelRunner(GPUModelRunner):
         profile_prefix: int | None = None,
         through_handoff: bool = False,
         profile_decode_query_lens: Sequence[int] | None = None,
+        rpa_decode_only: bool = False,
     ) -> float | None:
         """Run the forward at one bucket shape.
 
@@ -6732,6 +6778,11 @@ class TPUModelRunner(GPUModelRunner):
             distribution = [0, 0, actual_num_reqs]
         else:
             distribution = [actual_num_reqs] * 3
+        if rpa_decode_only:
+            assert distribution[0] == distribution[2], (
+                f"rpa_decode_only requires distribution[0] == distribution[2], "
+                f"got {distribution}"
+            )
         request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
             self.device
         )
@@ -6876,6 +6927,7 @@ class TPUModelRunner(GPUModelRunner):
                 mesh=self.mesh,
                 vllm_config=self.vllm_config,
                 kv_cache_bundle=self._kv_cache_bundle,
+                rpa_decode_only=rpa_decode_only,
             ),
         ):
             if self.supports_mm_inputs and self._pp_is_first:
@@ -8068,22 +8120,53 @@ class TPUModelRunner(GPUModelRunner):
         top = _get_padded_token_len(self.num_tokens_paddings, cap)
         return [n for n in self.num_tokens_paddings if n <= top]
 
+    def _rpa_decode_only_buckets(self) -> list[int]:
+        return rpa_decode_only_graph.resolve_decode_only_buckets(
+            vllm_config=self.vllm_config,
+            token_paddings=self._backbone_token_paddings(),
+            pad_token_len=_get_padded_token_len,
+            num_reqs_max_model_len=self.num_reqs_max_model_len,
+            num_reqs_most_model_len=self.num_reqs_most_model_len,
+            reorder_batch_threshold=self.reorder_batch_threshold,
+            enforce_eager=self.enforce_eager,
+            has_pcp=self.pcp_manager is not None,
+            has_kv_cache_bundle=self._kv_cache_bundle is not None,
+            pipeline_parallel_size=self.parallel_config.pipeline_parallel_size,
+        )
+
     def _precompile_backbone_pass(
         self,
         token_paddings: Sequence[int],
         *,
         trace_first: bool,
+        allowed_sizes: frozenset[int] | None = None,
+        cache_tag: str | None = None,
+        prefix_suffix: str = "",
+        rpa_decode_only: bool = False,
     ) -> shape_variants.BucketExecutables:
         """Run one backbone warmup pass over `token_paddings` and return its session."""
-        with shape_variants.warmup() as buckets:
+        with shape_variants.warmup(
+            allowed_sizes=allowed_sizes,
+            cache_tag=cache_tag,
+        ) as buckets:
             with (
                 shape_variants.trace_only() if trace_first else contextlib.nullcontext()
             ) as deferred:
                 for num_tokens in token_paddings:
-                    logger.info("  -- num_tokens: %d", num_tokens)
+                    logger.info(
+                        "  -- num_tokens: %d%s",
+                        num_tokens,
+                        " (decode-only)" if rpa_decode_only else "",
+                    )
                     if buckets.needs_retrace(num_tokens):
-                        shape_variants.retrace(self.model, self.vllm_config)
-                    self._backbone_dummy_runs(num_tokens)
+                        shape_variants.retrace(
+                            self.model,
+                            self.vllm_config,
+                            prefix_suffix=prefix_suffix,
+                        )
+                    self._backbone_dummy_runs(
+                        num_tokens, rpa_decode_only=rpa_decode_only
+                    )
                 if buckets.refused:
                     # A refusal that no trace picked up leaves a raising
                     # closure in the live graph, which would surface as a
@@ -8103,7 +8186,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
         if trace_first:
             for num_tokens in token_paddings:
-                self._backbone_dummy_runs(num_tokens)
+                self._backbone_dummy_runs(num_tokens, rpa_decode_only=rpa_decode_only)
         return buckets
 
     def _precompile_backbone(self) -> None:
@@ -8132,12 +8215,43 @@ class TPUModelRunner(GPUModelRunner):
                 "before deferred compiles finish, writing an empty artifact. "
                 "Set VLLM_USE_MEGA_AOT_ARTIFACT=0 (the TPU default)."
             )
-        self._precompile_backbone_pass(
+        self._has_rpa_decode_only_graph = False
+        decode_buckets = self._rpa_decode_only_buckets()
+        decode_runnables = None
+        if decode_buckets:
+            decode_runnables = rpa_decode_only_graph.precompile_decode_only_overlay(
+                model=self.model,
+                vllm_config=self.vllm_config,
+                decode_buckets=decode_buckets,
+                trace_first=trace_first,
+                run_pass=self._precompile_backbone_pass,
+            )
+
+        mixed_session = self._precompile_backbone_pass(
             self._backbone_token_paddings(),
             trace_first=trace_first,
         )
+        if decode_buckets:
+            if not decode_runnables:
+                raise shape_variants.ShapeSpecializationError(
+                    "decode-only precompile collected no executables for "
+                    f"buckets {decode_buckets}"
+                )
+            attached = shape_variants.attach_decode_only_runnables(
+                mixed_session, decode_runnables
+            )
+            self._has_rpa_decode_only_graph = True
+            # Exercise the live decode-only dispatch path at startup so a broken
+            # attachment fails during warmup rather than on the first decode step.
+            for num_tokens in decode_buckets:
+                self._backbone_dummy_runs(num_tokens, rpa_decode_only=True)
+            logger.info(
+                "Attached %d decode-only batched-RPA graph entries for buckets %s",
+                attached,
+                decode_buckets,
+            )
         if self._pp_handoff is not None:
-            self._warmup_handoff_forwards()
+            self._warmup_handoff_forwards(decode_buckets=decode_buckets)
 
     def _resolve_bf16_moe_skip_policy(self) -> moe_skip_policy.Bf16MoeSkipPolicy:
         """Resolve BF16 MoE padded-token skipping before model loading.
@@ -8172,13 +8286,16 @@ class TPUModelRunner(GPUModelRunner):
         with moe_skip_policy.bf16_policy_scope(self._bf16_moe_skip_policy):
             self._async_drafter.load_model(self.model)
 
-    def _backbone_dummy_runs(self, num_tokens: int) -> None:
+    def _backbone_dummy_runs(
+        self, num_tokens: int, *, rpa_decode_only: bool = False
+    ) -> None:
         """One warmup forward of the backbone per context bucket."""
         self._dummy_run(
             num_tokens,
             self.num_reqs_max_model_len,
             self.max_num_blocks_per_req,
             use_max_model_len=True,
+            rpa_decode_only=rpa_decode_only,
         )
         if self.most_model_len is not None:
             assert self.num_reqs_most_model_len is not None
@@ -8188,9 +8305,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.num_reqs_most_model_len,
                 self.num_blocks_per_most_len_req,
                 use_max_model_len=False,
+                rpa_decode_only=rpa_decode_only,
             )
 
-    def _warmup_handoff_forwards(self) -> None:
+    def _warmup_handoff_forwards(self, *, decode_buckets: Sequence[int] = ()) -> None:
         """Run every token bucket once through the pipeline hand-off.
 
         A stage's serving forward reads the tensors it received and sums
@@ -8203,24 +8321,31 @@ class TPUModelRunner(GPUModelRunner):
         """
         assert self._pp_handoff is not None
         started = time.perf_counter()
+        decode_bucket_set = (
+            set(decode_buckets) if self._has_rpa_decode_only_graph else set()
+        )
         for num_tokens in self.num_tokens_paddings:
-            self._dummy_run(
-                num_tokens,
-                self.num_reqs_max_model_len,
-                self.max_num_blocks_per_req,
-                use_max_model_len=True,
-                through_handoff=True,
-            )
-            if self.most_model_len is not None:
-                assert self.num_reqs_most_model_len is not None
-                assert self.num_blocks_per_most_len_req is not None
+            variants = (False, True) if num_tokens in decode_bucket_set else (False,)
+            for rpa_decode_only in variants:
                 self._dummy_run(
                     num_tokens,
-                    self.num_reqs_most_model_len,
-                    self.num_blocks_per_most_len_req,
-                    use_max_model_len=False,
+                    self.num_reqs_max_model_len,
+                    self.max_num_blocks_per_req,
+                    use_max_model_len=True,
                     through_handoff=True,
+                    rpa_decode_only=rpa_decode_only,
                 )
+                if self.most_model_len is not None:
+                    assert self.num_reqs_most_model_len is not None
+                    assert self.num_blocks_per_most_len_req is not None
+                    self._dummy_run(
+                        num_tokens,
+                        self.num_reqs_most_model_len,
+                        self.num_blocks_per_most_len_req,
+                        use_max_model_len=False,
+                        through_handoff=True,
+                        rpa_decode_only=rpa_decode_only,
+                    )
         synchronize_device()
         logger.info(
             "Pipeline hand-off warmup: %d buckets in %.1f s",

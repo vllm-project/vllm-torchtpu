@@ -31,9 +31,18 @@ class VllmModelWrapperContext:
     # attention forward execution routes through the bundled RPA custom op with
     # in-place buffer donation, bypassing the per-layer tensor views bound by vLLM.
     kv_cache_bundle: torch.Tensor | None = None
+    # When True, batched RPA layers trace/dispatch the decode-only variant
+    # that statically omits RpaCase.MIXED (RPAm).
+    rpa_decode_only: bool = False
 
 
 _vllm_model_wrapper_context: VllmModelWrapperContext | None = None
+
+
+def is_rpa_decode_only_active() -> bool:
+    """Return whether the current wrapper context requests the decode-only RPA graph."""
+    ctx = _vllm_model_wrapper_context
+    return ctx is not None and ctx.rpa_decode_only
 
 
 def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
@@ -75,6 +84,7 @@ def set_vllm_model_wrapper_context(
     layer_name_to_kvcache_index: dict[str, int] | None = None,
     vllm_config: object | None = None,
     kv_cache_bundle: torch.Tensor | None = None,
+    rpa_decode_only: bool = False,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -84,6 +94,7 @@ def set_vllm_model_wrapper_context(
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
         vllm_config=vllm_config,
         kv_cache_bundle=kv_cache_bundle,
+        rpa_decode_only=rpa_decode_only,
     )
 
     try:
