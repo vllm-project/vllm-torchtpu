@@ -269,3 +269,161 @@ def test_arm_runner_models_skips_a_draft_that_is_the_target(monkeypatch):
     runner.drafter = SimpleNamespace(draft_model=runner.model)
     assert bridge.arm_runner_models(runner) == 1
     assert armed == [(runner.model, "target model")]
+
+
+def test_admit_tp1_single_rank(monkeypatch):
+    """A TP=1 non-EP FP8 MoE layer is admitted with n_ranks=1."""
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128), n=1)
+    runner.moe_config.moe_parallel_config.use_ep = False
+    admitted = bridge._admit(runner, 1)
+    assert admitted is not None
+    shared, expert_parallel, routed_scale = admitted
+    assert shared[4] is None and not expert_parallel and routed_scale == 2.5
+
+
+@pytest.mark.parametrize("global_dev_id", [0, 1])
+def test_build_single_rank_mesh_aligns_device_id(monkeypatch, global_dev_id):
+    """Odd TPU v7x TensorCores report PJRT device id 1 while get_pallas_mesh()
+    hardcodes id 0 for world_size=1; _build_single_rank_mesh re-wraps when they
+    differ, keeps the mesh as-is when they match, and caches the result."""
+    import sys
+    import types
+
+    import vllm.distributed
+    from jax.sharding import Mesh
+
+    class _FakePallasDevice:
+        def __init__(self, *, id, process_index, device_kind):
+            self.id = id
+            self.process_index = process_index
+            self.device_kind = device_kind
+
+    ranked = Mesh(
+        np.array([_FakePallasDevice(id=0, process_index=0, device_kind="TPU7x")]),
+        axis_names=(EP_AXIS_NAME,),
+    )
+    tpu_mod = getattr(torch, "tpu", None)
+    pallas_mod = getattr(tpu_mod, "pallas", None) if tpu_mod is not None else None
+    if pallas_mod is not None:
+        monkeypatch.setattr(pallas_mod, "get_pallas_mesh", lambda axis_names: ranked)
+    else:
+        fake_tpu = types.ModuleType("torch.tpu")
+        fake_pallas = types.ModuleType("torch.tpu.pallas")
+        fake_pallas.get_pallas_mesh = lambda axis_names: ranked
+        fake_tpu.pallas = fake_pallas
+        monkeypatch.setattr(torch, "tpu", fake_tpu, raising=False)
+        monkeypatch.setitem(sys.modules, "torch.tpu", fake_tpu)
+        monkeypatch.setitem(sys.modules, "torch.tpu.pallas", fake_pallas)
+    pallas_sub = types.ModuleType("torch_tpu._internal.pallas.pallas")
+    pallas_sub._PallasDevice = _FakePallasDevice
+    monkeypatch.setitem(sys.modules, "torch_tpu._internal.pallas.pallas", pallas_sub)
+    monkeypatch.setattr(bridge, "_SINGLE_RANK_MESH_CACHE", {})
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(
+        "vllm_torchtpu.distributed.mesh_utils._get_tpu_global_device_id",
+        lambda: global_dev_id,
+    )
+
+    mesh = bridge._build_single_rank_mesh()
+    assert mesh is not None
+    assert mesh.shape == {EP_AXIS_NAME: 1}
+    dev = mesh.devices.flat[0]
+    assert int(dev.id) == global_dev_id
+    assert dev.process_index == 0
+    assert dev.device_kind == "TPU7x"
+    if global_dev_id == 0:
+        assert mesh is ranked
+    # Subsequent calls reuse the cached Mesh object so _OPS hits its id(mesh) key.
+    assert bridge._build_single_rank_mesh() is mesh
+
+
+@pytest.mark.parametrize(
+    "tp_size, dist_init, world_size",
+    [(2, True, 1), (1, False, 1), (1, True, 2)],
+)
+def test_build_single_rank_mesh_declines_non_single_rank(
+    monkeypatch, tp_size, dist_init, world_size
+):
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: dist_init)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world_size)
+    assert bridge._build_single_rank_mesh() is None
+
+
+def test_arm_fused_moe_decode_single_rank_fallback(monkeypatch):
+    """When build_ep_mesh() returns None at TP=1, arm_fused_moe_decode falls
+    back to _build_single_rank_mesh() and uses mesh index 0."""
+    import vllm.distributed
+    from jax.sharding import Mesh
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    class _FakeMoERunner(MoERunner):
+        @property
+        def _quant_method(self):
+            return self._qm
+
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            base = _glm_runner(DeepseekV2MLP(256, 128), n=1)
+            base.moe_config.moe_parallel_config.use_ep = False
+            base.moe_config.experts_per_token = 2
+            self.moe_config = base.moe_config
+            self._qm = base._quant_method
+            self.routed_experts = torch.nn.Module()
+            self.routed_experts.moe_config = base.moe_config
+            for attr in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale_inv",
+                "w2_weight_scale_inv",
+            ):
+                setattr(self.routed_experts, attr, getattr(base.routed_experts, attr))
+            self.routed_input_transform = None
+            self.routed_output_transform = None
+            self.routed_scaling_factor = 1.0
+            self.shared_expert_gate = None
+            self._shared_experts = base._shared_experts
+
+        def _select_forward(self):
+            return lambda *a, **k: None
+
+    class _Dev:
+        id = 1
+        process_index = 0
+        device_kind = "TPU7x"
+
+    fake_mesh = Mesh(np.array([_Dev()]), axis_names=(EP_AXIS_NAME,))
+    model = torch.nn.ModuleList([_FakeMoERunner()])
+    monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "1")
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(bridge, "build_ep_mesh", lambda: None)
+    monkeypatch.setattr(bridge, "_build_single_rank_mesh", lambda: fake_mesh)
+    monkeypatch.setattr(bridge, "_check_vmem", lambda *a, **k: None)
+    monkeypatch.setattr(bridge, "_build_op", lambda *a, **k: "fake_op")
+    monkeypatch.setattr(bridge, "_RANK_BUFFER", None)
+    monkeypatch.setattr(bridge, "_RANK_BUFFER_START", 0)
+    monkeypatch.setattr(bridge, "_RANK_BUFFER_INDEX", None)
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.moe_routing.get_experts_start", lambda _: 0
+    )
+
+    armed = bridge.arm_fused_moe_decode(model, "target model")
+    assert armed == 1
+    assert bridge._RANK_BUFFER_INDEX == 0
+    assert bridge._RANK_BUFFER.tolist() == [[0, 0]]
+    assert getattr(model[0]._quant_method, bridge.FUSED_MOE_DECODE_OP_ATTR) == "fake_op"
