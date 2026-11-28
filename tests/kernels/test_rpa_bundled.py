@@ -23,6 +23,8 @@ Tests confirm that:
     JAX buffer donation.
   - Attention Interface Compliance: Custom scaling, logits soft-capping, and causal
     masking flags are honored.
+  - Live Rows: passing only the request rows a step's tokens can hold gives the
+    full-row output and cache bit-for-bit, for RPA v3 and its hd64 kernel.
 """
 
 from __future__ import annotations
@@ -32,11 +34,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel_hd64
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
     get_kv_cache_shape,
     ragged_paged_attention,
     ragged_paged_attention_bundled,
 )
+from vllm_torchtpu.layers.core import attention_interface
 
 pytestmark = pytest.mark.tpu_test
 
@@ -420,3 +424,82 @@ def test_bundled_interface_forwards_scale_softcap_causal():
         "non-default sm_scale/soft_cap produced the default-param output — "
         "the bundled interface dropped attention parameters"
     )
+
+
+@jax.jit
+def _rpa_hd64_layer(kv, q, k, v, kv_lens, page_indices, cu_q_lens, distribution):
+    return kernel_hd64.ragged_paged_attention_hd64(
+        q,
+        k,
+        v,
+        kv,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        sm_scale=1.0 / (q.shape[-1] ** 0.5),
+    )
+
+
+@pytest.mark.parametrize("head_dim", [128, 64], ids=["v3", "hd64"])
+@pytest.mark.parametrize(
+    "q_lens, kv_lens_live, distribution",
+    [
+        ([1, 1, 1], [40, 17, 64], (3, 3, 3)),  # decode
+        ([1, 1, 4], [40, 17, 64], (2, 2, 3)),  # mixed
+        ([1, 1, 1], [40, 17, 64], (12, 12, 12)),  # names rows past the tokens
+    ],
+    ids=["decode", "mixed", "past_tokens"],
+)
+def test_live_rows_match_all_rows(head_dim, q_lens, kv_lens_live, distribution):
+    """`_live_rows` keeps the rows an 8-token bucket can hold out of 16 and
+    clamps the distribution to them: the zero-token rows 3-7 stay, rows 8-15
+    go, and output and cache are bit-exact against passing every row."""
+    _require_tpu()
+    c = {**_cfg(), "head_dim": head_dim}
+    if head_dim == 64:
+        layer = _rpa_hd64_layer
+        cache_shape = kernel_hd64.get_kv_cache_shape(
+            c["num_blocks"], c["page_size"], c["num_kv_heads"], 64, c["kv_dtype"]
+        )
+    else:
+        layer, cache_shape = _rpa_layer, _per_layer_shape(c)
+    max_num_seqs, num_tokens, pages_per_seq = 16, 8, 4
+    rng = np.random.default_rng(2)
+    init_np = rng.standard_normal(cache_shape).astype(np.float32)
+    cu = np.cumsum([0] + q_lens, dtype=np.int32)
+    cu = np.pad(cu, (0, max_num_seqs + 1 - len(cu)), mode="edge")
+    kv_lens = np.zeros(max_num_seqs, np.int32)
+    kv_lens[: len(kv_lens_live)] = kv_lens_live
+    pool = np.arange(c["num_blocks"], dtype=np.int32)
+    rng.shuffle(pool)
+    shape = (num_tokens, c["num_kv_heads"], head_dim)
+    q, k, v = (
+        rng.standard_normal((num_tokens, c["num_q_heads"], head_dim)),
+        rng.standard_normal(shape),
+        rng.standard_normal(shape),
+    )
+
+    def run(trim):
+        meta = (
+            jnp.asarray(kv_lens),
+            jnp.asarray(pool[: max_num_seqs * pages_per_seq]),
+            jnp.asarray(cu),
+            jnp.asarray(distribution, jnp.int32),
+        )
+        if trim:
+            meta = attention_interface._live_rows(num_tokens, *meta)
+            assert meta[0].shape == (num_tokens,)
+            assert int(meta[3].max()) <= num_tokens
+        out, kv = layer(
+            jnp.asarray(init_np, c["kv_dtype"]),
+            *(jnp.asarray(x, c["kv_dtype"]) for x in (q, k, v)),
+            *meta,
+        )
+        return np.asarray(out), np.asarray(kv)
+
+    full_out, full_kv = run(trim=False)
+    live_out, live_kv = run(trim=True)
+    # Output rows past the last live token are padding either way.
+    np.testing.assert_array_equal(live_out[: cu[-1]], full_out[: cu[-1]])
+    np.testing.assert_array_equal(live_kv, full_kv)

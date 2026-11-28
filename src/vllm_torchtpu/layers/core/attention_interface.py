@@ -377,6 +377,34 @@ def uses_seq_along_lane_kv_page(
     return head_size != 64 and kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
 
 
+def _live_rows(
+    num_tokens: int,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """The request rows of RPA v3's inputs a step of `num_tokens` tokens can hold.
+
+    Live requests come first and each holds at least one token, so the rows past
+    `num_tokens` hold none. RPA v3 scalar-prefetches its whole page table into
+    SMEM on every call; dropping those rows shrinks that copy. A distribution
+    that names them is clamped to the kept rows, which drops no work.
+    """
+    max_num_seqs = kv_lens.shape[0]
+    assert page_indices.shape[0] % max_num_seqs == 0 and cu_q_lens.shape == (
+        max_num_seqs + 1,
+    ), (page_indices.shape, cu_q_lens.shape, max_num_seqs)
+    num_rows = min(num_tokens, max_num_seqs)
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    return (
+        kv_lens[:num_rows],
+        page_indices[: num_rows * pages_per_seq],
+        cu_q_lens[: num_rows + 1],
+        jnp.minimum(distribution, num_rows),
+    )
+
+
 def sharded_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -425,8 +453,6 @@ def sharded_ragged_paged_attention(
     )
     out_specs = (qkv_spec, kv_cache_spec)
 
-    args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
-
     if use_hd64:
         # Batched RPA has no hd64 variant; head_dim==64 always uses default.
         func = functools.partial(
@@ -435,12 +461,20 @@ def sharded_ragged_paged_attention(
     else:
         func = rpa_func
 
-    if attention_sink is not None:
-        if not use_hd64:
-            raise NotImplementedError(
-                "Attention sink support is only available when head_dim==64"
-            )
+    if attention_sink is not None and not use_hd64:
+        raise NotImplementedError(
+            "Attention sink support is only available when head_dim==64"
+        )
 
+    if use_hd64 or rpa_func is ragged_paged_attention:
+        # Both scalar-prefetch the whole page table; the batched kernel reads it
+        # from HBM in windows.
+        kv_lens, page_indices, cu_q_lens, distribution = _live_rows(
+            q.shape[0], kv_lens, page_indices, cu_q_lens, distribution
+        )
+
+    args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
+    if attention_sink is not None:
         in_specs += (P("model"),)
         args += (attention_sink,)
 
@@ -614,10 +648,13 @@ def attention_bundled(
         v,
         kv_cache_bundle,
         layer_idx,
-        md.seq_lens,
-        md.block_tables,
-        md.query_start_loc,
-        md.request_distribution,
+        *_live_rows(
+            q.shape[0],
+            cast(jax.Array, md.seq_lens),
+            cast(jax.Array, md.block_tables),
+            cast(jax.Array, md.query_start_loc),
+            cast(jax.Array, md.request_distribution),
+        ),
     )
 
     # Output partition specs mirror (new_bundle, output).
