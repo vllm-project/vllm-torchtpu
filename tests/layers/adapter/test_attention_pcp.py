@@ -599,7 +599,7 @@ def test_adapter_make_streaming_kernel_has_eight_tensor_signature_and_calls_wrap
         pcp_adapter, "sharded_pcp_ragged_paged_attention", fake_pcp_wrapper
     )
 
-    mesh = object()
+    mesh = SimpleNamespace(shape={"pcp": 16, "tp": 2})
     kernel = pcp_adapter.make_pcp_streaming_rpa_kernel(
         q_scale=None,
         k_scale=0.125,
@@ -616,7 +616,11 @@ def test_adapter_make_streaming_kernel_has_eight_tensor_signature_and_calls_wrap
     assert len(params) == 8
     assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
 
-    args = tuple(object() for _ in range(8))
+    args = (
+        object(),
+        SimpleNamespace(shape=(8192, 64, 256)),
+        *(object() for _ in range(6)),
+    )
     assert kernel(*args) == (new_cache, output)
     assert captured["mesh"] is mesh
     assert captured["q"] is args[1]
@@ -1121,3 +1125,31 @@ def test_non_cp_keeps_page_table_lower_bound(max_num_seqs, expected):
         ),
     )
     assert get_tpu_min_page_size(config) == expected
+
+
+@pytest.mark.parametrize(
+    "tp,head_dim,expected", [(1, 256, 256), (2, 256, 512), (4, 256, 512), (1, 512, 128)]
+)
+def test_streaming_default_q_tile_bounds_local_accumulator(
+    monkeypatch, tp, head_dim, expected
+):
+    captured = {}
+
+    def fake_wrapper(**kwargs):
+        captured.update(kwargs)
+        return None, None
+
+    monkeypatch.setattr(pcp_adapter, "sharded_pcp_ragged_paged_attention", fake_wrapper)
+    kernel = pcp_adapter.make_pcp_streaming_rpa_kernel(
+        q_scale=None,
+        k_scale=None,
+        v_scale=None,
+        mesh=SimpleNamespace(shape={"pcp": 8, "tp": tp}),
+        sliding_window=None,
+        skip_kv_update=False,
+        cp_kv_cache_interleave_size=128,
+    )
+    query = SimpleNamespace(shape=(32768, 64, head_dim))
+    kernel(None, query, None, None, None, None, None, None)
+    assert captured["q_block_size"] == expected
+    assert expected * (64 // tp) * head_dim * 4 <= 16 * 1024 * 1024
