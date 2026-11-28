@@ -452,6 +452,7 @@ def test_the_connector_hooks_are_read_through_named_interfaces(caplog):
     connector = _HookedConnector()
     with caplog.at_level("WARNING"):
         s, _ = _built({"tpu_pp_scheduler": {"prefix_aware": True}}, connector=connector)
+    assert s._hit_estimator is connector
     assert s._transfer_poller is connector and s._hit_resolver is connector
     assert "has no" not in caplog.text
 

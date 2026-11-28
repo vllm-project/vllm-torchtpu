@@ -114,7 +114,13 @@ class _DeferredNoForwardOutput(AsyncModelRunnerOutput):
 
     timeout_s = 0.05
 
-    def __init__(self, output, worker: "TPUWorker", pollers: list, generation: int):
+    def __init__(
+        self,
+        output,
+        worker: "TPUWorker",
+        pollers: list[Callable[[], set[str]]],
+        generation: int,
+    ):
         self._output = output
         self._worker = worker
         self._pollers = pollers
@@ -152,7 +158,9 @@ class _LatePollModelRunnerOutput(AsyncModelRunnerOutput):
     the next one's step-start poll.
     """
 
-    def __init__(self, inner: AsyncModelRunnerOutput, pollers: list):
+    def __init__(
+        self, inner: AsyncModelRunnerOutput, pollers: list[Callable[[], set[str]]]
+    ):
         self._inner = inner
         self._pollers = pollers
 

@@ -205,6 +205,14 @@ def _apply_kv_transfer_page(vllm_config: VllmConfig) -> None:
     additional_config[KV_TRANSFER_SECTION] = {
         "kernel_page_tokens": _KV_TRANSFER_PAGE_TOKENS
     }
+    logger.info_once(
+        "Qwen3.5 KV transfer: %s.kernel_page_tokens defaults to %d for this "
+        "Qwen3.5-397B-A17B %s with a seq-along-lane KV cache; set the section "
+        "to choose another page.",
+        KV_TRANSFER_SECTION,
+        _KV_TRANSFER_PAGE_TOKENS,
+        transfer.kv_role,
+    )
 
 
 def _apply_hybrid_state_retention(vllm_config: VllmConfig, calibrated: bool) -> None:

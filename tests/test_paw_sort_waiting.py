@@ -394,7 +394,9 @@ def test_a_failing_estimate_is_logged_and_counts_as_zero():
     s = _warmth_scheduler(estimator)
     # The module's logger resolves lazily to vLLM's logger of this name.
     log = logging.getLogger("vllm." + pp_chunk_scheduler.__name__)
-    # The real warning_once runs; only the logger's output is captured.
+    # The real warning_once runs; only the logger's output is captured. Its
+    # process-wide cache starts empty: tests/conftest.py's autouse
+    # _reset_warning_once clears it before and after every test.
     with (
         patch.object(log, "warning") as warn,
         patch.object(log, "debug") as debug,

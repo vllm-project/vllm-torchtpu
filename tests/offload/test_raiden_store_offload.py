@@ -1670,9 +1670,11 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
             ),
         ):
             _patch_vllm_offload_fine_prefix_alignment()
+            # The overrides only: _lookup is inherited, so comparing it would
+            # compare the function with itself.
             for name in (
                 "get_num_new_matched_tokens",
-                "_lookup",
+                "_lookup_partial_tail",
                 "update_state_after_alloc",
                 "_build_store_jobs",
             ):

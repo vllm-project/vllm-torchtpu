@@ -4,7 +4,7 @@ Prefill/Decode (P/D) disaggregation separates compute-bound **Prefill** (`kv_pro
 
 `vllm-torchtpu` supports two KV cache transfer connectors:
 
-1. **Raiden KV Connector (`TpuRaidenConnector`)**: High-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`).
+1. **Raiden KV Connector (`TPURaidenConnector`)**: High-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`).
 2. **Host TCP/Side-Channel Connector (`TPUConnector`)**: Lightweight single-host or multi-host connector for functional testing and local disaggregation (`examples/disagg/run_disagg_single_host.sh`).
 
 ---
@@ -36,9 +36,9 @@ The script pins separate `/dev/vfio/<N>` devices to the Prefill (`kv_producer`) 
 
 ---
 
-## 3. Multi-Host Disaggregated Serving with Raiden (`TpuRaidenConnector`)
+## 3. Multi-Host Disaggregated Serving with Raiden (`TPURaidenConnector`)
 
-For large models such as `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-35B-A3B-FP8`, `moonshotai/Kimi-K3`, and `deepseek-ai/DeepSeek-V4`, use `TpuRaidenConnector` with `TPU_USE_RAIDEN_KV_CACHE_MANAGER=1`.
+For large models such as `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-35B-A3B-FP8`, `moonshotai/Kimi-K3`, and `deepseek-ai/DeepSeek-V4`, use `TPURaidenConnector` with `TPU_USE_RAIDEN_KV_CACHE_MANAGER=1`.
 
 ### Step 1: Start the Raiden Controller
 
@@ -68,8 +68,8 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   --block-size 256 \
   --attention-backend CUSTOM \
   --kv-transfer-config '{
-    "kv_connector": "TpuRaidenConnector",
-    "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.raiden.raiden_connector",
+    "kv_connector": "TPURaidenConnector",
+    "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
     "kv_role": "kv_producer"
   }'
 ```
@@ -107,8 +107,8 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   --block-size 256 \
   --attention-backend CUSTOM \
   --kv-transfer-config '{
-    "kv_connector": "TpuRaidenConnector",
-    "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.raiden.raiden_connector",
+    "kv_connector": "TPURaidenConnector",
+    "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
     "kv_role": "kv_consumer"
   }'
 ```

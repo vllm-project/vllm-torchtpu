@@ -81,8 +81,14 @@ def _engine(
     the runner resolves it, the model's architecture and text-config shape,
     a KV transfer config with ``kv_role`` (None: no KV transfer), an explicit
     ``tpu_kv_transfer`` section (None: absent), and, for a Qwen3.5
-    architecture, the Qwen3.5 config hook's serving defaults applied, as vLLM
-    applies them while it builds the config."""
+    architecture, the Qwen3.5 config hook's serving defaults applied.
+
+    vLLM runs the hook while it builds the config and resolves the layout
+    later, in the runner; here the layout is resolved first. The hook reads
+    the same layout either way: here the resolved one from the cache config,
+    in vLLM's order ``VLLM_KV_CACHE_LAYOUT``
+    (``test_hook_reads_the_layout_vllm_will_resolve``). The helper's own
+    patches are undone when it exits; the calling test's are kept."""
     from vllm import envs as vllm_envs
     from vllm.config import (
         DeviceConfig,
@@ -100,45 +106,47 @@ def _engine(
     was_cached = vllm_envs._is_envs_cache_enabled()
     vllm_envs.disable_envs_cache()
     try:
-        if layout is None:
-            monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
-        else:
-            monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
-        # Building a VllmConfig runs the platform's check_and_update_config.
-        # That applies the platform patches for the rest of the process (one
-        # replaces torch_tpu's Pallas shape conversion, which later tests rely
-        # on) and edits the TorchTPU bootstrap environment. The page selection
-        # needs neither, so stub both, as the platform tests do, and let
-        # monkeypatch restore the one variable the check pops.
-        monkeypatch.setattr(patch_registry, "apply", lambda *args, **kwargs: None)
-        monkeypatch.setattr(
-            TpuPlatform, "_prepare_singlehost_tpu_env", lambda *args, **kwargs: None
-        )
-        monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
-        config = VllmConfig(
-            device_config=DeviceConfig(device="cpu"),
-            attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
-        )
-        resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
-        config.parallel_config.prefill_context_parallel_size = pcp
-        config.model_config = SimpleNamespace(
-            architectures=[arch], hf_text_config=SimpleNamespace(**shape)
-        )
-        if kv_role is not None:
-            config.kv_transfer_config = KVTransferConfig(
-                kv_connector="TPURaidenConnector", kv_role=kv_role
+        with monkeypatch.context() as mp:
+            if layout is None:
+                mp.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+            else:
+                mp.setenv("VLLM_KV_CACHE_LAYOUT", layout)
+            # Building a VllmConfig runs the platform's check_and_update_config.
+            # That applies the platform patches for the rest of the process
+            # (one replaces torch_tpu's Pallas shape conversion, which later
+            # tests rely on) and edits the TorchTPU bootstrap environment. The
+            # page selection needs neither, so stub both, as the platform tests
+            # do, and let the context restore the one variable the check pops.
+            mp.setattr(patch_registry, "apply", lambda *args, **kwargs: None)
+            mp.setattr(
+                TpuPlatform,
+                "_prepare_singlehost_tpu_env",
+                lambda *args, **kwargs: None,
             )
-        if section is not None:
-            config.additional_config["tpu_kv_transfer"] = section
-        if arch == QWEN35:
-            # No TPU7x here: the defaults measured there stay off; the kernel
-            # page does not depend on the chip.
-            monkeypatch.setattr(qwen3_5_hooks, "_chip_family", lambda: None)
-            qwen3_5_hooks.apply_serving_defaults(config)
-        with set_current_vllm_config(config):
-            yield config
+            mp.delenv("TORCH_TPU_DP_SIZE", raising=False)
+            config = VllmConfig(
+                device_config=DeviceConfig(device="cpu"),
+                attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+            )
+            resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+            config.parallel_config.prefill_context_parallel_size = pcp
+            config.model_config = SimpleNamespace(
+                architectures=[arch], hf_text_config=SimpleNamespace(**shape)
+            )
+            if kv_role is not None:
+                config.kv_transfer_config = KVTransferConfig(
+                    kv_connector="TPURaidenConnector", kv_role=kv_role
+                )
+            if section is not None:
+                config.additional_config["tpu_kv_transfer"] = section
+            if arch == QWEN35:
+                # No TPU7x here: the defaults measured there stay off; the
+                # kernel page does not depend on the chip.
+                mp.setattr(qwen3_5_hooks, "_chip_family", lambda: None)
+                qwen3_5_hooks.apply_serving_defaults(config)
+            with set_current_vllm_config(config):
+                yield config
     finally:
-        monkeypatch.undo()
         if was_cached:
             vllm_envs.enable_envs_cache()
 
@@ -419,6 +427,25 @@ def test_hook_reads_the_layout_vllm_will_resolve(monkeypatch, layout, written):
     config = _hook_engine(monkeypatch, layout)
     _apply_hook(config)
     assert ("tpu_kv_transfer" in config.additional_config) is written
+
+
+@pytest.mark.parametrize("layout,logged", [("HND", True), ("NHD", False)])
+def test_the_default_page_the_hook_writes_is_logged(monkeypatch, layout, logged):
+    """An operator can see where a 128-token page they never set came from."""
+    logger = Mock()
+    monkeypatch.setattr(qwen3_5_hooks, "logger", logger)
+    _apply_hook(_hook_engine(monkeypatch, layout))
+    if not logged:
+        logger.info_once.assert_not_called()
+        return
+    (call,) = logger.info_once.call_args_list
+    assert call.args[1:] == ("tpu_kv_transfer", 128, "kv_producer")
+    # An explicit section is the user's: nothing written, nothing logged.
+    logger.reset_mock()
+    config = _hook_engine(monkeypatch, layout)
+    config.additional_config["tpu_kv_transfer"] = {"kernel_page_tokens": 256}
+    _apply_hook(config)
+    logger.info_once.assert_not_called()
 
 
 def test_the_hook_reads_layout_names_as_vllm_does():

@@ -717,8 +717,11 @@ def _strip_prefill_only_padding(
     spec = scheduler_output.scheduled_spec_decode_tokens
     if not spec:
         return scheduler_output
+    # (num_computed_tokens, num_prompt_tokens) of the requests with drafts.
     info: dict[str, tuple[int, int | None]] = {}
     for nrd in scheduler_output.scheduled_new_reqs:
+        if nrd.req_id not in spec:
+            continue
         prompt_ids = nrd.prompt_token_ids
         info[nrd.req_id] = (
             nrd.num_computed_tokens,
@@ -726,6 +729,8 @@ def _strip_prefill_only_padding(
         )
     cached = scheduler_output.scheduled_cached_reqs
     for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
+        if req_id not in spec:
+            continue
         state = requests.get(req_id)
         info[req_id] = (computed, None if state is None else state.num_prompt_tokens)
     num_scheduled_tokens = scheduler_output.num_scheduled_tokens
