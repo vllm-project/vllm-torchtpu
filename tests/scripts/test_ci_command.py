@@ -640,13 +640,13 @@ class TestCiCommand(unittest.TestCase):
             "No running PR builds to cancel.\n\n<!-- ci-merge-extras: -->",
         )
 
-        # `auto_merge_disabled` event also posts an empty marker to clear extras.
+        # `auto_merge_disabled` event also posts an empty marker to clear extras
+        # (after reading the PR's base branch).
         fake_dis, dis_calls = self._mock_api(role="write")
         with mock.patch.object(ci_command, "_api_json", side_effect=fake_dis):
             dis_reply = ci_command.handle_auto_merge_disabled(REPO, 42, "gh-tok")
         self.assertIn("<!-- ci-merge-extras: -->", dis_reply)
-        self.assertEqual(len(dis_calls), 1)
-        self.assertEqual(dis_calls[0][0], "POST")
+        self.assertEqual([m for m, _, _ in dis_calls], ["GET", "POST"])
 
     def test_inert_until_live_except_canary_prs_which_use_canary_pipeline(
         self,
@@ -693,6 +693,37 @@ class TestCiCommand(unittest.TestCase):
             bk_urls = [u for _, u, _ in calls if "api.buildkite.com" in u]
             self.assertTrue(bk_urls)
             self.assertTrue(all(u.startswith(CANARY_URL) for u in bk_urls))
+
+    def test_retired_partner_branch_prs_are_inert_even_when_live(self) -> None:
+        # CI is retired on partner/release-0.0.1: /ci and the PR events do
+        # nothing on PRs based on it, before or after cutover.
+        for live in (False, True):
+            for cmd in ("/ci help", "/ci run", "/ci merge", "/ci cancel"):
+                fake_api, calls = self._mock_api(base_ref=ci_command.RETIRED_BASE)
+                with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
+                    reply = ci_command.handle_comment(
+                        REPO, 42, "alice", cmd, "gh-tok", "bk-tok", live=live
+                    )
+                self.assertIsNone(reply)
+                self.assertEqual([m for m, _, _ in calls], ["GET"])
+            fake_api, calls = self._mock_api(base_ref=ci_command.RETIRED_BASE)
+            with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
+                self.assertIsNone(
+                    ci_command.handle_pr_info(REPO, 42, "alice", "gh-tok", live=live)
+                )
+                self.assertIsNone(
+                    ci_command.handle_auto_merge_disabled(REPO, 42, "gh-tok", live=live)
+                )
+            self.assertFalse(any(m == "POST" for m, _, _ in calls))
+
+        # Only that branch: after cutover, another partner/* base still answers.
+        fake_api, _ = self._mock_api(base_ref="partner/release-0.0.2")
+        with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
+            self.assertIsNotNone(
+                ci_command.handle_comment(
+                    REPO, 42, "alice", "/ci help", "gh-tok", "bk-tok", live=True
+                )
+            )
 
     def test_run_and_cancel_reply_when_buildkite_fails(self) -> None:
         # A Buildkite error (say, the token's team can't build the pipeline) gets a
