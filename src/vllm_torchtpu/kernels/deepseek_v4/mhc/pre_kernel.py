@@ -73,6 +73,8 @@ def _mixes_collapse_kernel(
     """
     m, h = hc_mult, hidden_size
     x = x_ref[...]
+    if x.shape[1] == h:
+        x = jnp.concatenate([x] * m, axis=1)
     acc = _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref)
     mixes_ref[...] = acc
     xf = x.astype(jnp.float32)
@@ -184,12 +186,12 @@ def mhc_pre_mixes_collapse(
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
     assert fn.dtype == jnp.float32, fn.dtype
-    num_tokens, hc_hidden = x2d.shape
-    hc_mult3 = fn.shape[0]
-    assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, x2d.shape)
+    hc_mult3, hc_hidden = fn.shape
     # hc_mult3 = hc_mult * (hc_mult + 2) -> unique positive hc_mult.
     hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
     hidden_size = hc_hidden // hc_mult
+    num_tokens, x_width = x2d.shape
+    assert x_width in (hc_hidden, hidden_size), (fn.shape, x2d.shape)
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
@@ -231,7 +233,7 @@ def mhc_pre_mixes_collapse(
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
+            pl.BlockSpec((tb, x_width), lambda i: (i, 0)),
             resident,
             resident,
             resident,
@@ -268,6 +270,7 @@ def mhc_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
+    single_stream: bool = False,
     token_block_size: int = 64,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -284,9 +287,10 @@ def mhc_pre(
     assert residual.dtype == jnp.bfloat16
     assert fn.dtype == jnp.float32
 
-    outer_shape = residual.shape[:-2]
-    hc_mult, hidden_size = residual.shape[-2:]
-    x2d = residual.reshape(-1, hc_mult * hidden_size)
+    hidden_size = residual.shape[-1]
+    hc_mult = fn.shape[1] // hidden_size if single_stream else residual.shape[-2]
+    outer_shape = residual.shape[:-1] if single_stream else residual.shape[:-2]
+    x2d = residual.reshape(-1, hidden_size if single_stream else hc_mult * hidden_size)
 
     mixes, sqrsum, layer2d = mhc_pre_mixes_collapse(
         x2d,
@@ -317,3 +321,6 @@ def mhc_pre(
         comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
         layer2d.reshape(*outer_shape, hidden_size),
     )
+
+
+mhc_pre_single_stream = functools.partial(mhc_pre, single_stream=True)
