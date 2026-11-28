@@ -33,6 +33,10 @@ GPU_MEMORY_UTILIZATION=0.9
 ATTENTION_BACKEND="CUSTOM"
 BENCHMARK_TEMPERATURE=0
 EVAL_TOLERANCE="0.02"
+# Accuracy gate: every response must be valid for its schema. The flat task
+# config is the default one without complex_ast, which this model truncates.
+EVAL_SUITES="json_schema"
+JSON_SCHEMA_TASK_CONFIG="$SCRIPT_DIR/task_configs/json_schema_flat.yaml"
 # Concurrency 32 swings run to run on this small model (throughput by 9%,
 # TPOT by 12% across the two calibration runs, and a later job hit +18.5% on
 # c32 median TPOT). Perf is not gated in CI yet, so use a loose 0.20 band.

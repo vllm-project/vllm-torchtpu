@@ -415,6 +415,34 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
     fi
 }
 
+# Structured outputs via eval_json_schema.py. The pass rule is fixed, not
+# calibrated: every response must be valid on every config, so there is one
+# shared baseline at 1.0 and no tolerance.
+run_json_schema_eval() {
+    local task="json_schema"
+    local pass_rule="scripts/vllm/benchmarking/baselines/eval/json_schema.pass_rule.baseline.json"
+    local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
+
+    rm -f "$RESULTS_DIR/results_${task}.json"
+    echo "Running eval_json_schema.py for task: $task (task config: $JSON_SCHEMA_TASK_CONFIG)..."
+    if ! python3 "$SCRIPT_DIR/eval_json_schema.py" \
+        --base-url "$BASE_URL" \
+        --model "$MODEL" \
+        --task-config "$JSON_SCHEMA_TASK_CONFIG" \
+        --output-json "$RESULTS_DIR/results_${task}.json"; then
+        echo "::error::eval_json_schema.py could not evaluate $task. See logs above for details."
+        fail=1
+        return
+    fi
+
+    echo "=== Checking Eval Regression for $task ==="
+    python3 scripts/vllm/benchmarking/check_regression.py \
+      --mode eval \
+      --tolerance 0 \
+      --results-dir "$RESULTS_DIR" \
+      --baseline "$pass_rule" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
+}
+
 # Single source of truth for named --eval-suites entries:
 #   "<suite>:<runner>:<scope>"
 # Scope says when `all` includes the suite: "text" always, "config_lm_eval"
@@ -428,6 +456,7 @@ EVAL_SUITE_TABLE=(
     "humaneval_plus_tpu:lm_eval:text"
     "mbpp_plus_tpu:lm_eval:text"
     "mmmu_pro:mm_eval:multimodal"
+    "json_schema:json_schema:text"
 )
 
 eval_suite_runner() {
@@ -466,20 +495,22 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # Read config-declared suite defaults in an isolated subshell before launching.
-# Suite variables start empty so only the config file sets them, and config
-# stdout is discarded so echoed notes are never eval'd. MODEL and
-# BENCHMARK_MODE start as run_benchmarks.sh starts them, and come back under
-# CONFIG_ names so this shell's own MODEL and environment stay as they were.
+# Suite variables start empty, and JSON_SCHEMA_TASK_CONFIG at its default, so
+# only the config file sets them, and config stdout is discarded so echoed
+# notes are never eval'd. MODEL and BENCHMARK_MODE start as run_benchmarks.sh
+# starts them, and come back under CONFIG_ names so this shell's own MODEL and
+# environment stay as they were.
 _config_vars=$(
     SCRIPT_DIR="$SCRIPT_DIR" bash -c '
         set -euo pipefail
         LM_EVAL_TASKS="mmlu_llama mmlu_pro"
         EVAL_SUITES=""
         PERF_SUITES=""
+        JSON_SCHEMA_TASK_CONFIG="$SCRIPT_DIR/task_configs/json_schema_default.yaml"
         MODEL=""
         BENCHMARK_MODE="${BENCHMARK_MODE:-serving}"
         source "$1" >/dev/null
-        for var in LM_EVAL_TASKS EVAL_SUITES PERF_SUITES; do
+        for var in LM_EVAL_TASKS EVAL_SUITES PERF_SUITES JSON_SCHEMA_TASK_CONFIG; do
             printf "%s=%q\n" "$var" "${!var}"
         done
         printf "CONFIG_MODEL=%q\n" "$MODEL"
@@ -568,6 +599,13 @@ if [ -n "$effective_eval_suites" ]; then
                 ;;
         esac
     done
+fi
+
+# Checked here, before any server boots: the json_schema suite would only find
+# its task config missing after the boot and every suite that runs before it.
+if [[ " ${SELECTED_EVAL_SUITES[*]} " == *" json_schema "* ]] && [ ! -f "$JSON_SCHEMA_TASK_CONFIG" ]; then
+    echo "ERROR: JSON_SCHEMA_TASK_CONFIG of $CONFIG_NAME is not a file: $JSON_SCHEMA_TASK_CONFIG"
+    exit 1
 fi
 
 NEEDS_LIVE_SERVER=0
@@ -739,6 +777,9 @@ for suite in "${SELECTED_EVAL_SUITES[@]}"; do
             else
                 run_mm_eval "$suite"
             fi
+            ;;
+        json_schema)
+            run_json_schema_eval
             ;;
     esac
 done

@@ -1,0 +1,9 @@
+{
+  "_source": {
+    "description": "Pass rule of the json_schema suite, shared by every config: 100% of responses parse as JSON, satisfy their schema, and are not truncated. Not a calibrated baseline."
+  },
+  "json_schema": {
+    "acc,none": 1.0,
+    "acc_stderr,none": 0.0
+  }
+}

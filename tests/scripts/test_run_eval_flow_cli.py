@@ -15,8 +15,9 @@
 
 Every test runs against a hermetic copy of ``scripts/vllm/benchmarking`` under
 ``tmp_path`` with fixture configs, stubbed client CLIs (``lm_eval``,
-``evalscope``, ``vllm``, ``curl``), and a stubbed ``cleanup_server.sh``. Nothing
-writes to the repository tree or kills host processes.
+``evalscope``, ``vllm``, ``curl``), and a stubbed ``cleanup_server.sh``. The
+``json_schema`` suite runs the real ``eval_json_schema.py`` against the fixture
+gateway. Nothing writes to the repository tree or kills host processes.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import socket
 import stat
 import subprocess
 import threading
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -39,6 +41,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _BENCHMARKING_SRC = _REPO_ROOT / "scripts" / "vllm" / "benchmarking"
 _COPIED_FILES = (
     "endpoint_url.py",
+    "eval_json_schema.py",
     "run_eval_flow.sh",
     "run_benchmarks.sh",
     "upload_results.py",
@@ -46,6 +49,10 @@ _COPIED_FILES = (
     "check_regression.py",
     "publish_perf_dashboard.py",
 )
+# Data the flow's suites read: lm_eval task definitions, and the json_schema
+# suite's task configs with the schemas and the dataset they point at.
+_COPIED_DIRS = ("lm_eval_tasks", "task_configs", "structured_schemas", "datasets")
+_JSON_SCHEMA_PASS_RULE = "baselines/eval/json_schema.pass_rule.baseline.json"
 
 _FIXTURE_CONFIG = "fixture-model"
 _MULTIMODAL_CONFIG = "fixture-multimodal"
@@ -135,10 +142,69 @@ echo '{"score": 0.5, "num": 4}' > "$work_dir/reports/stub/mmmu_pro.json"
 )
 
 
+# One valid answer for each case of task_configs/json_schema_default.yaml.
+_VALID_JSON_SCHEMA_ANSWERS: dict[str, Any] = {
+    "flat_json": {
+        "users": [
+            {
+                "name": "Ada",
+                "age": 36,
+                "email": "ada@example.com",
+                "is_active": True,
+                "role": "admin",
+            }
+        ]
+        * 10
+    },
+    "complex_ast": {
+        "expressions": [
+            {
+                "ast": {
+                    "op": "+",
+                    "left": 1,
+                    "right": {"op": "*", "left": "x", "right": 2},
+                },
+                "description": "one plus twice x",
+            }
+        ]
+        * 10
+    },
+    "character_schema": {
+        "name": "Harry Potter",
+        "house": "Gryffindor",
+        "blood status": "Half-blood",
+        "occupation": "auror",
+        "wand": {"wood": "Holly", "core": "Phoenix feather", "length": 11},
+        "alive": "Alive",
+        "patronus": "Stag",
+        "bogart": "Dementor",
+    },
+    "tool_call_arguments": {
+        "tool_name": "query_logs",
+        "arguments": {"service": "gateway-router", "limit": 50, "severity": "ERROR"},
+    },
+}
+
+_ChatReply = tuple[int, dict[str, Any]]
+
+
+def _chat_completion(content: str, finish_reason: str = "stop") -> _ChatReply:
+    """A 200 chat completion with ``content`` as its text."""
+    message = {"content": content}
+    return 200, {"choices": [{"message": message, "finish_reason": finish_reason}]}
+
+
+def _valid_json_schema_reply(payload: dict[str, Any]) -> _ChatReply:
+    case = payload["response_format"]["json_schema"]["name"]
+    return _chat_completion(json.dumps(_VALID_JSON_SCHEMA_ANSWERS[case]))
+
+
 class _Gateway:
     """Lists ``model_ids`` at ``<prefix>/v1/models`` with optional bearer auth.
 
     ``models_reply`` replaces the model list with a raw ``(status, body)``.
+    Chat completions are answered by ``chat_reply``, which by default gives
+    each case of the shipped ``json_schema`` task configs a valid answer.
     """
 
     def __init__(
@@ -147,12 +213,15 @@ class _Gateway:
         model_ids: list[str],
         required_api_key: str | None = None,
         models_reply: tuple[int, bytes] | None = None,
+        chat_reply: Callable[[dict[str, Any]], _ChatReply] = _valid_json_schema_reply,
     ):
         self.prefix = prefix
         self.model_ids = model_ids
         self.required_api_key = required_api_key
         self.models_reply = models_reply
         self.seen_auth_headers: list[str | None] = []
+        self.chat_reply = chat_reply
+        self.chat_requests: list[dict[str, Any]] = []
         gateway = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -169,14 +238,16 @@ class _Gateway:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _authorized(self) -> bool:
+                key = gateway.required_api_key
+                if key is None or self.headers.get("Authorization") == f"Bearer {key}":
+                    return True
+                self._reply(401, {"error": "unauthorized"})
+                return False
+
             def do_GET(self) -> None:
-                auth = self.headers.get("Authorization")
-                gateway.seen_auth_headers.append(auth)
-                if (
-                    gateway.required_api_key is not None
-                    and auth != f"Bearer {gateway.required_api_key}"
-                ):
-                    self._reply(401, {"error": "unauthorized"})
+                gateway.seen_auth_headers.append(self.headers.get("Authorization"))
+                if not self._authorized():
                     return
                 if self.path != f"{gateway.prefix}/v1/models":
                     self._reply(404, {})
@@ -186,7 +257,23 @@ class _Gateway:
                     ids = [{"id": model_id} for model_id in gateway.model_ids]
                     self._reply(200, {"data": ids})
 
-        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                if not self._authorized():
+                    return
+                if self.path != f"{gateway.prefix}/v1/chat/completions":
+                    self._reply(404, {})
+                    return
+                payload = json.loads(body)
+                gateway.chat_requests.append(payload)
+                self._reply(*gateway.chat_reply(payload))
+
+        class Server(http.server.ThreadingHTTPServer):
+            # eval_json_schema.py connects 16 times at once. The default
+            # backlog of 5 drops some of those, and each retry takes a second.
+            request_queue_size = 32
+
+        self._server = Server(("127.0.0.1", 0), Handler)
         self.port = self._server.server_address[1]
         self.url = f"http://127.0.0.1:{self.port}{prefix}"
         # A short poll, so closing a gateway after each test does not wait 0.5 s.
@@ -208,6 +295,7 @@ def make_gateway():
         model_ids: list[str],
         required_api_key: str | None = None,
         models_reply: tuple[int, bytes] | None = None,
+        chat_reply: Callable[[dict[str, Any]], _ChatReply] = _valid_json_schema_reply,
     ) -> _Gateway:
         gateways.append(
             _Gateway(
@@ -215,6 +303,7 @@ def make_gateway():
                 model_ids,
                 required_api_key=required_api_key,
                 models_reply=models_reply,
+                chat_reply=chat_reply,
             )
         )
         return gateways[-1]
@@ -239,11 +328,9 @@ class _Flow:
         self._configs_dir.mkdir(parents=True)
         (self._bench_dir / "baselines" / "eval").mkdir(parents=True)
         (self._bench_dir / "baselines" / "perf").mkdir(parents=True)
-        shutil.copytree(
-            _BENCHMARKING_SRC / "lm_eval_tasks",
-            self._bench_dir / "lm_eval_tasks",
-        )
-        for name in _COPIED_FILES:
+        for name in _COPIED_DIRS:
+            shutil.copytree(_BENCHMARKING_SRC / name, self._bench_dir / name)
+        for name in (*_COPIED_FILES, _JSON_SCHEMA_PASS_RULE):
             shutil.copy2(_BENCHMARKING_SRC / name, self._bench_dir / name)
 
         cleanup_script = self._bench_dir / "cleanup_server.sh"
@@ -1742,3 +1829,291 @@ def test_gsm8k_uses_plain_chat_gen_kwargs_without_continue_final_message(flow):
         '"chat_template_kwargs": {"enable_thinking": false}}',
     ]
     assert flow.values("lm_eval", "--fewshot_as_multiturn") == ["true"]
+
+
+# --- json_schema suite ---
+
+_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "integer"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _write_answer_task_config(tmp_path: pathlib.Path, prompts: list[str]) -> str:
+    """Writes a one-case task config; a valid answer is ``{"answer": <int>}``."""
+    case = {
+        "name": "answer",
+        "max_tokens": 64,
+        "schema": _ANSWER_SCHEMA,
+        "prompts": prompts,
+    }
+    path = tmp_path / "answer_task.yaml"
+    path.write_text(json.dumps({"cases": [case]}))
+    return str(path)
+
+
+def _run_json_schema(
+    flow, gateway, *extra_args: str, **kwargs
+) -> subprocess.CompletedProcess[str]:
+    return flow.run_unchecked(
+        "--base-url",
+        gateway.url,
+        "--eval-suites",
+        "json_schema",
+        "--perf-suites",
+        "none",
+        *extra_args,
+        **kwargs,
+    )
+
+
+def _json_schema_results(flow) -> dict[str, Any]:
+    return json.loads((flow.results_dir / "results_json_schema.json").read_text())
+
+
+def test_json_schema_suite_passes_when_every_response_is_valid(flow, make_gateway):
+    gateway = make_gateway("/gw", ["router-served-name"])
+
+    proc = _run_json_schema(flow, gateway, "--served-model-name", "router-served-name")
+
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert _json_schema_results(flow) == {
+        "results": {"json_schema": {"acc,none": 1.0, "acc_stderr,none": 0.0}},
+        "meta": {
+            "model": "router-served-name",
+            "total_trials": 28,
+            "successful_trials": 28,
+            "failed_trials": [],
+        },
+    }
+    assert (
+        "| `json_schema` | acc,none | 1.0000 | 1.0000 | 0.0000 | 0.0000 | +0.0000 "
+        "| PASS |" in (flow.results_dir / "eval_check_json_schema.md").read_text()
+    )
+    assert {request["model"] for request in gateway.chat_requests} == {
+        "router-served-name"
+    }
+
+
+def test_json_schema_suite_fails_and_reports_each_invalid_response(
+    flow, make_gateway, tmp_path
+):
+    replies = {
+        "valid": _chat_completion('{"answer": 42}'),
+        "wrong type": _chat_completion('{"answer": "forty-two"}'),
+        "truncated": _chat_completion('{"answer": 42}', finish_reason="length"),
+        "not json": _chat_completion("The answer is 42."),
+        "refused": (400, {"error": "schema not supported"}),
+    }
+    task_config = _write_answer_task_config(tmp_path, list(replies))
+    config = flow.write_config(
+        "answer-task",
+        _FIXTURE_CONFIG_BODY + f'JSON_SCHEMA_TASK_CONFIG="{task_config}"\n',
+    )
+    gateway = make_gateway(
+        "",
+        [_CONFIG_MODEL],
+        chat_reply=lambda payload: replies[payload["messages"][0]["content"]],
+    )
+
+    proc = _run_json_schema(flow, gateway, config=config)
+
+    assert proc.returncode == 1
+    assert _json_schema_results(flow) == {
+        "results": {"json_schema": {"acc,none": 0.2, "acc_stderr,none": 0.0}},
+        "meta": {
+            "model": _CONFIG_MODEL,
+            "total_trials": 5,
+            "successful_trials": 1,
+            "failed_trials": [
+                {
+                    "case_name": "answer",
+                    "sample_id": "1",
+                    "finish_reason": "stop",
+                    "error": "Property 'answer': Expected JSON type integer, got str",
+                },
+                {
+                    "case_name": "answer",
+                    "sample_id": "2",
+                    "finish_reason": "length",
+                    "error": "Completion hit max_tokens (finish_reason=length)",
+                },
+                {
+                    "case_name": "answer",
+                    "sample_id": "3",
+                    "finish_reason": "stop",
+                    "error": "JSONDecodeError: Expecting value: line 1 column 1 "
+                    "(char 0)",
+                },
+                {
+                    "case_name": "answer",
+                    "sample_id": "4",
+                    "finish_reason": None,
+                    "error": 'HTTP 400: {"error": "schema not supported"}',
+                },
+            ],
+        },
+    }
+    assert "| `json_schema` | acc,none | 0.2000 | 1.0000 |" in proc.stdout
+    assert "::error::Eval regression check failed for json_schema!" in proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("reply", "error_parts"),
+    [
+        pytest.param(
+            (401, {"error": "unauthorized"}),
+            ("ERROR: HTTP 401 for case ", '{"error": "unauthorized"}'),
+            id="http_401",
+        ),
+        pytest.param(
+            (403, {"error": "forbidden"}),
+            ("ERROR: HTTP 403 for case ", '{"error": "forbidden"}'),
+            id="http_403",
+        ),
+        pytest.param(
+            (404, {"error": "not found"}),
+            ("ERROR: HTTP 404 for case ", '{"error": "not found"}'),
+            id="http_404",
+        ),
+        pytest.param(
+            (429, {"error": "rate limited"}),
+            ("ERROR: HTTP 429 for case ", '{"error": "rate limited"}'),
+            id="http_429",
+        ),
+        pytest.param(
+            (503, {"error": "overloaded"}),
+            ("ERROR: HTTP 503 for case ", '{"error": "overloaded"}'),
+            id="http_503",
+        ),
+        pytest.param(
+            (200, {"object": "error"}),
+            ("ERROR: Request for case ", "KeyError('choices')"),
+            id="not_a_chat_completion",
+        ),
+    ],
+)
+def test_json_schema_suite_has_no_result_when_the_endpoint_cannot_be_evaluated(
+    flow, make_gateway, reply, error_parts
+):
+    flow.results_dir.mkdir(parents=True, exist_ok=True)
+    stale_results = flow.results_dir / "results_json_schema.json"
+    stale_results.write_text('{"results": {"json_schema": {"acc,none": 1.0}}}\n')
+    gateway = make_gateway("", [_CONFIG_MODEL], chat_reply=lambda payload: reply)
+
+    proc = _run_json_schema(flow, gateway)
+
+    assert proc.returncode == 1
+    for part in error_parts:
+        assert part in proc.stderr
+    assert "::error::eval_json_schema.py could not evaluate json_schema." in proc.stdout
+    assert not stale_results.exists()
+    assert not (flow.results_dir / "eval_check_json_schema.md").exists()
+
+
+def test_openai_api_key_reaches_the_json_schema_client(flow, make_gateway):
+    gateway = make_gateway("", [_CONFIG_MODEL], required_api_key="gw-key-123")
+
+    proc = _run_json_schema(flow, gateway, env={"OPENAI_API_KEY": "gw-key-123"})
+
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    meta = _json_schema_results(flow)["meta"]
+    assert (meta["total_trials"], meta["successful_trials"]) == (28, 28)
+
+
+def test_config_names_the_json_schema_task_config(flow, make_gateway, tmp_path):
+    task_config = _write_answer_task_config(tmp_path, ["What is 6 times 7?"])
+    config = flow.write_config(
+        "answer-task",
+        _FIXTURE_CONFIG_BODY + f'JSON_SCHEMA_TASK_CONFIG="{task_config}"\n',
+    )
+    gateway = make_gateway(
+        "",
+        [_CONFIG_MODEL],
+        chat_reply=lambda payload: _chat_completion('{"answer": 42}'),
+    )
+
+    proc = _run_json_schema(flow, gateway, config=config)
+
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert gateway.chat_requests == [
+        {
+            "model": _CONFIG_MODEL,
+            "messages": [{"role": "user", "content": "What is 6 times 7?"}],
+            "temperature": 0.0,
+            "max_tokens": 64,
+            "chat_template_kwargs": {"enable_thinking": False, "thinking": False},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": True,
+                    "schema": _ANSWER_SCHEMA,
+                },
+            },
+        }
+    ]
+
+
+def test_json_schema_task_config_in_the_environment_is_ignored(
+    flow, make_gateway, tmp_path
+):
+    task_config = _write_answer_task_config(tmp_path, ["What is 6 times 7?"])
+    gateway = make_gateway("", [_CONFIG_MODEL])
+
+    proc = _run_json_schema(flow, gateway, env={"JSON_SCHEMA_TASK_CONFIG": task_config})
+
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert _json_schema_results(flow)["meta"]["total_trials"] == 28
+
+
+def test_missing_json_schema_task_config_fails_before_cleanup(flow):
+    config = flow.write_config(
+        "missing-task",
+        _FIXTURE_CONFIG_BODY + 'JSON_SCHEMA_TASK_CONFIG="/nonexistent/task.yaml"\n',
+    )
+
+    # No endpoint flag: this run would boot a server for the suite.
+    proc = flow.run_unchecked(
+        "--eval-suites", "mmlu_pro,json_schema", "--perf-suites", "none", config=config
+    )
+
+    assert proc.returncode == 1
+    assert (
+        "ERROR: JSON_SCHEMA_TASK_CONFIG of missing-task is not a file: "
+        "/nonexistent/task.yaml" in proc.stdout
+    )
+    assert "Running benchmarks" not in proc.stdout
+    assert flow.argv("cleanup_server") == []
+    assert flow.argv("vllm") == []
+    assert flow.argv("lm_eval") == []
+
+
+def test_eval_suites_all_runs_json_schema_after_the_other_suites(flow):
+    proc = flow.run(*flow.host_args, "--eval-suites", "all", "--perf-suites", "none")
+
+    assert _json_schema_results(flow)["meta"]["total_trials"] == 28
+    assert len(flow.server.chat_requests) == 28
+    assert proc.stdout.index("Running lm_eval for task: mbpp_plus_tpu") < (
+        proc.stdout.index("Running eval_json_schema.py for task: json_schema")
+    )
+
+
+def test_shipped_flat_json_config_gates_its_own_task_config(flow, make_gateway):
+    name = "qwen3-0.6b-structured-flat-json"
+    config = flow.write_config(
+        name, (_BENCHMARKING_SRC / "configs" / f"{name}.sh").read_text()
+    )
+    gateway = make_gateway("", ["Qwen/Qwen3-0.6B"])
+
+    # No --eval-suites: the config's EVAL_SUITES selects json_schema.
+    flow.run("--base-url", gateway.url, "--perf-suites", "none", config=config)
+
+    meta = _json_schema_results(flow)["meta"]
+    assert (meta["total_trials"], meta["successful_trials"]) == (24, 24)
+    assert {
+        request["response_format"]["json_schema"]["name"]
+        for request in gateway.chat_requests
+    } == {"flat_json", "character_schema", "tool_call_arguments"}

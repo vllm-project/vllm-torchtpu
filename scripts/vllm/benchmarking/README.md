@@ -155,12 +155,27 @@ that the other runs reported.
 | `gsm8k` | `--eval-suites gsm8k` (or `all`) | chat completions | `exact_match` |
 | `humaneval_plus_tpu`, `mbpp_plus_tpu` | `--run-code-eval` or `--eval-suites` | chat completions | pass@1 |
 | `mmmu_pro` | `--run-mm-eval` or `--eval-suites` (via `evalscope`) | chat completions | `acc` |
+| `json_schema` | `--eval-suites json_schema` (or `all`) (via `eval_json_schema.py`) | chat completions | `acc`, which must be 1.0 |
 
 - `--run-lm-eval` walks `LM_EVAL_TASKS` (default `mmlu_llama mmlu_pro`; configs
   may narrow it).
 - The code tasks use the full EvalPlus datasets, with evalplus-style instruct
   prompting and code-block extraction (see `lm_eval_tasks/`).
-- Each task gates only when its baseline file exists.
+- Each task gates only when its baseline file exists, except `json_schema`,
+  which always gates.
+- `json_schema` sends every prompt of a task config with its case's JSON Schema
+  as `response_format` (`json_schema`, `strict`). A response is valid when it
+  is not truncated (`finish_reason` other than `length`), parses as JSON, and
+  satisfies the schema. An HTTP 400 or 422 answer counts as an invalid
+  response; any other HTTP error (such as 401, 403, 404, 429, or 5xx) or an
+  unreachable endpoint fails the suite without a result.
+  The pass rule is the same for every config and is not calibrated: `acc` must
+  be 1.0 (`baselines/eval/json_schema.pass_rule.baseline.json`, tolerance 0).
+  The default task config, `task_configs/json_schema_default.yaml`, has 28
+  prompts in 4 cases; a config names another file with
+  `JSON_SCHEMA_TASK_CONFIG`. `eval_json_schema.py` checks a fixed set of JSON
+  Schema keywords and refuses a task config whose schema uses any other, so
+  it never passes a constraint it did not check.
 
 ### Tuning the `lm_eval` invocation
 
@@ -194,7 +209,7 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 
 - `--base-url URL`: API root URL (not a full route like `/v1/chat/completions`) with optional scheme, port, and path prefix. Bare host defaults to `:8000`; trailing `/` and `/v1` on the path are stripped, and paths beneath `/v1/` are rejected. Cannot be combined with `--host` or `--port`. Connects to the endpoint instead of starting a local server.
 - `--served-model-name NAME`: Model name sent in requests to a running server (`--base-url`, `--host`, or `--skip-benchmark` with the server already on `localhost`) when it differs from the config's `MODEL`. Before a run sends a request to a server it did not start (`--base-url`, `--host`, or `--skip-benchmark` with the server on `localhost`), it reads `<server>/v1/models` (sending `OPENAI_API_KEY` as a bearer token when set) and stops unless the name it will send is listed there. That name is `--served-model-name` when given, otherwise the config's `MODEL`. A lookup that fails (connection error, HTTP error, or a response that is not a model list) also stops the run.
-- `--eval-suites LIST`: Comma-separated list of accuracy suites (`mmlu_llama`, `mmlu_pro`, `gsm8k`, `humaneval_plus_tpu`, `mbpp_plus_tpu`, `mmmu_pro`, `all`, or `none`). `all` covers whichever of `mmlu_llama` and `mmlu_pro` the config's `LM_EVAL_TASKS` lists (both by default; a config that narrows the list to `mmlu_pro` gets no `mmlu_llama`), then `gsm8k`, `humaneval_plus_tpu`, and `mbpp_plus_tpu`, plus `mmmu_pro` for `*multimodal*` configs. Precedence is `--eval-suites` > legacy `--run-*-eval` flags > config `EVAL_SUITES` > none.
+- `--eval-suites LIST`: Comma-separated list of accuracy suites (`mmlu_llama`, `mmlu_pro`, `gsm8k`, `humaneval_plus_tpu`, `mbpp_plus_tpu`, `mmmu_pro`, `json_schema`, `all`, or `none`). `all` covers whichever of `mmlu_llama` and `mmlu_pro` the config's `LM_EVAL_TASKS` lists (both by default; a config that narrows the list to `mmlu_pro` gets no `mmlu_llama`), then `gsm8k`, `humaneval_plus_tpu`, and `mbpp_plus_tpu`, then `mmmu_pro` for `*multimodal*` configs, then `json_schema`. Precedence is `--eval-suites` > legacy `--run-*-eval` flags > config `EVAL_SUITES` > none.
 - `--perf-suites LIST`: Comma-separated list of performance suites (`bench_serve`, `all`, or `none`; `all` currently runs `bench_serve`). Precedence matches eval suites: `--perf-suites` > legacy `--skip-benchmark` (which removes `bench_serve`) > config `PERF_SUITES` > `bench_serve`. Runs without `bench_serve` skip the perf regression check and the `ci.vllm.ai` dashboard publish. `--skip-benchmark` also decides which server the evals use: unless `--perf-suites` selects `bench_serve`, it never starts a server (even next to `--perf-suites none`) and sends the evals to the one already on `localhost:$PORT`, while `--perf-suites none` without `--skip-benchmark` runs `cleanup_server.sh` and starts a server for the evals. A `spec_bench` config cannot run eval-only on a server the script starts, because its servers exist only inside its `(BS, K)` sweep; the script rejects that before the cleanup, so point it at a running server with `--host`, `--base-url`, or `--skip-benchmark`.
 
 ## Speculative Decoding (`run_benchmarks.sh --mode spec_bench`)
@@ -275,4 +290,5 @@ prints the rows without posting them.
 | `SERVED_MODEL_NAME` (config var) | (empty) | Optional `--served-model-name` passed in `spec_bench` mode |
 | `EVAL_SUITES` (config var) | (empty) | Default comma-separated accuracy suites when neither `--eval-suites` nor `--run-*-eval` is passed |
 | `PERF_SUITES` (config var) | (empty) | Default comma-separated performance suites (`bench_serve`, `all`, or `none`) when `--perf-suites` is omitted; legacy `--skip-benchmark` still removes `bench_serve` |
-| `OPENAI_API_KEY` | (empty) | Sent as a bearer token to `/v1/models` and as `--api-key` to `evalscope` (in addition to `lm_eval` and `vllm bench serve`). `FORWARD` in `.buildkite/kubernetes/common.sh` does not name it, so a key set on a Buildkite kube step does not reach the pod; a gateway that requires the key then answers the `/v1/models` lookup with 401 and the run stops |
+| `JSON_SCHEMA_TASK_CONFIG` (config var) | `task_configs/json_schema_default.yaml` | Task config of the `json_schema` suite. Read from the config file only, not from the environment. A run that selects `json_schema` stops before it starts a server when the file does not exist |
+| `OPENAI_API_KEY` | (empty) | Sent as a bearer token to `/v1/models` and by `eval_json_schema.py`, and as `--api-key` to `evalscope` (in addition to `lm_eval` and `vllm bench serve`). `FORWARD` in `.buildkite/kubernetes/common.sh` does not name it, so a key set on a Buildkite kube step does not reach the pod; a gateway that requires the key then answers the `/v1/models` lookup with 401 and the run stops |
