@@ -17,6 +17,7 @@
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
+    check_regression.py --mode update --baseline <new.json> [--previous-baseline <old.json>]
 """  # noqa: E501
 
 from __future__ import annotations
@@ -31,6 +32,24 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import baseline_policy  # noqa: E402
+
+POLICY_KEY = baseline_policy.POLICY_KEY
+DEVELOPMENT = baseline_policy.DEVELOPMENT
+FROZEN = baseline_policy.FROZEN
+BaselineApproval = baseline_policy.BaselineApproval
+BaselinePolicy = baseline_policy.BaselinePolicy
+check_baseline_update = baseline_policy.check_baseline_update
+format_update_result = baseline_policy.format_update_result
+gated_entries = baseline_policy.gated_entries
+load_json_object = baseline_policy.load_json_object
+load_baseline_file = baseline_policy.load_json_object
+parse_policy = baseline_policy.parse_policy
 
 
 class Metric(NamedTuple):
@@ -484,23 +503,138 @@ def calibrate_eval(
     return baseline
 
 
+# The argparse destinations each (mode, calibrate) combination reads. A flag
+# given to a mode that does not read it is a usage error, not silently ignored.
+UPDATE_MODE_ARGS = frozenset({"mode", "baseline", "previous_baseline"})
+PERF_CHECK_ARGS = frozenset({"mode", "results_dir", "baseline", "tolerance"})
+PERF_CALIBRATE_ARGS = frozenset(
+    {"mode", "calibrate", "results_dir", "gate_ttft_max_concurrency"}
+)
+EVAL_CHECK_ARGS = frozenset({"mode", "results_dir", "baseline", "tolerance"})
+EVAL_CALIBRATE_ARGS = frozenset({"mode", "calibrate", "results_dir", "task_filter"})
+
+_MODE_ALLOWED_ARGS: dict[tuple[str, bool], frozenset[str]] = {
+    ("update", False): UPDATE_MODE_ARGS,
+    ("update", True): UPDATE_MODE_ARGS,
+    ("perf", False): PERF_CHECK_ARGS,
+    ("perf", True): PERF_CALIBRATE_ARGS,
+    ("eval", False): EVAL_CHECK_ARGS,
+    ("eval", True): EVAL_CALIBRATE_ARGS,
+}
+
+
+def _run_update(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    if args.baseline is None:
+        parser.error("--baseline is required in update mode")
+    try:
+        old = None
+        if args.previous_baseline is not None:
+            old = load_json_object(args.previous_baseline)
+        violation = check_baseline_update(old, load_json_object(args.baseline))
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    message = format_update_result(args.baseline, violation)
+    if violation:
+        print(message, file=sys.stderr)
+        return 1
+    print(message)
+    return 0
+
+
+def _run_calibrate(args: argparse.Namespace) -> int:
+    if args.mode == "perf":
+        baseline = calibrate_perf(args.results_dir, args.gate_ttft_max_concurrency)
+    else:
+        if args.task_filter == "all":
+            task_filter = None
+        elif args.task_filter:
+            task_filter = {s.strip() for s in args.task_filter.split(",") if s.strip()}
+        else:
+            task_filter = set(DEFAULT_TASK_FILTER)
+        try:
+            baseline = calibrate_eval(args.results_dir, task_filter)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+    json.dump(baseline, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+def _run_eval_check(args: argparse.Namespace, tolerance: float) -> int:
+    try:
+        baseline = gated_entries(load_json_object(args.baseline))
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    results = load_eval_results(args.results_dir[0])
+    if not results:
+        print(
+            f"ERROR: no results_*.json found under {args.results_dir[0]}",
+            file=sys.stderr,
+        )
+        return 2
+    result = check_eval(results, baseline, tolerance)
+    if result:
+        tol_str = format_drop_range([row.allowed_drop for row in result.failed_rows])
+        print(
+            f"FAILED: {result.failed_count} task(s) regressed beyond {tol_str}",
+            file=sys.stderr,
+        )
+        return 1
+    print("PASS: all evaluated tasks within tolerance.")
+    return 0
+
+
+def _run_perf_check(args: argparse.Namespace, tolerance: float) -> int:
+    try:
+        baseline = gated_entries(load_json_object(args.baseline))
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    results = load_perf_results(args.results_dir[0])
+    if not results:
+        print(
+            f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
+            file=sys.stderr,
+        )
+        return 2
+    failed = check_perf(results, baseline, tolerance)
+    if failed:
+        print(
+            f"FAILED: {failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
+            file=sys.stderr,
+        )
+        return 1
+    print("PASS: all gated metrics within tolerance.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["perf", "eval"],
+        choices=["perf", "eval", "update"],
         required=True,
-        help="Mode of operation: perf or eval.",
+        help="perf or eval gate results against a baseline; update checks "
+        "that a baseline file change follows its freeze policy.",
     )
     parser.add_argument(
         "--results-dir",
         type=Path,
         action="append",
-        required=True,
+        default=[],
         help="Directory containing result files. Repeat for calibrate.",
     )
     parser.add_argument(
         "--baseline", type=Path, help="Baseline JSON to compare against."
+    )
+    parser.add_argument(
+        "--previous-baseline",
+        type=Path,
+        help="Update mode: the baseline file before the change. Omit for a "
+        "new baseline file.",
     )
     parser.add_argument(
         "--tolerance",
@@ -515,7 +649,7 @@ def main() -> int:
     parser.add_argument(
         "--task-filter",
         default="",
-        help="Comma-separated allow-list of tasks/datasets.",
+        help="Calibrate (eval) only: comma-separated allow-list of tasks/datasets.",
     )
     parser.add_argument(
         "--gate-ttft-max-concurrency",
@@ -527,79 +661,37 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    tolerance = args.tolerance
-    if tolerance is None:
-        tolerance = 0.05 if args.mode == "perf" else 0.015
+    accepted = _MODE_ALLOWED_ARGS[(args.mode, args.calibrate)]
+    # A flag whose value equals its default counts as not given.
+    rejected = sorted(
+        dest
+        for dest, value in vars(args).items()
+        if dest not in accepted and value != parser.get_default(dest)
+    )
+    if rejected:
+        flags = ", ".join("--" + dest.replace("_", "-") for dest in rejected)
+        selected = f"--mode {args.mode}"
+        if args.calibrate and args.mode != "update":
+            selected += " --calibrate"
+        parser.error(f"{flags}: not valid with {selected}")
 
+    if args.mode == "update":
+        return _run_update(parser, args)
+    if not args.results_dir:
+        parser.error("--results-dir is required in perf and eval modes")
     if args.calibrate:
-        if args.mode == "perf":
-            baseline = calibrate_perf(args.results_dir, args.gate_ttft_max_concurrency)
-        elif args.mode == "eval":
-            if args.task_filter == "all":
-                task_filter = None
-            elif args.task_filter:
-                task_filter = set(
-                    s.strip() for s in args.task_filter.split(",") if s.strip()
-                )
-            else:
-                task_filter = set(DEFAULT_TASK_FILTER)
-            try:
-                baseline = calibrate_eval(args.results_dir, task_filter)
-            except ValueError as e:
-                print(f"ERROR: {e}", file=sys.stderr)
-                return 2
-        json.dump(baseline, sys.stdout, indent=2, sort_keys=True)
-        sys.stdout.write("\n")
-        return 0
-
+        return _run_calibrate(args)
     if args.baseline is None:
         parser.error("--baseline is required unless --calibrate is set")
     if len(args.results_dir) != 1:
         parser.error("--results-dir may only be given once in check mode")
 
+    tolerance = args.tolerance
+    if tolerance is None:
+        tolerance = 0.05 if args.mode == "perf" else 0.015
     if args.mode == "perf":
-        results = load_perf_results(args.results_dir[0])
-        if not results:
-            print(
-                f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
-                file=sys.stderr,
-            )
-            return 2
-    else:
-        results = load_eval_results(args.results_dir[0])
-        if not results:
-            print(
-                f"ERROR: no results_*.json found under {args.results_dir[0]}",
-                file=sys.stderr,
-            )
-            return 2
-
-    with args.baseline.open() as fh:
-        baseline = json.load(fh)
-    baseline = {k: v for k, v in baseline.items() if not k.startswith("_")}
-
-    if args.mode == "perf":
-        failed = check_perf(results, baseline, tolerance)
-        if failed:
-            print(
-                f"FAILED: {failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
-                file=sys.stderr,
-            )
-            return 1
-        print("PASS: all gated metrics within tolerance.")
-    else:
-        result = check_eval(results, baseline, tolerance)
-        if result:
-            tol_str = format_drop_range(
-                [row.allowed_drop for row in result.failed_rows]
-            )
-            print(
-                f"FAILED: {result.failed_count} task(s) regressed beyond {tol_str}",
-                file=sys.stderr,
-            )
-            return 1
-        print("PASS: all evaluated tasks within tolerance.")
-    return 0
+        return _run_perf_check(args, tolerance)
+    return _run_eval_check(args, tolerance)
 
 
 if __name__ == "__main__":

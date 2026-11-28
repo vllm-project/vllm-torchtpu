@@ -631,6 +631,16 @@ _TASK_FILTER_HINT = (
 )
 
 
+def _assert_usage_error(monkeypatch, capsys, argv, error):
+    """The command line exits 2 with `error` as its only message."""
+    with pytest.raises(SystemExit) as exc_info:
+        _run_cli(monkeypatch, *argv)
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.endswith(f"check_regression.py: error: {error}\n")
+
+
 def test_calibrate_eval_rejects_bad_runs(tmp_path, monkeypatch, capsys):
     good = _write_eval_run(tmp_path / "good", {"mmlu_pro": {"acc,none": 0.5}})
     other = _write_eval_run(tmp_path / "other", {"mbpp": {"acc,none": 0.5}})
@@ -728,3 +738,389 @@ def test_cli_calibrate_eval_writes_median_of_selected_tasks(
     captured = capsys.readouterr()
     assert json.loads(captured.out) == expected_baseline
     assert captured.err == ""
+
+
+# --- Freeze policy: a frozen baseline changes only with owner approval ---
+
+_TASK = {"mmlu_pro": {"acc,none": 0.90}}
+_RAISED = {"mmlu_pro": {"acc,none": 0.93}}
+_FROZEN = {"state": "frozen", "owner": "alice"}
+_APPROVAL_1 = {"approver": "alice", "reference": "https://example.invalid/pull/1"}
+_APPROVAL_2 = {"approver": "alice", "reference": "https://example.invalid/pull/2"}
+_NO_APPROVAL = (
+    "frozen baseline changed without a new _policy.approval record from owner 'alice'"
+)
+_WRONG_APPROVER = (
+    "frozen baseline changed with approval from 'bob', but its owner is 'alice'"
+)
+
+
+def test_parse_policy_defaults_to_development():
+    assert check_regression.parse_policy(_TASK) == check_regression.BaselinePolicy(
+        state="development", owner=None, approval=None
+    )
+
+
+def test_parse_policy_frozen_with_approval():
+    policy = check_regression.parse_policy(
+        {
+            "_policy": {
+                "state": "frozen",
+                "owner": " alice ",
+                "approval": {
+                    "approver": " alice ",
+                    "reference": " https://example.invalid/pull/1 ",
+                },
+            }
+        }
+    )
+    assert policy == check_regression.BaselinePolicy(
+        state="frozen",
+        owner="alice",
+        approval=check_regression.BaselineApproval(
+            "alice", "https://example.invalid/pull/1"
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy", "message"),
+    [
+        (None, "_policy must be an object"),
+        ("frozen", "_policy must be an object"),
+        (
+            {"status": "frozen", "owner": "alice"},
+            r"unknown _policy field\(s\): 'status'",
+        ),
+        ({"state": "golden"}, "_policy.state must be 'development' or 'frozen'"),
+        ({"state": "frozen"}, "_policy.owner must be a non-empty string"),
+        ({"state": "frozen", "owner": " "}, "_policy.owner must be a non-empty"),
+        # A development block need not name an owner, but may not name a bad one.
+        ({"owner": ""}, "_policy.owner must be a non-empty string"),
+        ({"approval": "alice"}, "_policy.approval must be an object"),
+        (
+            {"approval": {"approver": "alice"}},
+            "_policy.approval.reference must be a non-empty string",
+        ),
+        (
+            {
+                "approval": {
+                    "approver": "alice",
+                    "reference": "https://example.invalid/pull/1",
+                    "extra": "nope",
+                }
+            },
+            r"unknown _policy\.approval field\(s\): 'extra'",
+        ),
+    ],
+)
+def test_parse_policy_rejects_malformed_block(policy, message):
+    with pytest.raises(ValueError, match=message):
+        check_regression.parse_policy({"_policy": policy})
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        # New file, and development baselines, change freely.
+        (None, _RAISED, None),
+        (_TASK, _RAISED, None),
+        ({**_TASK, "_policy": {"state": "development"}}, _RAISED, None),
+        # Freezing a development baseline needs no approval.
+        (_TASK, {**_RAISED, "_policy": _FROZEN}, None),
+        # A frozen baseline may change metadata, but not gated values.
+        (
+            {**_TASK, "_policy": _FROZEN},
+            {
+                **_TASK,
+                "_policy": _FROZEN,
+                "_source": {"url": "https://example.invalid"},
+            },
+            None,
+        ),
+        ({**_TASK, "_policy": _FROZEN}, {**_RAISED, "_policy": _FROZEN}, _NO_APPROVAL),
+        # Dropping the policy block or the task does not unfreeze it.
+        ({**_TASK, "_policy": _FROZEN}, _TASK, _NO_APPROVAL),
+        ({**_TASK, "_policy": _FROZEN}, {"_policy": _FROZEN}, _NO_APPROVAL),
+        # Unfreezing is a change, also when the owner stays.
+        (
+            {**_TASK, "_policy": _FROZEN},
+            {**_TASK, "_policy": {"state": "development", "owner": "alice"}},
+            _NO_APPROVAL,
+        ),
+        # Handing the file to another owner is a change too.
+        (
+            {**_TASK, "_policy": _FROZEN},
+            {**_TASK, "_policy": {"state": "frozen", "owner": "bob"}},
+            _NO_APPROVAL,
+        ),
+        # An approval that was already in the old file does not count again,
+        # even with extra whitespace around its fields.
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {**_RAISED, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            _NO_APPROVAL,
+        ),
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {
+                **_RAISED,
+                "_policy": {
+                    **_FROZEN,
+                    "approval": {
+                        "approver": "alice ",
+                        "reference": "https://example.invalid/pull/1 ",
+                    },
+                },
+            },
+            _NO_APPROVAL,
+        ),
+        # Stripping or mutating an existing approval without a new owner
+        # approval is rejected (blocks two-step strip-then-replay).
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {**_TASK, "_policy": _FROZEN},
+            _NO_APPROVAL,
+        ),
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {
+                **_TASK,
+                "_policy": {
+                    **_FROZEN,
+                    "approval": {
+                        "approver": "bob",
+                        "reference": "https://example.invalid/pull/3",
+                    },
+                },
+            },
+            _WRONG_APPROVER,
+        ),
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_2}},
+            None,
+        ),
+        # Type-aware gated value equality detects int vs bool substitutions.
+        (
+            {"task": {"acc,none": 1}, "_policy": _FROZEN},
+            {"task": {"acc,none": True}, "_policy": _FROZEN},
+            _NO_APPROVAL,
+        ),
+        (
+            {"task": {"acc,none": 0}, "_policy": _FROZEN},
+            {"task": {"acc,none": False}, "_policy": _FROZEN},
+            _NO_APPROVAL,
+        ),
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {**_RAISED, "_policy": {**_FROZEN, "approval": _APPROVAL_2}},
+            None,
+        ),
+        (
+            {**_TASK, "_policy": _FROZEN},
+            {
+                **_RAISED,
+                "_policy": {
+                    "state": "frozen",
+                    "owner": "bob",
+                    "approval": {
+                        "approver": "bob",
+                        "reference": "https://example.invalid/3",
+                    },
+                },
+            },
+            _WRONG_APPROVER,
+        ),
+    ],
+)
+def test_check_baseline_update(old, new, expected):
+    assert check_regression.check_baseline_update(old, new) == expected
+
+
+def test_format_update_result():
+    path = pathlib.Path("baseline.json")
+    assert (
+        check_regression.format_update_result(path, None)
+        == "PASS: baseline update follows its freeze policy."
+    )
+    assert (
+        check_regression.format_update_result(path, _NO_APPROVAL)
+        == f"FAILED: {path}: {_NO_APPROVAL}"
+    )
+
+
+def test_cli_update_mode(tmp_path, monkeypatch, capsys):
+    old_file = tmp_path / "old.json"
+    new_file = tmp_path / "new.json"
+    old_file.write_text(json.dumps({**_TASK, "_policy": _FROZEN}))
+    new_only = ["--mode", "update", "--baseline", str(new_file)]
+    with_previous = [*new_only, "--previous-baseline", str(old_file)]
+    passed = (0, "PASS: baseline update follows its freeze policy.\n", "")
+    no_owner = (2, "", "ERROR: _policy.owner must be a non-empty string\n")
+
+    def run(new_policy, argv):
+        new_file.write_text(json.dumps({**_RAISED, "_policy": new_policy}))
+        ret = _run_cli(monkeypatch, *argv)
+        captured = capsys.readouterr()
+        return ret, captured.out, captured.err
+
+    violation = (1, "", f"FAILED: {new_file}: {_NO_APPROVAL}\n")
+    assert run(_FROZEN, with_previous) == violation
+    # Without a previous file the same content is a new baseline.
+    assert run(_FROZEN, new_only) == passed
+    assert run({**_FROZEN, "approval": _APPROVAL_1}, with_previous) == passed
+    # A malformed block exits 2, in a changed file and in a new one.
+    assert run({"state": "frozen"}, with_previous) == no_owner
+    assert run({"state": "frozen"}, new_only) == no_owner
+
+
+# What each mode needs after the flags that select it; BASELINE and RESULTS
+# stand for real paths.
+_UPDATE = "--mode update"
+_MODE_ARGS = {
+    _UPDATE: ["--baseline", "BASELINE"],
+    "--mode perf": ["--results-dir", "RESULTS", "--baseline", "BASELINE"],
+    "--mode eval": ["--results-dir", "RESULTS", "--baseline", "BASELINE"],
+    "--mode perf --calibrate": ["--results-dir", "RESULTS"],
+    "--mode eval --calibrate": ["--results-dir", "RESULTS"],
+}
+_RESULT_MODES = [mode for mode in _MODE_ARGS if mode != _UPDATE]
+
+
+@pytest.mark.parametrize(
+    ("argv", "error"),
+    [
+        (["--mode", "update"], "--baseline is required in update mode"),
+        (
+            ["--mode", "perf", "--baseline", "b.json"],
+            "--results-dir is required in perf and eval modes",
+        ),
+        # Without the check this run would write an empty baseline and exit 0.
+        (
+            ["--mode", "eval", "--calibrate"],
+            "--results-dir is required in perf and eval modes",
+        ),
+    ],
+)
+def test_cli_requires_the_flags_a_mode_reads(monkeypatch, capsys, argv, error):
+    _assert_usage_error(monkeypatch, capsys, argv, error)
+
+
+# (mode, flags it does not take, the flags the error names)
+_NOT_VALID_CASES = [
+    (_UPDATE, ["--calibrate"], "--calibrate"),
+    (_UPDATE, ["--tolerance", "0.1"], "--tolerance"),
+    (_UPDATE, ["--results-dir", "RESULTS"], "--results-dir"),
+    (_UPDATE, ["--task-filter", "mmlu_pro"], "--task-filter"),
+    # 0 is a real value of this flag, not "flag not given".
+    (_UPDATE, ["--gate-ttft-max-concurrency", "0"], "--gate-ttft-max-concurrency"),
+    (_UPDATE, ["--tolerance", "0.1", "--calibrate"], "--calibrate, --tolerance"),
+    *[
+        (mode, ["--previous-baseline", "BASELINE"], "--previous-baseline")
+        for mode in _RESULT_MODES
+    ],
+    *[
+        (mode, flag, flag[0])
+        for mode in ("--mode perf", "--mode eval")
+        for flag in (
+            ["--task-filter", "mmlu_pro"],
+            ["--gate-ttft-max-concurrency", "0"],
+        )
+    ],
+    *[
+        ("--mode perf --calibrate", flag, flag[0])
+        for flag in (
+            ["--baseline", "BASELINE"],
+            ["--tolerance", "0.1"],
+            ["--task-filter", "mmlu_pro"],
+        )
+    ],
+    *[
+        ("--mode eval --calibrate", flag, flag[0])
+        for flag in (
+            ["--baseline", "BASELINE"],
+            ["--tolerance", "0.1"],
+            ["--gate-ttft-max-concurrency", "0"],
+        )
+    ],
+]
+
+
+@pytest.mark.parametrize(
+    ("mode", "flags", "named"),
+    _NOT_VALID_CASES,
+    ids=[f"{mode} {' '.join(flags)}" for mode, flags, _ in _NOT_VALID_CASES],
+)
+def test_cli_rejects_flags_the_mode_does_not_take(
+    tmp_path, monkeypatch, capsys, mode, flags, named
+):
+    """A flag given to a mode that does not take it is a usage error."""
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(_TASK))
+    results = _write_eval_run(tmp_path / "results", _TASK)
+    paths = {"BASELINE": str(baseline), "RESULTS": str(results)}
+    argv = [paths.get(arg, arg) for arg in mode.split() + _MODE_ARGS[mode] + flags]
+    _assert_usage_error(monkeypatch, capsys, argv, f"{named}: not valid with {mode}")
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        # A missing file, invalid JSON, and NaN/Infinity: reason follows file name.
+        (None, "ERROR: cannot read {bad}: "),
+        ("{not json", "ERROR: cannot read {bad}: "),
+        ('{"mmlu_pro": {"acc,none": NaN}}', "ERROR: cannot read {bad}: "),
+        ('{"mmlu_pro": {"acc,none": Infinity}}', "ERROR: cannot read {bad}: "),
+        ("[]", "ERROR: {bad} must hold a JSON object\n"),
+    ],
+)
+def test_cli_update_mode_unreadable_file_exits_2(
+    tmp_path, monkeypatch, capsys, content, error
+):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(_TASK))
+    bad = tmp_path / "bad.json"
+    if content is not None:
+        bad.write_text(content)
+    for baseline, previous in ((bad, good), (good, bad)):
+        ret = _run_cli(
+            monkeypatch,
+            "--mode", "update", "--baseline", str(baseline),
+            "--previous-baseline", str(previous),
+        )  # fmt: skip
+        assert ret == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith(error.format(bad=bad))
+        assert captured.err.count("\n") == 1
+
+
+@pytest.mark.parametrize("mode", ["perf", "eval"])
+def test_cli_check_modes_reject_nan_baseline_with_exit_2(
+    tmp_path, monkeypatch, capsys, mode
+):
+    bad = tmp_path / "nan.baseline.json"
+    bad.write_text('{"mmlu_pro": {"acc,none": NaN}}')
+    results = _write_eval_run(tmp_path / "results", _TASK)
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        mode,
+        "--results-dir",
+        str(results),
+        "--baseline",
+        str(bad),
+    )
+    assert ret == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "non-standard JSON constant 'NaN'" in captured.err
+
+
+def test_shipped_baselines_have_valid_policy():
+    """Every checked-in perf and eval baseline parses under the policy schema."""
+    files = sorted(_BASELINE_DIR.parent.rglob("*.baseline.json"))
+    assert files, f"no baselines found under {_BASELINE_DIR.parent}"
+    for path in files:
+        check_regression.parse_policy(check_regression.load_baseline_file(path))

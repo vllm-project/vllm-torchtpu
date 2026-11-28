@@ -145,6 +145,74 @@ selected task or lacks an accuracy metric that another run has. A run may lack
 a standard error. The baseline then takes the median of the standard errors
 that the other runs reported.
 
+### Baseline freeze policy (`--mode update`)
+
+A baseline file is in one of two states, recorded in a top-level `_policy`
+block. A file without the block, or with a block that has no `state`, is in
+`development`.
+
+- `development`: the setup is still below its target. Anyone may update the
+  baseline.
+- `frozen`: the setup met its target. The gated values, the state, the owner,
+  and the existing `approval` record change only when the same change adds a
+  new `approval` record whose `approver` is the `owner` named in the file
+  before the change.
+
+```json
+{
+  "_policy": {
+    "state": "frozen",
+    "owner": "<GitHub handle>",
+    "approval": {
+      "approver": "<GitHub handle>",
+      "reference": "<URL of the PR or issue where the owner approved>"
+    }
+  },
+  "mmlu_pro": {"exact_match,custom-extract": 0.7664}
+}
+```
+
+The rule in detail:
+
+- The gated values are all top-level keys that do not start with `_`, compared
+  with JSON type equality (`1` and `true` are distinct). Other `_` keys, such
+  as `_source`, change freely.
+- A `frozen` block must name an `owner`. `approval` is optional and needs both
+  `approver` and `reference`. Each of the three is a non-empty string with
+  leading and trailing whitespace stripped before comparison. Explicit
+  `"_policy": null` and unknown keys inside `_policy` or `_policy.approval`
+  are rejected.
+- An `approval` record counts once. A record that the file already carried
+  before the change does not approve the change, and removing or mutating it
+  on a `frozen` baseline requires a new approval from the owner.
+- A new baseline file and a `development` baseline need no approval, also to
+  become `frozen`.
+
+`--mode update` checks a change to a baseline file against this rule. Pass the
+file before the change as `--previous-baseline`, and omit that flag for a new
+baseline file. The check compares the two files and does not open `reference`,
+so a reviewer confirms the approval there. No CI step runs the check yet.
+
+It exits `0` when the change follows the policy and `1` when a frozen baseline
+changed without a new approval from its owner. It exits `2` when a file cannot
+be read, is not a standard JSON object (including `NaN` or `Infinity`), or has
+a malformed `_policy` block.
+
+Each mode accepts only the flags it reads: update mode takes `--baseline` and
+`--previous-baseline`; perf and eval check modes take `--results-dir`,
+`--baseline`, and `--tolerance`; `--mode perf --calibrate` takes
+`--results-dir` and `--gate-ttft-max-concurrency`; and `--mode eval
+--calibrate` takes `--results-dir` and `--task-filter`. Any other flag is a
+usage error (exit `2`).
+
+```bash
+git show origin/main:<baseline path> > /tmp/previous.baseline.json
+python3 scripts/vllm/benchmarking/check_regression.py \
+  --mode update \
+  --previous-baseline /tmp/previous.baseline.json \
+  --baseline <baseline path>
+```
+
 ## Accuracy Evaluation (`lm_eval`)
 
 ### Tasks
@@ -201,8 +269,8 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 
 `run_benchmarks.sh` supports two runner modes via `--mode serving|spec_bench`
 (or `BENCHMARK_MODE=serving|spec_bench`; distinct from `check_regression.py
---mode perf|eval` above). In `spec_bench` mode, the runner sweeps batch size
-(`SPEC_BS_LIST`) × speculative draft tokens (`SPEC_K_LIST`) on the
+--mode perf|eval|update` above). In `spec_bench` mode, the runner sweeps batch
+size (`SPEC_BS_LIST`) × speculative draft tokens (`SPEC_K_LIST`) on the
 [Spec-Bench](https://github.com/hemingkx/Spec-Bench) dataset:
 
 1. Restarts `vllm serve` per `(BS, K)` cell with `--max-num-seqs <BS>` and
