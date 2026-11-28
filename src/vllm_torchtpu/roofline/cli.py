@@ -20,6 +20,7 @@ import json
 import math
 import sys
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .chips import (
@@ -54,6 +55,7 @@ from .emit import (
 from .geometry import UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
 from .modules import Dtypes, Parallel, StepShape
+from .report import write_html
 from .serving import ServingRequest, plan
 from .solver import (
     EXAMPLE_SCENARIOS,
@@ -210,6 +212,12 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_scenario_args(solve_parser)
+    solve_parser.add_argument(
+        "--html",
+        type=Path,
+        default=None,
+        help="Write an offline HTML report to PATH.",
+    )
 
     ceiling_parser = sub.add_parser(
         "ceiling",
@@ -515,15 +523,22 @@ def _dispatch_solve(
     )
     if args.cmd == "ceiling":
         return _dispatch_ceiling(args, serving_plan)
-    if args.json:
-        payload = build_solve_payload(
+    src = args.model if args.model is not None else (model_ref or args.config)
+    payload = (
+        build_solve_payload(
             serving_plan,
             chip=chip,
             dtypes=resolved_dtypes,
-            model=args.model if args.model is not None else (model_ref or args.config),
+            model=src,
             top_k=args.top_k,
             topologies=custom_topos,
         )
+        if (args.html is not None or args.json)
+        else None
+    )
+    if args.html is not None and payload is not None:
+        write_html(payload, args.html)
+    if args.json and payload is not None:
         sys.stdout.write(format_solve_json(payload) + "\n")
         return 0
     return _write_solve_text_output(serving_plan, top_k=args.top_k)

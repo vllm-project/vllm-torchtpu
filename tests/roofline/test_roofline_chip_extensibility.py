@@ -544,3 +544,27 @@ def test_tpu7x_chip_catalog_exposes_provenance_brackets() -> None:
     )
     assert cat["fp8_flops"]["bracket"] == rf_constants.TPU7X_FP8_FLOPS_PER_CORE_BRACKET
     assert cat["d2d_bw"]["bracket"] == rf_constants.D2D_BW_BRACKET
+
+
+@pytest.mark.parametrize(
+    ("chips_per_host", "cases"),
+    [
+        (None, ((0, 1), (4, 1), (5, 2), (8, 2), (9, 3))),
+        (1, ((0, 1), (1, 1), (2, 2), (5, 5))),
+        (8, ((0, 1), (4, 1), (8, 1), (9, 2), (16, 2))),
+    ],
+)
+def test_count_hosts_rounds_up_partial_hosts(
+    chips_per_host: int | None,
+    cases: tuple[tuple[int, int], ...],
+) -> None:
+    """Round positive chip counts up to physical hosts using ceiling division."""
+    from vllm_torchtpu.roofline import count_hosts
+
+    for num_chips, expected_hosts in cases:
+        if chips_per_host is None:
+            assert count_hosts(num_chips) == expected_hosts
+        else:
+            assert (
+                count_hosts(num_chips, chips_per_host=chips_per_host) == expected_hosts
+            )

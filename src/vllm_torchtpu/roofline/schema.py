@@ -19,6 +19,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
+from .chips import count_hosts
 from .constants import (
     DEFAULT_CHIPS_PER_HOST,
     DEFAULT_CORES_PER_CHIP,
@@ -408,8 +409,10 @@ def _format_slice_hw(total_chips: int, chip: ChipSpec | None) -> tuple[str, int]
     """Return host description and TensorCore count for a slice chip total."""
     chips_per_host = chip.chips_per_host if chip is not None else DEFAULT_CHIPS_PER_HOST
     cores_per_chip = chip.cores_per_chip if chip is not None else DEFAULT_CORES_PER_CHIP
-    hosts = max(1, (total_chips + chips_per_host - 1) // chips_per_host)
-    return format_host_count(hosts), total_chips * cores_per_chip
+    host_description = format_host_count(
+        count_hosts(total_chips, chips_per_host=chips_per_host)
+    )
+    return host_description, total_chips * cores_per_chip
 
 
 def format_submodule_parallelism(
