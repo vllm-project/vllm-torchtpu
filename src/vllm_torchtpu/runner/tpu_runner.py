@@ -190,10 +190,12 @@ from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
+    MERGE_WARMUP_HOOK,
     MMEncoderManager,
     host_encoder_batches,
     maybe_create_mm_encoder_manager,
 )
+from vllm_torchtpu.runner.mm_encoder_rows import EncoderEmbeds, EncoderRows, Upload
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.pcp import (
     PcpManager,
@@ -721,6 +723,16 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
             f"{shapes}; the pipeline hand-off carries one per stage"
         )
     return next(iter(found.values()))
+
+
+def _concat_mm_embeds(embeds: list, upload: Upload) -> "torch.Tensor | EncoderEmbeds":
+    """A step's multimodal embeddings in order: row handles when every item is
+    one (`runner.mm_encoder_rows`), else one tensor."""
+    if all(isinstance(e, EncoderRows) for e in embeds):
+        return EncoderEmbeds(embeds)
+    return torch.cat(
+        [e.tensor(upload) if isinstance(e, EncoderRows) else e for e in embeds]
+    )
 
 
 # Recompilation-avoidance contract:
@@ -4159,9 +4171,14 @@ class TPUModelRunner(GPUModelRunner):
             return super()._execute_mm_encoder(scheduler_output)
 
     def _maybe_enable_layout_free_encoder(self, manager: MMEncoderManager) -> None:
-        """Hand the encoder its batches on the host (see `host_encoder_batches`)
-        unless this config needs today's per-batch uploads."""
-        if self._dp_lockstep_enabled():
+        """Keep encoder outputs as row handles (see `runner.mm_encoder_rows`)
+        unless this config needs vLLM's per-item output tensors."""
+        from vllm.distributed.ec_transfer import has_ec_transfer
+
+        spec = self.speculative_config
+        if has_ec_transfer():
+            reason = "an EC connector saves and loads encoder outputs as tensors"
+        elif self._dp_lockstep_enabled():
             reason = "DP-coordinated encoding"
         elif (
             self.is_multimodal_pruning_enabled
@@ -4170,22 +4187,88 @@ class TPUModelRunner(GPUModelRunner):
             reason = "the model prunes or encodes videos one by one"
         elif self.lora_config is not None:
             reason = "multimodal LoRA"
+        elif spec is not None and spec.method != "ngram":
+            reason = f"the {spec.method} drafter reads encoder outputs"
         elif self.mm_budget is None:
             reason = "no encoder cache budget"
         else:
             reason = manager.enable_layout_free()
         if reason is None:
-            logger.info("Layout-free multimodal encoder: pixels in budget chunks.")
+            logger.info("Layout-free multimodal encoder: outputs as row handles.")
         else:
-            logger.info("Multimodal encoder uploads pixels per batch: %s.", reason)
+            logger.info("Multimodal encoder keeps per-item outputs: %s.", reason)
+
+    @torch.no_grad()
+    def _precompile_layout_free_embeds(self) -> None:
+        """Compile the embedding merge of row handles (`EncoderEmbeds.gather`):
+        with the gather of one encoder output fused in, at every encoder budget
+        and token bucket; and for several outputs, each one's gather at every
+        budget and the merge of their rows at every bucket.
+
+        A separate program for a one-output gather would need a flush of its
+        own, which holds the host until the encoder is done.
+        """
+        manager = self.encoder_cudagraph_manager
+        if not isinstance(manager, MMEncoderManager) or not manager.layout_free:
+            return
+        hidden, dtype = manager.config.out_hidden_size, manager.dtype
+        one = np.zeros(1, dtype=np.int64)
+        finish = getattr(self.model, MERGE_WARMUP_HOOK, None)
+
+        def merge(sources: list[torch.Tensor], num_tokens: int) -> None:
+            # A serving chunk's fence discipline: release the previous merge's
+            # host sources, fence this one's.
+            self._wait_input_staging_fence()
+            is_mm = torch.zeros(num_tokens, dtype=torch.bool)
+            is_mm[: len(sources)] = True
+            ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+            parts = [EncoderRows(source, one) for source in sources]
+            _, embeds = self._get_model_inputs(ids, ([EncoderEmbeds(parts)], is_mm))
+            assert embeds is not None
+            synchronize_tensors([embeds])
+            self._record_input_staging_fence()
+            if finish is not None:
+                finish(num_tokens)
+
+        def outputs(rows: int, count: int) -> list[torch.Tensor]:
+            # Shaped as the budget graph's output, which row handles index.
+            return [
+                torch.zeros(rows, hidden, dtype=dtype, device=self.device)
+                for _ in range(count)
+            ]
+
+        output_rows = sorted(set(manager.output_rows.values()))
+        if not output_rows:
+            return
+        for rows in output_rows:
+            source = outputs(rows, 1)
+            for num_tokens in self.num_tokens_paddings:
+                merge(source, num_tokens)
+            merge(outputs(rows, 2), self.num_tokens_paddings[0])
+        for num_tokens in self.num_tokens_paddings[1:]:
+            merge(outputs(output_rows[0], 2), num_tokens)
 
     def _get_model_inputs(
         self,
         input_ids: torch.Tensor,
-        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+        mm_embed_inputs: tuple[Sequence[torch.Tensor | EncoderEmbeds], torch.Tensor]
+        | None,
     ):
         if self.supports_mm_inputs:
-            mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
+            mm_inputs, is_mm_embed = mm_embed_inputs or (None, None)
+            mm_embeds = None
+            if mm_inputs is not None:
+                mm_embeds = [
+                    # Row handles: gathers at the token bucket's shape.
+                    e.gather(
+                        input_ids.shape[0],
+                        self.max_num_tokens,
+                        lambda host: stage_h2d_upload(self, host),
+                    )
+                    if isinstance(e, EncoderEmbeds)
+                    else e
+                    for e in mm_inputs
+                ]
 
             # _gather_mm_embeddings returns is_mm_embed sized to the number
             # of scheduled tokens, but TPU pads input_ids to a fixed bucket.
@@ -4593,7 +4676,9 @@ class TPUModelRunner(GPUModelRunner):
                 scheduler_output
             )
             if mm_embeds_list:
-                mm_embeds_flat = torch.cat(mm_embeds_list)
+                mm_embeds_flat = _concat_mm_embeds(
+                    mm_embeds_list, lambda host: stage_h2d_upload(self, host)
+                )
             req_tok = np.array(
                 [
                     scheduler_output.num_scheduled_tokens[r]
@@ -8159,6 +8244,7 @@ class TPUModelRunner(GPUModelRunner):
                     self.encoder_cudagraph_manager.precompile_vision_encoder(
                         max_step_tokens=max_step_tokens
                     )
+                    self._precompile_layout_free_embeds()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.

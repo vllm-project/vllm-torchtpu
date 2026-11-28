@@ -17,7 +17,8 @@ from unittest.mock import MagicMock, Mock, call
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounter
-from vllm.distributed import parallel_state
+from vllm.distributed import ec_transfer, parallel_state
+from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
 from vllm.v1.worker import encoder_cudagraph
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
 
@@ -623,30 +624,49 @@ def test_capture_model_passes_encoder_step_budget_to_precompile(
 
 
 class _BudgetInputsModel(Mock):
-    """A model with the budget-inputs hook."""
+    """A model with the budget-inputs hook and vLLM's default post-processing."""
 
     prepare_encoder_budget_inputs = Mock()
+    postprocess_encoder_output = SupportsEncoderCudaGraph.postprocess_encoder_output
+
+
+class _PostprocessingModel(_BudgetInputsModel):
+    def postprocess_encoder_output(self, *args, **kwargs):
+        pass
 
 
 @pytest.mark.parametrize(
     ("model_cls", "runner_config", "layout_free"),
     [
         (_BudgetInputsModel, {}, True),
+        (
+            _BudgetInputsModel,
+            {"speculative_config": SimpleNamespace(method="ngram")},
+            True,
+        ),
         (Mock, {}, False),
+        (_PostprocessingModel, {}, False),
+        (_BudgetInputsModel, {"ec_transfer": True}, False),
         (_BudgetInputsModel, {"_dp_lockstep_enabled": lambda: True}, False),
         (_BudgetInputsModel, {"is_multimodal_pruning_enabled": True}, False),
         (_BudgetInputsModel, {"requires_sequential_video_encoding": True}, False),
         (_BudgetInputsModel, {"lora_config": object()}, False),
+        (
+            _BudgetInputsModel,
+            {"speculative_config": SimpleNamespace(method="eagle3")},
+            False,
+        ),
         (_BudgetInputsModel, {"mm_budget": None}, False),
     ],
 )
-def test_layout_free_encoder_only_where_batches_run_in_budget_graphs(
-    compile_mock, model_cls, runner_config, layout_free
+def test_layout_free_encoder_only_where_outputs_need_no_tensors(
+    compile_mock, monkeypatch, model_cls, runner_config, layout_free
 ):
-    """Host batches reach only configs that encode through the budget graphs."""
+    """Row handles reach only consumers that take them in place of tensors."""
     from vllm_torchtpu.runner import tpu_runner
 
     config = {
+        "speculative_config": None,
         "_dp_lockstep_enabled": lambda: False,
         "is_multimodal_pruning_enabled": False,
         "requires_sequential_video_encoding": False,
@@ -654,6 +674,8 @@ def test_layout_free_encoder_only_where_batches_run_in_budget_graphs(
         "mm_budget": object(),
         **runner_config,
     }
+    has_ec_transfer = config.pop("ec_transfer", False)
+    monkeypatch.setattr(ec_transfer, "has_ec_transfer", lambda: has_ec_transfer)
     manager = _make_manager(
         lambda budget: {"pixels": torch.zeros(budget, 2)}, model_cls=model_cls
     )
