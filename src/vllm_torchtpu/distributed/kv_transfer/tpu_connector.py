@@ -3476,7 +3476,10 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _measure_raiden_glm_layout(
-        manifest: Any, page_tokens: int, indexer_seq_along_lane: bool = False
+        manifest: Any,
+        page_tokens: int,
+        indexer_seq_along_lane: bool = False,
+        rope_half_split: tuple[bool, bool] = (False, False),
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_glm_layout_fingerprint,
@@ -3490,6 +3493,8 @@ class TPURaidenConnectorWorker:
             page_tokens=page_tokens,
             hash_indexer=not _use_per_layer_pool_tags() or _raiden_glm_dcp_identity(),
             indexer_seq_along_lane=indexer_seq_along_lane,
+            mla_rope_half_split=rope_half_split[0],
+            indexer_rope_half_split=rope_half_split[1],
         )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
@@ -3529,11 +3534,19 @@ class TPURaidenConnectorWorker:
             )
             return fingerprint, payload, page_tokens
         if _use_raiden_glm_admission():
+            from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+                glm_rope_half_split,
+            )
+
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
                 manifest,
                 page_tokens,
                 indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
+                rope_half_split=glm_rope_half_split(
+                    getattr(self.runner, "model", None),
+                    self.vllm_config.model_config.hf_text_config,
+                ),
             )
             return fingerprint, payload, page_tokens
         if _raiden_seq_on_lane_layout():
@@ -3873,10 +3886,13 @@ class TPURaidenConnectorWorker:
         self._raiden_work_unit = unit
         self._raiden_layout_fingerprint = fingerprint
         self._raiden_layout_fingerprint_payload = dict(fingerprint_payload)
+        # The payload too: after a refused transfer, the two legs' lines show
+        # which field differs, not only two different hashes.
         logger.info(
             "Raiden work unit registered controller=%s unit=%s "
             "data=%s listener=%s page_tokens=%d transfer_rank=%d/%d "
-            "interleave_tokens=%d layout_fingerprint=%s",
+            "interleave_tokens=%d layout_fingerprint=%s "
+            "layout_fingerprint_payload=%s",
             controller_address,
             unit,
             data_address,
@@ -3886,6 +3902,12 @@ class TPURaidenConnectorWorker:
             transfer_parallelism,
             interleave_tokens,
             fingerprint,
+            json.dumps(
+                dict(fingerprint_payload),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
         )
         return {
             "controller_address": controller_address,

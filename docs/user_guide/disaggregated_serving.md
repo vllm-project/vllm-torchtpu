@@ -135,3 +135,27 @@ python examples/disagg/toy_proxy_server.py \
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of concurrent DMA transfer streams per worker. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | KV resharding implementation (`controller` or `host`) when Prefill and Decode shardings differ. |
 | `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol for host-side KV resharding (`zmq` or `tcp`). |
+
+---
+
+## 6. Both Legs Must Cache the Same Layout
+
+Each worker registers a layout fingerprint with the Raiden controller: a hash of its KV cache page layout and of anything else a peer needs to read its pages. The controller refuses a transfer between a Prefill unit and a Decode unit that registered different fingerprints, so the Decode never loads pages it would misread.
+
+For GLM (`TPU_RAIDEN_GLM_ADMISSION=1`), the fingerprint includes the rope channel order of the cached MLA `k_pe` and of the indexer key:
+
+- With `TPU_MLA_ROPE_NEOX_PERMUTE` / `TPU_INDEXER_ROPE_NEOX_PERMUTE` on (the default), an engine permutes its rope projection columns after load and caches those channels in half-split order. The payload then declares `"mla_rope_order":"half_split"` / `"indexer_rope_order":"half_split"`.
+- With them off, or on a tree without the permute, the engine caches the checkpoint's interleaved order and declares nothing.
+- A pipeline stage whose layers hold no indexer declares the order an indexer layer of its own would cache: half-split when `TPU_INDEXER_ROPE_NEOX_PERMUTE` is on and the model config sets `indexer_rope_interleave`.
+
+The page geometry is the same in both orders, so run both legs with the same two settings: a half-split leg and an interleaved leg register different fingerprints, and every transfer between them is refused. The refusal itself comes from the controller. The Decode worker logs one line per refused request, at ERROR, carrying the controller's message, and then waits for the native transfer's terminal state:
+
+```text
+(Worker_TP0_DCP0_EP0 pid=<pid>) ERROR <date> <time> [tpu_connector.py:6201] Stage-3 controller transfer outcome uncertain; waiting for native terminal state req_id=<request id> destination_req_id=<request id> uuid=<transfer id>: Remote Controller Server execution failed: Layout fingerprint mismatch between source and destination
+```
+
+Each worker logs its registration in one line with the fingerprint and its payload, so the two legs' lines show the field that differs:
+
+```text
+Raiden work unit registered controller=<addr> unit=<unit> data=<addr> listener=<addr> page_tokens=1024 transfer_rank=0/8 interleave_tokens=<n> layout_fingerprint=<sha256> layout_fingerprint_payload={"indexer_rope_order":"half_split",...,"mla_rope_order":"half_split",...}
+```
