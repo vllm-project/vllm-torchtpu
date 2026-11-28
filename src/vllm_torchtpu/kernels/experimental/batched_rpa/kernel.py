@@ -502,20 +502,29 @@ def rpa_body(
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
-    q_loaded = utils.strided_load(
-        q_ref,
-        0,
-        cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
-        1,
-        dtype=cfgs.serve.dtype_q,
+    chunked_b1 = (
+        cfgs.mode == configs.RpaCase.MIXED
+        and cfgs.batch_size == 1
+        and cfgs.bq_sz >= 512
+        and cfgs.bq_c_sz < cfgs.bq_sz
+        and not cfgs.serve.return_lse
+        and not cfgs.fuse_accum
     )
-    q = q_loaded.reshape(
-        cfgs.batch_size,
-        cfgs.model.num_kv_heads,
-        cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
-        cfgs.aligned_q_head_dim,
-    )
-    q = q[..., : cfgs.compute_kv_head_dim]
+    if not chunked_b1:
+        q_loaded = utils.strided_load(
+            q_ref,
+            0,
+            cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
+            1,
+            dtype=cfgs.serve.dtype_q,
+        )
+        q = q_loaded.reshape(
+            cfgs.batch_size,
+            cfgs.model.num_kv_heads,
+            cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
+            cfgs.aligned_q_head_dim,
+        )
+        q = q[..., : cfgs.compute_kv_head_dim]
 
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
     # where bkv_stride ~= num_kv_heads * 2 // kv_packing
@@ -616,6 +625,167 @@ def rpa_body(
     k, v, k_scale, v_scale = get_scale_factors(k, v, cfgs=cfgs)
 
     # Step 3: Perform compute.
+    if chunked_b1:
+
+        def _run_chunked_b1(apply_mask: bool):
+            prev_p = prev_alpha_list = prev_q_slice = None
+            for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+                bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
+                bq_len = bq_end - bq_start
+                q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
+                q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
+                q_slice = slice(q_start, q_end)
+
+                q_heads = []
+                for kv_h in range(cfgs.model.num_kv_heads):
+                    row_start = (kv_h * cfgs.bq_sz + bq_start) * q_p
+                    qh = utils.strided_load(
+                        q_ref, row_start, bq_len * q_p, 1, dtype=cfgs.serve.dtype_q
+                    )
+                    q_heads.append(qh[..., : cfgs.compute_kv_head_dim])
+                q_chunk = jnp.stack(q_heads, axis=0)[None]
+
+                custom_mask = (
+                    generate_mask(
+                        shape=(
+                            1,
+                            cfgs.model.num_kv_heads,
+                            q_end - q_start,
+                            cfgs.bkv_sz,
+                        ),
+                        bq_start=bq_start,
+                        step_meta=step_meta,
+                        cfgs=cfgs,
+                    )
+                    if apply_mask
+                    else None
+                )
+                p, alpha_list, _, l_next, m_carry, _ = (
+                    flash_attention.flash_attention_qk_softmax(
+                        step,
+                        q_chunk,
+                        k,
+                        m_scratch_ref[:, q_slice],
+                        l_scratch_ref[:, q_slice],
+                        schedule_ref.is_last_k,
+                        custom_mask=custom_mask,
+                        cfgs=cfgs,
+                        bq_start=bq_start,
+                        k_scale=k_scale,
+                    )
+                )
+                m_scratch_ref[:, q_slice] = m_carry
+                l_scratch_ref[:, q_slice] = l_next[0]
+
+                if prev_p is not None:
+                    o_next, _ = flash_attention.flash_attention_pv(
+                        prev_p,
+                        v,
+                        cast(list[jax.Array], prev_alpha_list),
+                        acc_scratch_ref[:, prev_q_slice],
+                        step,
+                        schedule_ref.is_last_k,
+                        cfgs=cfgs,
+                        v_scale=v_scale,
+                    )
+                    acc_scratch_ref[:, prev_q_slice] = o_next[0]
+
+                prev_p = p
+                prev_alpha_list = alpha_list
+                prev_q_slice = q_slice
+
+            assert prev_p is not None
+            o_next, _ = flash_attention.flash_attention_pv(
+                prev_p,
+                v,
+                cast(list[jax.Array], prev_alpha_list),
+                acc_scratch_ref[:, prev_q_slice],
+                step,
+                schedule_ref.is_last_k,
+                cfgs=cfgs,
+                v_scale=v_scale,
+            )
+            acc_scratch_ref[:, prev_q_slice] = o_next[0]
+
+        can_skip_mask = (
+            cfgs.model.sliding_window is None
+            and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+            and step_meta.local_k_start is None
+            and step_meta.local_k_end is None
+        )
+        if can_skip_mask:
+            is_fully_unmasked = (schedule_ref.s_idx[step, 0] != -1) & (
+                (step_meta.causal_offset[0] + cfgs.bkv_sz - 1) <= 0
+            )
+            jax.lax.cond(
+                is_fully_unmasked,
+                lambda _: _run_chunked_b1(apply_mask=False),
+                lambda _: _run_chunked_b1(apply_mask=True),
+                None,
+            )
+        else:
+            _run_chunked_b1(apply_mask=True)
+
+        # Step 4: Chunked epilogue store to keep peak VREGs bounded at bq_sz >= 512.
+        is_last_k = schedule_ref.is_last_k[step, 0] == 1
+
+        def _store_out_chunked(_):
+            o_ref_2d = (
+                o_vref.at[0].bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
+            )
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            folds = cfgs.aligned_q_head_dim // num_lanes
+            o_ref_flat = o_ref_2d.reshape(o_ref_2d.shape[0] * folds, num_lanes)
+            for kv_h in range(cfgs.model.num_kv_heads):
+                for bq_start in range(0, cfgs.bq_sz, cfgs.bq_c_sz):
+                    bq_end = min(bq_start + cfgs.bq_c_sz, cfgs.bq_sz)
+                    bq_len = bq_end - bq_start
+                    q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
+                    q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
+                    q_slice = slice(q_start, q_end)
+
+                    acc_h = acc_scratch_ref[kv_h, q_slice]
+                    l_h = utils.broadcast_minor(
+                        l_scratch_ref[kv_h, q_slice], acc_h.shape
+                    )
+                    if (
+                        cfgs.serve.dtype_out == jnp.float32
+                        or cfgs.serve.dtype_out == l_h.dtype == jnp.bfloat16
+                    ):
+                        res_h = lax.div(acc_h, l_h)
+                    else:
+                        res_h = acc_h * pl.reciprocal(l_h, approx=True)
+                    out_h = res_h.astype(cfgs.serve.dtype_out)
+
+                    if cfgs.aligned_q_head_dim > cfgs.compute_kv_head_dim:
+                        out_h = jnp.pad(
+                            out_h,
+                            (
+                                (0, 0),
+                                (
+                                    0,
+                                    cfgs.aligned_q_head_dim - cfgs.compute_kv_head_dim,
+                                ),
+                            ),
+                            constant_values=0,
+                        )
+
+                    row_count = bq_len * q_p
+                    out_h_u32 = pltpu.bitcast(out_h, jnp.uint32).reshape(
+                        row_count, cfgs.aligned_q_head_dim
+                    )
+                    row_start = (kv_h * cfgs.bq_sz + bq_start) * q_p
+                    for f_idx in range(folds):
+                        val_slice = out_h_u32[
+                            :, f_idx * num_lanes : (f_idx + 1) * num_lanes
+                        ]
+                        o_ref_flat[
+                            pl.ds(row_start * folds + f_idx, row_count, folds)
+                        ] = val_slice
+
+        jax.lax.cond(is_last_k, _store_out_chunked, lambda _: None, None)
+        return
+
     m_val = m_scratch_ref[...]
     l_val = l_scratch_ref[...]
     acc_val = acc_scratch_ref[...]

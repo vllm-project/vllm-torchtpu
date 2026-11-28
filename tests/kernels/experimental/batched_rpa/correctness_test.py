@@ -1068,6 +1068,72 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         self.assertTrue(np.isfinite(out_f32).all())
         np.testing.assert_allclose(out_f32, ref, atol=3e-2, rtol=2e-2)
 
+    def test_mixed_b1_512_unmasked_prefix_and_tail(self):
+        """Exercise b1-q512-k512-c64 mixed prefill with unmasked prefix, diagonal, and tail."""
+        dtype = jnp.bfloat16
+        num_q_heads = 12
+        num_kv_heads = 2
+        head_dim = 256
+        page_size = 64
+        num_seqs = 8
+        pages_per_seq = 48
+        # 2 decode seqs + 2 prefill seqs: seq2 has 1152 cached + 890 new (spans unmasked
+        # prefix tiles + diagonal tiles + non-512 tail), seq3 has 0 cached + 1150 new.
+        q_lens = [1, 1, 890, 1150, 0, 0, 0, 0]
+        kv_cache_lens = [320, 640, 1152, 0, 0, 0, 0, 0]
+        kv_lens = [c + q for c, q in zip(kv_cache_lens, q_lens)]
+        total_q = 2048  # >= sum(q_lens) = 2042
+        total_pages = num_seqs * pages_per_seq
+
+        rng = np.random.default_rng(77)
+        q = jnp.asarray(rng.standard_normal((total_q, num_q_heads, head_dim)) * 0.4, dtype)
+        k = jnp.asarray(rng.standard_normal((total_q, num_kv_heads, head_dim)) * 0.4, dtype)
+        v = jnp.asarray(rng.standard_normal((total_q, num_kv_heads, head_dim)) * 0.4, dtype)
+        cache_shape = wrapper.get_kv_cache_shape(
+            total_pages, page_size, num_kv_heads, head_dim, dtype
+        )
+        kv_cache = jnp.asarray(rng.standard_normal(cache_shape) * 0.4, dtype)
+        page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+        cu_q_lens = jnp.asarray(np.cumsum([0] + q_lens), dtype=jnp.int32)
+        kv_lens_arr = jnp.asarray(kv_lens, dtype=jnp.int32)
+        distribution = jnp.array([2, 2, 4], dtype=jnp.int32)
+        sm_scale = head_dim**-0.5
+
+        actual_out, actual_cache = wrapper.ragged_paged_attention(
+            q,
+            k,
+            v,
+            kv_cache,
+            kv_lens_arr,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=sm_scale,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        )
+        ref_out, ref_cache = ref_ragged_paged_attention(
+            q,
+            k,
+            v,
+            kv_cache,
+            kv_lens_arr,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=sm_scale,
+        )
+        valid_q = sum(q_lens)
+        actual_f32 = np.asarray(actual_out[:valid_q], np.float32)
+        ref_f32 = np.asarray(ref_out[:valid_q], np.float32)
+        self.assertTrue(np.isfinite(actual_f32).all())
+        np.testing.assert_allclose(actual_f32, ref_f32, atol=3e-2, rtol=2e-2)
+        self.assertTrue(bool(_assert_cache_equal(actual_cache, ref_cache)))
+        # Must-fail positive control.
+        bad = actual_f32.copy()
+        bad[-1, 0, 0] += 0.25
+        with self.assertRaises(AssertionError):
+            np.testing.assert_allclose(bad, ref_f32, atol=3e-2, rtol=2e-2)
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())
