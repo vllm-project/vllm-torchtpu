@@ -184,20 +184,25 @@ def xreq_prefetch_for(B: int) -> int:
 # rel_fetch (trace-time-decoded dense refills; exact): j-01f264b1, bitwise at b4/b8/b16,
 # 3.84 -> 3.67 / 4.11 -> 3.95 / 5.33 -> 5.14 ms per call. No VMEM headroom for deeper rings
 # even at b4 (nbd 14 / nbe 16: 66 MiB of 62).
+# moe.topk_lanes (Batcher top-k on lanes instead of ten cross-lane max reductions; the
+# keys are distinct, so the same picks): tpu_bench_wholestep_call j-05dba402, output hashes
+# identical, -16/-19/-18/-18/-15/-14 us at b4/b8/b16/b24/b32/b48, b64 within noise.
 BUCKET_TUNE: dict[int, dict[str, Any]] = {
-    4: {"rel_fetch": True},
-    8: {"rel_fetch": True},
-    16: {"rel_fetch": True},
+    4: {"rel_fetch": True, "moe.topk_lanes": True},
+    8: {"rel_fetch": True, "moe.topk_lanes": True},
+    16: {"rel_fetch": True, "moe.topk_lanes": True},
     # exos j-fd684c46 (bitwise): b24 6.46 -> 6.27, b32 7.32 -> 7.19 ms. lazy=false and the
     # nbe/nbd trades (14/8, 10/12, 8/8) are within noise or worse on top of rel_fetch.
-    24: {"rel_fetch": True},
-    32: {"rel_fetch": True},
+    24: {"rel_fetch": True, "moe.topk_lanes": True},
+    32: {"rel_fetch": True, "moe.topk_lanes": True},
+    48: {"moe.topk_lanes": True},
 }
 # VLLM_TPU_MK_BUCKET_TUNE_WIDE=1 (default off): rel_fetch at b48/b64 too (the L45 partial-cycle
 # hang is fixed; exos c32 served env: b48 -266/-245, b64 -104/-105 us per call at ctx 20K/50K,
 # output hash identical, ~/q38f/mkc32/mk_c32_budget.md section 8).
 if os.environ.get("VLLM_TPU_MK_BUCKET_TUNE_WIDE", "0") == "1":
-    BUCKET_TUNE.update({48: {"rel_fetch": True}, 64: {"rel_fetch": True}})
+    for _b in (48, 64):
+        BUCKET_TUNE.setdefault(_b, {})["rel_fetch"] = True
 
 
 def _tile_value(v: Any) -> Any:
