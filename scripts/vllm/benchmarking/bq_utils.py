@@ -20,6 +20,9 @@ metrics element's type names the tool that produced its payload (e.g.
 'vllm_bench', 'lm_eval'); values keeps that tool's flat leaf keys
 verbatim, so generic names (completed, failed, duration) can't clash with
 other harnesses writing to the shared table and provenance stays explicit.
+
+Numbers computed from a tool's payload (bench_metrics.derived_metrics) go in
+an element of their own, 'derived', so the tool's payload stays verbatim.
 """
 
 import json
@@ -59,6 +62,12 @@ BENCH_METRIC_FIELDS = (
     "total_input_tokens",
     "total_output_tokens",
     "duration",
+    # Present only when the server runs speculative decoding.
+    "spec_decode_acceptance_rate",
+    "spec_decode_acceptance_length",
+    "spec_decode_num_drafts",
+    "spec_decode_draft_tokens",
+    "spec_decode_accepted_tokens",
 )
 
 

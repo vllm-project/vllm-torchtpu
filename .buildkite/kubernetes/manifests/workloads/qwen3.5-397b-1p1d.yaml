@@ -223,7 +223,9 @@ spec:
                   value: "0"
                 - name: PYTHONUNBUFFERED
                   value: "1"
-                command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/disagg_benchmark.sh"]
+                # The chips each engine above requests, which the rows report
+                # throughput per chip over.
+                command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/disagg_benchmark.sh", "--prefill-chips=4", "--decode-chips=4"]
                 # Request equals limit, so this is Guaranteed: it holds no
                 # chips and shares a worker-cpu node, so the bound is real.
                 resources:
