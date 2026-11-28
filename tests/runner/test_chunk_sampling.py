@@ -78,6 +78,9 @@ def _runner(*, all_greedy: bool = True, spec_k: int | None = None) -> SimpleName
     ):
         setattr(runner, fn.__name__, fn.__get__(runner))
     runner.sample_from_logits_func = TPUModelRunner.sample_from_logits.__get__(runner)
+    runner.sample_with_processed_logits = (
+        TPUModelRunner.sample_with_processed_logits.__get__(runner)
+    )
     return runner
 
 
@@ -344,6 +347,46 @@ def test_plain_chunk_processors_run_in_order_after_the_masks(
     assert int(selected[0, 0]) == 40
     # Logprobs see none of the processors.
     assert logprob_logits[0, 50].item() == -3.0
+
+
+@pytest.mark.parametrize("all_greedy", [True, False], ids=["greedy", "sampled"])
+def test_plain_chunk_processed_logits_include_masks_and_processors(
+    all_greedy: bool,
+) -> None:
+    runner = _runner(all_greedy=all_greedy)
+    runner.input_batch.no_top_k = False
+    runner.structured_decoding_manager = _grammar_blocking(99)
+    raw = torch.full((4, 128), -20.0)
+    raw[0, 99], raw[0, 12], raw[0, 50], raw[0, 40] = 20.0, 9.0, -3.0, 6.0
+    events: list[str] = []
+    procs = [_PlainRecorder("p1", 50, 7.0, events)]
+
+    selected, logprob_logits = runner._sample_plain_chunk(
+        raw.clone(),
+        cur_start_idx=0,
+        cur_end_idx=1,
+        top_tokens=False,
+        all_greedy=all_greedy,
+        sampling_generator=torch.Generator().manual_seed(0),
+        grammar_output=object(),
+        scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+        is_spec_step=False,
+        min_toks=_below_min_tokens(12),
+        processors=procs,
+        need_processed_logits=True,
+    )
+
+    assert logprob_logits[0, 99].item() == NEG_INF
+    assert logprob_logits[0, 12].item() == NEG_INF
+    if all_greedy:
+        assert int(selected[0, 0]) == 50
+        assert logprob_logits[0, 50].item() == pytest.approx(7.0)
+        assert logprob_logits[0, 40].item() == pytest.approx(6.0)
+    else:
+        assert int(selected[0, 0]) in (50, 40)
+        assert logprob_logits[0, 50].item() == pytest.approx(7.0 / 0.7, rel=1e-6)
+        assert logprob_logits[0, 40].item() == pytest.approx(6.0 / 0.7, rel=1e-6)
+        assert int(torch.isfinite(logprob_logits[0]).sum().item()) == 2
 
 
 def test_plain_chunk_top_tokens_overrides_in_order_then_on_sampled() -> None:

@@ -1232,6 +1232,14 @@ class TpuPlatform(Platform):
                 "TPU supports rejection_sample_method 'standard' and 'synthetic' "
                 f"(got {speculative_config.rejection_sample_method!r})."
             )
+        if speculative_config is not None and model_config is not None:
+            from vllm.config.model import PROCESSED_LOGPROBS_MODES
+
+            if model_config.logprobs_mode in PROCESSED_LOGPROBS_MODES:
+                raise NotImplementedError(
+                    f"logprobs_mode={model_config.logprobs_mode!r} is not "
+                    "supported with speculative decoding on TPU."
+                )
         is_attention_free = (
             model_config.is_attention_free if model_config is not None else False
         )

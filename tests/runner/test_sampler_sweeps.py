@@ -80,6 +80,7 @@ def _runner(seen, speculative=False):
         speculative_config=(
             SimpleNamespace(num_speculative_tokens=3) if speculative else None
         ),
+        model_config=SimpleNamespace(logprobs_mode="raw_logprobs"),
         _mtp_prefill_only=False,
         _greedy_head_owner=None,
         _thinking_budget=ThinkingBudgetTracker(
@@ -202,7 +203,9 @@ def test_rotated_sweeps_hold_no_collective():
     check whose positive controls are in test_rejection_sampler_sweep.py."""
     vocab, n = 2 * CANDIDATE_BLOCK, 8
     logits = torch.randn(n, vocab)
-    runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=5))
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(max_logprobs=5, logprobs_mode="raw_logprobs")
+    )
     runner._apply_temperature = lambda lg, t: TPUModelRunner._apply_temperature(
         runner, lg, t
     )
@@ -222,6 +225,19 @@ def test_rotated_sweeps_hold_no_collective():
             torch.zeros(n, 1, dtype=torch.int32),
             torch.ones(n, 1),
             all_greedy=all_greedy,
+            topk_candidates=topk_candidates,
+            apply_topk_topp=apply_topk_topp,
+        )
+    bf16_logits = logits.to(torch.bfloat16)
+    for topk_candidates, apply_topk_topp in [(0, False), (0, True), (2, True)]:
+        graphs += _trace(
+            TPUModelRunner.sample_with_processed_logits,
+            runner,
+            bf16_logits,
+            torch.ones(n, 1, dtype=torch.float32),
+            torch.rand_like(logits),
+            torch.zeros(n, 1, dtype=torch.int32),
+            torch.ones(n, 1, dtype=torch.float32),
             topk_candidates=topk_candidates,
             apply_topk_topp=apply_topk_topp,
         )

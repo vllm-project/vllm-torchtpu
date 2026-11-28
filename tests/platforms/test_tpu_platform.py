@@ -439,6 +439,30 @@ class TestTpuPlatform:
             TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
+        ("mode", "should_reject"),
+        [
+            ("raw_logprobs", False),
+            ("raw_logits", False),
+            ("processed_logprobs", True),
+            ("processed_logits", True),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_speculative_with_processed_logprobs(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, mode, should_reject
+    ):
+        vllm_config.model_config.logprobs_mode = mode
+        vllm_config.speculative_config = MagicMock(rejection_sample_method="standard")
+        if should_reject:
+            with pytest.raises(NotImplementedError, match="speculative decoding"):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
         [
             ("all", None, False, "mamba_cache_mode='align'"),
