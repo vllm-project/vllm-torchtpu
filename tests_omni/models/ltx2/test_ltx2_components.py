@@ -514,6 +514,106 @@ def test_ltx2_tiny_transformer_parity(
         )
 
 
+@pytest.mark.parametrize(
+    ("dtype", "max_rel_l2", "max_abs"),
+    [
+        pytest.param(torch.float32, 1e-4, 1e-4, id="fp32"),
+        pytest.param(torch.bfloat16, 5e-3, 1e-2, id="bf16"),
+    ],
+)
+@torch.no_grad()
+def test_ltx2_tiny_transformer_per_batch_timestep_matches_expanded(
+    dtype: torch.dtype,
+    max_rel_l2: float,
+    max_abs: float,
+    omni_ctx: None,
+) -> None:
+    """1-D (B,) timesteps broadcast identically to expanded (B, T) in the DiT."""
+    torch.manual_seed(0)
+    ref_model = RefLTX2Transformer3DModel(**TINY_DIT_CONFIG).eval()
+    with set_default_torch_dtype(dtype):
+        omni_model = LTX2VideoTransformer3DModel(**TINY_DIT_CONFIG)
+    loaded = omni_model.load_weights(ref_model.state_dict().items())
+    assert_all_loaded(loaded, omni_model)
+    tpu = torch.device("tpu")
+    omni_model = omni_model.to(device=tpu, dtype=dtype).eval()
+
+    batch_size = 2
+    f_lat, h_lat, w_lat = DIT_LATENT_GRID
+    seq_v = f_lat * h_lat * w_lat
+    gen = torch.Generator(device="cpu").manual_seed(1)
+    video_coords = omni_model.rope.prepare_video_coords(
+        batch_size=batch_size,
+        num_frames=f_lat,
+        height=h_lat,
+        width=w_lat,
+        device=tpu,
+        fps=24.0,
+    )
+    audio_coords = omni_model.audio_rope.prepare_audio_coords(
+        batch_size=batch_size, num_frames=DIT_AUDIO_LEN, device=tpu
+    )
+    common: dict[str, object] = {
+        "hidden_states": torch.randn(
+            batch_size, seq_v, int(TINY_DIT_CONFIG["in_channels"]), generator=gen
+        ).to(device=tpu, dtype=dtype),
+        "audio_hidden_states": torch.randn(
+            batch_size,
+            DIT_AUDIO_LEN,
+            int(TINY_DIT_CONFIG["audio_in_channels"]),
+            generator=gen,
+        ).to(device=tpu, dtype=dtype),
+        "encoder_hidden_states": torch.randn(
+            batch_size,
+            DIT_TEXT_LEN,
+            int(TINY_DIT_CONFIG["caption_channels"]),
+            generator=gen,
+        ).to(device=tpu, dtype=dtype),
+        "audio_encoder_hidden_states": torch.randn(
+            batch_size,
+            DIT_TEXT_LEN,
+            int(TINY_DIT_CONFIG["caption_channels"]),
+            generator=gen,
+        ).to(device=tpu, dtype=dtype),
+        "num_frames": f_lat,
+        "height": h_lat,
+        "width": w_lat,
+        "fps": 24.0,
+        "audio_num_frames": DIT_AUDIO_LEN,
+        "video_coords": video_coords,
+        "audio_coords": audio_coords,
+        "return_dict": False,
+    }
+    ts_1d = torch.tensor([900.0, 450.0], device=tpu, dtype=dtype)
+    ts_video_2d = ts_1d.reshape(batch_size, 1).expand(batch_size, seq_v).contiguous()
+    ts_audio_2d = (
+        ts_1d.reshape(batch_size, 1).expand(batch_size, DIT_AUDIO_LEN).contiguous()
+    )
+
+    video_1d, audio_1d = omni_model(**common, timestep=ts_1d, audio_timestep=ts_1d)
+    video_2d, audio_2d = omni_model(
+        **common, timestep=ts_video_2d, audio_timestep=ts_audio_2d
+    )
+
+    # Confirm the outputs depend on the timestep (must-fail control).
+    ts_alt = torch.tensor([100.0, 100.0], device=tpu, dtype=dtype)
+    video_alt, audio_alt = omni_model(**common, timestep=ts_alt, audio_timestep=ts_alt)
+    assert not torch.allclose(video_1d.float().cpu(), video_alt.float().cpu())
+    assert not torch.allclose(audio_1d.float().cpu(), audio_alt.float().cpu())
+
+    for modality, out_1d, out_2d in (
+        ("video", video_1d, video_2d),
+        ("audio", audio_1d, audio_2d),
+    ):
+        assert_parity(
+            out_1d.float().cpu(),
+            out_2d.float().cpu(),
+            name=f"DiT per-batch vs expanded timestep {modality} ({dtype})",
+            max_rel_l2=max_rel_l2,
+            max_abs=max_abs,
+        )
+
+
 # --------------------------------------------------------------------------- #
 # 3. Tiny random-weight LTX2TextConnectors + _install_connector_attention
 # --------------------------------------------------------------------------- #
