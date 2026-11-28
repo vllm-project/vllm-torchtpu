@@ -347,6 +347,7 @@ def _verify_chunk(monkeypatch, synthetic):
         bonus_logits_indices=torch.tensor(bonus_rows, dtype=torch.int32),
         segment_ids=torch.tensor(segments, dtype=torch.int64),
         group_indices=torch.tensor(groups, dtype=torch.int32),
+        draft_flags=None,
     )
     spec_config = SimpleNamespace(
         num_speculative_tokens=K,

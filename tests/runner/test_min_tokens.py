@@ -784,6 +784,7 @@ def _one_request_verify_md():
         final_logits_indices=torch.arange(4, dtype=torch.int32),
         segment_ids=torch.tensor([0, 0, 0], dtype=torch.int64),
         group_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+        draft_flags=None,
     )
     return logits, md
 
@@ -854,6 +855,7 @@ def _verify(
         bonus_logits_indices=torch.tensor([3, 5], dtype=torch.int32),
         segment_ids=torch.tensor([0, 0, 0, 1], dtype=torch.int64),
         group_indices=torch.tensor([0, 1, 2, 0], dtype=torch.int32),
+        draft_flags=None,
     )
     spec_config = SimpleNamespace(
         num_speculative_tokens=3,

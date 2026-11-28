@@ -236,7 +236,7 @@ from vllm_torchtpu.spec_decode.utils import (
     fit_rows,
     handoff_seed_tokens,
 )
-from vllm_torchtpu.structured_decoding import StructuredDecodingManager
+from vllm_torchtpu.structured_decoding import StructuredDecodingManager, gaad
 from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
@@ -1541,7 +1541,10 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler = RejectionSampler(
                 self.speculative_config, self.device
             )
-            if self.speculative_config.method == "ngram":
+            if gaad.is_standalone(self.speculative_config):
+                # GaaD alone: the scheduler plans every draft from the grammar.
+                self.drafter = None
+            elif self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "dflash":
                 self.drafter = DFlashProposer(self, self.vllm_config)
@@ -3266,6 +3269,19 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
+    def _fit_draft_row(self, drafts: torch.Tensor) -> torch.Tensor:
+        """``[rows, k]`` drafts padded to the ``K`` columns of a source span.
+
+        With GaaD the drafter fills only its share of the row
+        (``gaad.draft_limit``), and an async step then schedules only that
+        share, so the padding is never substituted.
+        """
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        if drafts.shape[1] >= k:
+            return drafts
+        return torch.nn.functional.pad(drafts, (0, k - drafts.shape[1]))
+
     def _scheduled_draft_counts(
         self,
         req_offset: int,
@@ -3396,7 +3412,9 @@ class TPUModelRunner(GPUModelRunner):
             drafts_per_chunk,
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
-            drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            drafts_chunk = self._fit_draft_row(
+                fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            )
             src = assemble_spec_next_tokens(
                 nt_chunk, drafts_chunk, None if bucketed else num_reqs
             )
@@ -3468,7 +3486,9 @@ class TPUModelRunner(GPUModelRunner):
             flat = sel.view(-1)
             chunk_padded_num_reqs = flat.shape[0] if bucketed else n
             bonus = (flat if bucketed else flat[:n]).unsqueeze(1)  # [rows, 1]
-            drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            drafts_chunk = self._fit_draft_row(
+                fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            )
             src = torch.cat(
                 [bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1
             )  # [chunk_padded_num_reqs, 1+K] = [bonus, draft_1..K]
@@ -3857,6 +3877,17 @@ class TPUModelRunner(GPUModelRunner):
                         # device and uploads the host copy only as a fallback.
                         defer_draft_token_ids=bool(
                             self.scheduler_config.async_scheduling
+                        ),
+                        scheduled_spec_decode_flags=getattr(
+                            scheduler_output, "scheduled_spec_decode_flags", None
+                        ),
+                        start_index=start_index,
+                        # Logprobs and min_tokens read every verify row by
+                        # position, so only skip GRAMMAR rows without them.
+                        skip_grammar_rows=(
+                            gaad.is_enabled(self.vllm_config)
+                            and self.input_batch.max_num_logprobs is None
+                            and not self._min_tokens
                         ),
                     )
                 )
@@ -4453,6 +4484,15 @@ class TPUModelRunner(GPUModelRunner):
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
+        if self.scheduler_config.async_scheduling and gaad.follows_commit(
+            scheduler_output
+        ):
+            # The engine committed the step in flight before scheduling this
+            # one (gaad.patch_engine_core). Commit it here too, before the
+            # cached state reads the scheduler's exact counts, so the step
+            # takes its tokens and drafts from the host, nothing substituted.
+            self._modify_prev_results()
+            self._pre_async_results = None
         # Update cached state
         self._update_states(scheduler_output)
         if self._routed_experts is not None:
@@ -5749,6 +5789,7 @@ class TPUModelRunner(GPUModelRunner):
         # also draw the recovery noise and verify on their sampling params.
         do_sampling = params is not None
         accept_u = None
+        assert self.rejection_sampler is not None
         if self.rejection_sampler.synthetic_mode or do_sampling:
             accept_u = torch.rand(
                 draft_token_ids.shape,
@@ -5786,6 +5827,7 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
+            draft_flags=md.draft_flags,
         )
         for proc in processors:
             proc.finish(next_tokens)
@@ -7425,6 +7467,21 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+                if (
+                    gaad.is_enabled(self.vllm_config)
+                    and self.speculative_config is not None
+                ):
+                    # A verify step's logits rows are a token bucket; GaaD drops
+                    # GRAMMAR rows, so any bucket up to the step's tokens occurs.
+                    for num_rows in self.num_tokens_paddings:
+                        if num_rows > num_tokens:
+                            break
+                        indices = torch.zeros(num_rows, dtype=torch.int32).to(
+                            self.device
+                        )
+                        synchronize_tensors(
+                            self.compute_selected_logits(dummy_hidden, indices)
+                        )
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -7866,6 +7923,12 @@ class TPUModelRunner(GPUModelRunner):
                 warm_accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(
                     self.device
                 )
+                # With GaaD every verify passes flags (a separate graph).
+                warm_draft_flags = (
+                    torch.ones(num_tokens, dtype=torch.int32).to(self.device)
+                    if gaad.is_enabled(self.vllm_config)
+                    else None
+                )
                 # --- greedy verify path (do_sampling=False) ---
                 bonus_token_ids, target_logits_warm = self.spec_bonus_and_target_logits(
                     dummy_logits, bonus_logits_indices, target_logits_indices
@@ -7881,6 +7944,7 @@ class TPUModelRunner(GPUModelRunner):
                     accept_u=(
                         warm_accept_u if self.rejection_sampler.synthetic_mode else None
                     ),
+                    draft_flags=warm_draft_flags,
                 )
                 synchronize_tensors(out)
                 if self._greedy_head_owner is not None:
@@ -7898,6 +7962,25 @@ class TPUModelRunner(GPUModelRunner):
                 _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
                     dummy_logits, bonus_logits_indices, target_logits_indices
                 )
+                if gaad.is_enabled(self.vllm_config):
+                    # GaaD computes logits only for MODEL and bonus rows, so the
+                    # gather also reads from fewer rows: every smaller bucket that
+                    # still holds one row per request.
+                    for num_rows in self.num_tokens_paddings:
+                        if num_rows >= num_tokens:
+                            break
+                        if num_rows < num_reqs:
+                            continue
+                        synchronize_tensors(
+                            self.spec_gather_bonus_and_target_logits(
+                                torch.zeros(
+                                    (num_rows, self.vocab_size),
+                                    dtype=self._hidden_states_dtype,
+                                ).to(self.device),
+                                bonus_logits_indices,
+                                target_logits_indices,
+                            )
+                        )
                 warm_temps = torch.zeros(
                     (num_tokens, 1),
                     dtype=self._hidden_states_dtype,
@@ -7933,6 +8016,7 @@ class TPUModelRunner(GPUModelRunner):
                         do_sampling=True,
                         topk_candidates=topk_candidates,
                         apply_topk_topp=apply_topk_topp,
+                        draft_flags=warm_draft_flags,
                     )
                     synchronize_tensors(out)
                 logger.info(

@@ -4051,6 +4051,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         draft_lengths=torch.ones((2,), dtype=torch.int32),
         segment_ids=torch.tensor([0, 1], dtype=torch.int32),
         group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
+        draft_flags=None,
     )
     TPUModelRunner._sample_spec_verify_chunk(
         spec_runner,

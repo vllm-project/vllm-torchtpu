@@ -73,6 +73,7 @@ class RejectionSampler:
         target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
         draft_probs: torch.Tensor | None = None,
+        draft_flags: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -92,6 +93,7 @@ class RejectionSampler:
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
             draft_probs=draft_probs,
+            draft_flags=draft_flags,
         )
 
     def forward(
@@ -113,6 +115,7 @@ class RejectionSampler:
         target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
         draft_probs: torch.Tensor | None = None,
+        draft_flags: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -146,6 +149,10 @@ class RejectionSampler:
             from (probabilistic drafting), shaped like target_logits. None
             treats the draft as one-hot (greedy drafting). Used by the
             non-greedy path; the greedy and synthetic decisions ignore it.
+          draft_flags: int32 per-draft-token provenance, shaped like
+            draft_token_ids (0 EMPTY, 1 MODEL, 2 GRAMMAR). A GRAMMAR draft is
+            accepted without comparing it with the target; a rejected draft
+            ahead of it still rejects it. None treats every draft as MODEL.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -201,6 +208,7 @@ class RejectionSampler:
                 topk_candidates,
                 apply_topk_topp,
                 draft_probs,
+                draft_flags,
             )
         if draft_probs is not None:
             # As upstream, greedy verification is an argmax match; q plays no
@@ -222,6 +230,7 @@ class RejectionSampler:
                 accept_u,
                 self.synthetic_conditional_rates,
                 self.synthetic_mode,
+                draft_flags,
             )
         if target_logits is None:
             raise ValueError(
@@ -238,6 +247,7 @@ class RejectionSampler:
             accept_u,
             self.synthetic_conditional_rates,
             self.synthetic_mode,
+            draft_flags,
         )
 
 
@@ -282,6 +292,7 @@ def _greedy_rejection_sample_with_segment(
     accept_u: torch.Tensor | None,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    draft_flags: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized greedy speculative decoding validation in Torch."""
     return _greedy_rejection_sample(
@@ -295,6 +306,7 @@ def _greedy_rejection_sample_with_segment(
         accept_u,
         synthetic_conditional_rates,
         synthetic_mode,
+        draft_flags,
     )
 
 
@@ -310,6 +322,7 @@ def _greedy_rejection_sample_from_argmax(
     accept_u: torch.Tensor | None,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    draft_flags: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Greedy validation from the target's argmax tokens, without logits."""
     return _greedy_rejection_sample(
@@ -323,6 +336,7 @@ def _greedy_rejection_sample_from_argmax(
         accept_u,
         synthetic_conditional_rates,
         synthetic_mode,
+        draft_flags,
     )
 
 
@@ -337,6 +351,7 @@ def _greedy_rejection_sample(
     accept_u: torch.Tensor | None,
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
+    draft_flags: torch.Tensor | None = None,
 ) -> torch.Tensor:
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
@@ -372,6 +387,9 @@ def _greedy_rejection_sample(
         else:
             # A -1 (grammar-invalidated) draft never equals an argmax token.
             accepted = draft_token_ids == target_logits_argmax
+        if draft_flags is not None:
+            is_grammar = (draft_flags.to(device) == 2) & (draft_token_ids >= 0)
+            accepted = is_grammar | accepted
         mismatch_indices = torch.where(
             valid_slot_mask & ~accepted,
             group_indices,
@@ -483,6 +501,7 @@ def _random_rejection_sample_with_segment(
     topk_candidates: int = 0,
     apply_topk_topp: bool = True,
     draft_probs: torch.Tensor | None = None,
+    draft_flags: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch.
 
@@ -546,6 +565,9 @@ def _random_rejection_sample_with_segment(
             draft_token_ids == target_logits_argmax,
             random_accept,
         )
+    if draft_flags is not None:
+        is_grammar = draft_flags.to(device) == 2
+        accepted = is_grammar | accepted
     accepted = accepted & valid_draft_token_ids
 
     # On rejection, resample from the residual max(0, p - q). Placeholder
