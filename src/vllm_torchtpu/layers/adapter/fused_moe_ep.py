@@ -1066,6 +1066,12 @@ def fused_moe_ep_unsupported_reason(
     supplies_hash_ids=False,
 ) -> str | None:
     """Validate prepared (or meta) weights and routing before installation."""
+    sublanes = _num_sublanes()
+    if sublanes != U32_SUBLANE_TILE:
+        return (
+            f"fused EP v2 assumes {U32_SUBLANE_TILE}-sublane u32 tiling; "
+            f"this chip has {sublanes} sublanes"
+        )
     w1, w2, w1_scale, w2_scale = weights
     if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != w1.shape[0]:
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"
@@ -1252,6 +1258,16 @@ def _smem_capacity_bytes() -> int:
         return int(pltpu.get_tpu_info().smem_capacity_bytes)
     except Exception:  # noqa: BLE001 - CPU host, or an unknown device kind
         return 1024 * 1024
+
+
+def _num_sublanes() -> int:
+    """This chip's sublane count, or U32_SUBLANE_TILE outside a device process."""
+    try:
+        from jax.experimental.pallas import tpu as pltpu
+
+        return int(pltpu.get_tpu_info().num_sublanes)
+    except Exception:  # noqa: BLE001 - CPU host, or an unknown device kind
+        return U32_SUBLANE_TILE
 
 
 def _pcp_size(layer) -> int:
