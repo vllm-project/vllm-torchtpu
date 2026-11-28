@@ -333,7 +333,9 @@ _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
 # same way. They are discovered rather than listed, so a model that adds one is
 # covered without editing this file. Only directories with one of these names
 # are discovered: a custom-op wrapper anywhere else in a model directory is
-# hashed only if it is listed in _RUNTIME_CACHE_KEY_PATHS.
+# hashed only if it is listed in _RUNTIME_CACHE_KEY_PATHS or registered by the
+# model directory with `register_compile_cache_key` (below), which also adds
+# the model's own settings.
 _MODEL_KERNELS_ROOT = "vllm_torchtpu/models"
 _MODEL_CACHE_KEY_DIRNAMES = ("kernels", "ops")
 
@@ -356,11 +358,93 @@ def _model_cache_key_relpaths(repo_root: Path) -> list[str]:
     ]
 
 
+# Sources and settings that model directories add to the compile cache key
+# (`register_compile_cache_key`) beyond the discovered `kernels/` and `ops/`
+# dirs: other files their graphs depend on, and their own settings, which are
+# not in envs.py.
+_MODEL_CACHE_KEY_PATHS: dict[str, tuple[str, ...]] = {}
+# Per-owner callables that derive, from the VllmConfig, the model settings that
+# can change a compiled graph; their results land under `model:<owner>` in the
+# env factors.
+_MODEL_ENV_FACTORS: dict[str, Callable[[VllmConfig], dict[str, Any]]] = {}
+# Set once this process computed the compile hash; later registry changes raise.
+_COMPILE_HASH_COMPUTED = False
+
+
+def _source_root() -> Path:
+    """The directory that holds the `vllm_torchtpu` package.
+
+    Cache key paths (`_RUNTIME_CACHE_KEY_PATHS`, registered paths) are
+    relative to it, e.g. `vllm_torchtpu/models/<model>/pool_layout.py`.
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def register_compile_cache_key(
+    owner: str,
+    *,
+    paths: tuple[str, ...] = (),
+    env_factors: Callable[[VllmConfig], dict[str, Any]] | None = None,
+) -> None:
+    """Add a model directory's sources and settings to the compile cache key.
+
+    `paths` are files or directories relative to the directory that holds
+    the `vllm_torchtpu` package (`vllm_torchtpu/...`, not `src/...`), hashed
+    like `_RUNTIME_CACHE_KEY_PATHS`; a path that is not an existing file or
+    directory there raises. `env_factors(vllm_config)` derives from the config
+    every setting the model's graphs, kernels and ops read that can change a
+    compiled graph; its values must be JSON-serializable.
+
+    The registry is per process: call this from the model directory's
+    registration hook, which runs in every process (worker included) before
+    the first compile. Registering an owner again with the same paths and
+    callable is a no-op; with different ones it raises, so two directories
+    cannot share an owner name and silently drop one entry. A new owner
+    registered after this process computed the compile hash raises too,
+    since the AOT and piecewise keys already in use would not include it.
+    """
+    paths = tuple(paths)
+    if owner in _MODEL_CACHE_KEY_PATHS:
+        if (
+            _MODEL_CACHE_KEY_PATHS[owner] != paths
+            or _MODEL_ENV_FACTORS.get(owner) is not env_factors
+        ):
+            raise RuntimeError(
+                f"register_compile_cache_key({owner!r}): the owner is already "
+                "registered with different paths or env_factors"
+            )
+        return
+    if _COMPILE_HASH_COMPUTED:
+        raise RuntimeError(
+            f"register_compile_cache_key({owner!r}) called after the compile "
+            "hash was computed; register from the model's registration hook"
+        )
+    root = _source_root()
+    for rel_path in paths:
+        path = root / rel_path
+        if not (path.is_file() or path.is_dir()):
+            raise ValueError(
+                f"register_compile_cache_key({owner!r}): {rel_path!r} is not a "
+                f"file or directory under {root}"
+            )
+    _MODEL_CACHE_KEY_PATHS[owner] = paths
+    if env_factors is not None:
+        _MODEL_ENV_FACTORS[owner] = env_factors
+
+
+def _registered_cache_key_paths() -> tuple[str, ...]:
+    return tuple(p for _, ps in sorted(_MODEL_CACHE_KEY_PATHS.items()) for p in ps)
+
+
 def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
     """Return runtime source files that affect TPU custom-op lowering."""
     files_by_relpath: dict[str, Path] = {}
 
-    for rel_path in (*_RUNTIME_CACHE_KEY_PATHS, *_model_cache_key_relpaths(repo_root)):
+    for rel_path in (
+        *_RUNTIME_CACHE_KEY_PATHS,
+        *_model_cache_key_relpaths(repo_root),
+        *_registered_cache_key_paths(),
+    ):
         path = repo_root / rel_path
         if path.is_file():
             files_by_relpath[rel_path] = path
@@ -436,8 +520,19 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
+def _model_env_factors(vllm_config: VllmConfig) -> dict[str, Any]:
+    """Settings that registered model directories derive from `vllm_config`,
+    keyed `model:<owner>` (empty when no directory registered)."""
+    return {
+        f"model:{owner}": model_factors(vllm_config)
+        for owner, model_factors in sorted(_MODEL_ENV_FACTORS.items())
+    }
+
+
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
+    global _COMPILE_HASH_COMPUTED
+    _COMPILE_HASH_COMPUTED = True
     # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
     from vllm_torchtpu.tpu_info import get_libtpu_cache_key
 
@@ -450,7 +545,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "jax": importlib_metadata.version("jax"),
         "jaxlib": importlib_metadata.version("jaxlib"),
         "libtpu": get_libtpu_cache_key(),
-        "env": _tpu_compile_env_factors(),
+        "env": {**_tpu_compile_env_factors(), **_model_env_factors(vllm_config)},
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
@@ -490,7 +585,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         },
     }
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = _source_root()
     hash_obj = hashlib.sha256(
         json.dumps(factors, sort_keys=True, separators=(",", ":")).encode()
     )

@@ -70,6 +70,32 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(autouse=True)
+def _reset_compile_cache_key_registry():
+    """`compute_tpu_compilation_hash` marks the compile cache key registry as
+    in use for the life of the process, so without this a test that registers
+    a model directory passes or fails depending on what ran before it.
+
+    Looked up in sys.modules rather than imported, so tests that never touch
+    the compiler do not pay for (or depend on) its torch_tpu and vLLM imports;
+    a module first imported during the test is restored to its import state.
+    """
+    name = "vllm_torchtpu.compilation.tpu_compiler"
+    before = sys.modules.get(name)
+    paths = dict(before._MODEL_CACHE_KEY_PATHS) if before else {}
+    factors = dict(before._MODEL_ENV_FACTORS) if before else {}
+    computed = before._COMPILE_HASH_COMPUTED if before else False
+    yield
+    tpu_compiler = sys.modules.get(name)
+    if tpu_compiler is None:
+        return
+    tpu_compiler._MODEL_CACHE_KEY_PATHS.clear()
+    tpu_compiler._MODEL_CACHE_KEY_PATHS.update(paths)
+    tpu_compiler._MODEL_ENV_FACTORS.clear()
+    tpu_compiler._MODEL_ENV_FACTORS.update(factors)
+    tpu_compiler._COMPILE_HASH_COMPUTED = computed
+
+
+@pytest.fixture(autouse=True)
 def _reset_warning_once():
     """`warning_once` dedups by message for the life of the process, so without
     this a test passes or fails depending on what ran before it."""

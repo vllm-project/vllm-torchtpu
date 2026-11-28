@@ -1572,3 +1572,117 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+class TestModelDirectoryCacheKey:
+    """`register_compile_cache_key`, through `compute_tpu_compilation_hash`.
+
+    The autouse `_reset_compile_cache_key_registry` fixture (tests/conftest.py)
+    restores the registry and the computed-hash flag after each test.
+    """
+
+    @pytest.fixture
+    def tree(self, tmp_path, monkeypatch):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        root = tmp_path.resolve()
+        for rel in (
+            "vllm_torchtpu/compilation/tpu_compiler.py",
+            "vllm_torchtpu/models/foo/README.md",
+            "vllm_torchtpu/models/foo/model.py",
+            "vllm_torchtpu/models/foo/pool_layout.py",
+            "vllm_torchtpu/models/foo/experimental/kernels/k.py",
+            "vllm_torchtpu/models/foo/experimental/ops/op.py",
+        ):
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# x\n")
+        # The source root (cache key paths are relative to it) comes from
+        # __file__.
+        monkeypatch.setattr(
+            tpu_compiler,
+            "__file__",
+            str(root / "vllm_torchtpu/compilation/tpu_compiler.py"),
+        )
+        monkeypatch.setattr(tpu_compiler, "_RUNTIME_CACHE_KEY_PATHS", ())
+        return root
+
+    @staticmethod
+    def _key(config=None):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        return tpu_compiler.compute_tpu_compilation_hash(
+            config or TestTpuCompilerCache._config()
+        )
+
+    def test_registered_paths_and_settings_change_the_key(self, tree, monkeypatch):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        unregistered = self._key()
+        # A new process: the registration hook runs before the first hash.
+        monkeypatch.setattr(tpu_compiler, "_COMPILE_HASH_COMPUTED", False)
+
+        def factors(vllm_config):
+            # Derived from the config, not from process state.
+            return {"MAMBA_BLOCK": vllm_config.cache_config.mamba_block_size}
+
+        tpu_compiler.register_compile_cache_key(
+            "foo",
+            paths=("vllm_torchtpu/models/foo/pool_layout.py",),
+            env_factors=factors,
+        )
+        hashed = {
+            p.relative_to(tree).as_posix()
+            for p in tpu_compiler._iter_runtime_cache_key_files(tree)
+        }
+        assert "vllm_torchtpu/models/foo/pool_layout.py" in hashed
+        assert "vllm_torchtpu/models/foo/model.py" not in hashed
+
+        keys = [unregistered, self._key()]
+        (tree / "vllm_torchtpu/models/foo/pool_layout.py").write_text("# y\n")
+        keys.append(self._key())
+        config = TestTpuCompilerCache._config()
+        config.cache_config.mamba_block_size = 1024  # not in the base key
+        keys.append(self._key(config))
+        assert len(set(keys)) == len(keys)
+
+        # The hash is computed: a new owner would miss the keys in use.
+        with pytest.raises(RuntimeError, match="after the compile hash was computed"):
+            tpu_compiler.register_compile_cache_key("bar")
+        # Repeating the same registration stays harmless.
+        tpu_compiler.register_compile_cache_key(
+            "foo",
+            paths=("vllm_torchtpu/models/foo/pool_layout.py",),
+            env_factors=factors,
+        )
+
+    def test_conflicting_owner_and_bad_paths_raise(self, tree):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        def factors(vllm_config):
+            return {"FOO_FLAG": 1}
+
+        tpu_compiler.register_compile_cache_key("foo", env_factors=factors)
+        # Two directories that use one owner name: the second must not
+        # silently replace the first, also before the first hash.
+        with pytest.raises(RuntimeError, match="already registered"):
+            tpu_compiler.register_compile_cache_key(
+                "foo", paths=("vllm_torchtpu/models/foo/pool_layout.py",)
+            )
+        with pytest.raises(RuntimeError, match="already registered"):
+            tpu_compiler.register_compile_cache_key(
+                "foo", env_factors=lambda vllm_config: {}
+            )
+        # Paths are relative to the directory holding `vllm_torchtpu`, so a
+        # repo-relative `src/...` path (or a typo) would hash nothing.
+        for bad in (
+            "src/vllm_torchtpu/models/foo/pool_layout.py",
+            "vllm_torchtpu/models/foo/missing.py",
+        ):
+            with pytest.raises(ValueError, match="not a file or directory"):
+                tpu_compiler.register_compile_cache_key("bar", paths=(bad,))
+        assert "bar" not in tpu_compiler._MODEL_CACHE_KEY_PATHS
+        # The conflicts left the first registration in place.
+        assert tpu_compiler._model_env_factors(TestTpuCompilerCache._config()) == {
+            "model:foo": {"FOO_FLAG": 1}
+        }

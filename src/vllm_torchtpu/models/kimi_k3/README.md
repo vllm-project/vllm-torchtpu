@@ -25,7 +25,10 @@ megakernel code base:
 
 The compile cache key covers the paths in `_RUNTIME_CACHE_KEY_PATHS` plus
 every `kernels/` and `ops/` directory under `vllm_torchtpu/models/`, so keep
-custom-op bridges and kernel copies in those directories.
+custom-op bridges and kernel copies in those directories. Another file the graphs
+depend on, or a model setting that changes a graph, enters the key through
+`register_compile_cache_key` (`compilation/tpu_compiler.py`), called from the
+model's registration hook.
 
 The native Kimi-K3 model still lives in `models/vllm/kimi_k3/`.
 
