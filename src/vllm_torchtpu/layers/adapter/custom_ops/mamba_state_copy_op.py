@@ -60,6 +60,11 @@ def copy_mamba_state_blocks(
     state-block advance must be mirrored on each of them with the same
     pairs; seeding them all from one program costs one dispatch per step
     instead of one per buffer.
+
+    ``src`` and ``dst`` are block indices, valid in ``[0, pool.shape[0])`` of
+    each pool. A pair with either index outside that range is replaced by the
+    ``(0, 0)`` padding pair, which copies the null block onto itself, so it
+    changes no block (``pool_adapters.copy_blocks``).
     """
     marker = None
     for pool in pools:
@@ -116,6 +121,13 @@ def _row_copy_fn(num_pools: int, split: int, step_rows: int):
         pool: jax.Array, src: jax.Array, dst: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         assert pool.shape[1] == rows, (pool.shape, rows)
+        # Before the expansion: `src * steps` can wrap in int32 back into the
+        # pool, where copy_blocks could not tell it from a valid kernel block.
+        # A pair with a row outside the pool becomes (-1, -1), whose steps all
+        # stay below zero, so copy_blocks replaces (and reports) each of them.
+        in_pool = pool_adapters.copy_pairs_in_pool(src, dst, pool.shape[0])
+        src = jnp.where(in_pool, src, -1)
+        dst = jnp.where(in_pool, dst, -1)
         view = pool.reshape(pool.shape[0] * steps, step_rows, *pool.shape[2:])
         offsets = jnp.arange(steps, dtype=src.dtype)
         src_steps = (src[:, None] * steps + offsets).reshape(-1)
@@ -144,6 +156,11 @@ def copy_mamba_state_rows(
     """Copies whole manager-block rows in place within the merged block-major pool.
 
     Each `(src[i], dst[i])` pair moves `num_pools * split` kernel blocks.
+    `src` and `dst` are manager rows, valid in `[0, pool.shape[0])`. A pair
+    with either index outside that range changes no row: it is marked before
+    the rows expand into kernel blocks, so `pool_adapters.copy_blocks`
+    replaces each of its kernel-block pairs by the `(0, 0)` padding pair,
+    and reports them as `copy_blocks` describes.
     """
     kernel_block_bytes = pool[0, 0].numel() * pool.element_size()
     step_rows = _row_copy_step_rows(

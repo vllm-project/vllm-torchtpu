@@ -661,30 +661,12 @@ def test_register_kv_caches_canonicalizes_the_merged_pool(monkeypatch):
 # --- mamba row copy expansion ------------------------------------------------
 
 
-def _row_copy_rows_fn(num_pools, split, step_rows):
-    """Build `_rows_fn` for the geometry without registering a torch op."""
-    from vllm_torchtpu.layers.adapter.custom_ops import mamba_state_copy_op
-
-    captured = {}
-
-    def fake_jax_op(_name, fn, **_kwargs):
-        captured["rows_fn"] = fn
-        return fn
-
-    with patch.object(mamba_state_copy_op.pallas, "jax_op", fake_jax_op):
-        mamba_state_copy_op._row_copy_fn.__wrapped__(num_pools, split, step_rows)
-    return captured["rows_fn"]
-
-
-def _gather_copy_blocks(pool, src, dst):
-    out = np.array(pool)
-    out[np.asarray(dst)] = np.asarray(pool)[np.asarray(src)]
-    return jnp.asarray(out)
-
-
 @pytest.mark.parametrize("step_rows", [2, 6], ids=["steps=3", "steps=1"])
 def test_row_copy_expands_manager_pairs_into_whole_rows(step_rows):
-    from vllm_torchtpu.kernels import pool_adapters
+    from tests.layers.adapter.mamba_state_copy_test_utils import (
+        numpy_copy_kernel,
+        row_copy_program,
+    )
 
     num_pools, split = 3, 2
     pool = jnp.arange(4 * num_pools * split * 2 * 3, dtype=jnp.int32).reshape(
@@ -696,8 +678,8 @@ def test_row_copy_expands_manager_pairs_into_whole_rows(step_rows):
     reference[2] = np.array(pool)[1]
     reference[0] = np.array(pool)[3]
 
-    rows_fn = _row_copy_rows_fn(num_pools, split, step_rows)
-    with patch.object(pool_adapters, "copy_blocks", _gather_copy_blocks):
+    rows_fn = row_copy_program(num_pools, split, step_rows)
+    with numpy_copy_kernel():
         new_pool, marker = rows_fn(pool, src, dst)
 
     assert new_pool.shape == pool.shape

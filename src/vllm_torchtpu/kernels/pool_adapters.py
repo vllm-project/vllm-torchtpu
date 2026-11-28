@@ -31,10 +31,13 @@ the pool in place (`input_output_aliases`); the unwritten complement is
 preserved via the HBM alias, with no read-modify-write.
 """
 
+import functools
 import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -397,6 +400,63 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
     )(state_indices, vals.reshape(na * chunks, v_rows, v_lanes), pool)
 
 
+def copy_pairs_in_pool(src_indices, dst_indices, num_blocks: int):
+    """True for each copy pair whose src and dst are both in `[0, num_blocks)`."""
+    return (
+        (src_indices >= 0)
+        & (src_indices < num_blocks)
+        & (dst_indices >= 0)
+        & (dst_indices < num_blocks)
+    )
+
+
+def null_out_of_range_pairs(src_indices, dst_indices, num_blocks: int, *, in_pool=None):
+    """Replaces every copy pair with an index outside `[0, num_blocks)` by `(0, 0)`.
+
+    Block 0 is vLLM's reserved null block and `(0, 0)` is the copy's padding
+    pair: it copies the null block onto itself, so a replaced pair writes
+    nothing outside the pool and changes no block in it. A pair with both
+    indices in range is returned unchanged.
+
+    `in_pool`, if given, must be `copy_pairs_in_pool(src_indices, dst_indices,
+    num_blocks)`. A caller that also needs that mask passes it, so that it is
+    computed once.
+    """
+    if in_pool is None:
+        in_pool = copy_pairs_in_pool(src_indices, dst_indices, num_blocks)
+    return (
+        jnp.where(in_pool, src_indices, jnp.zeros_like(src_indices)),
+        jnp.where(in_pool, dst_indices, jnp.zeros_like(dst_indices)),
+    )
+
+
+def _replaced_pair_message(num_blocks: int) -> str:
+    return (
+        f"block copy: (src, dst) pair outside [0, {num_blocks}) replaced by the "
+        "(0, 0) padding pair"
+    )
+
+
+def _report_on_host(num_blocks, in_pool, src_indices, dst_indices):
+    jax.debug.callback(
+        functools.partial(_raise_on_replaced_pairs, num_blocks),
+        in_pool,
+        src_indices,
+        dst_indices,
+    )
+    return jnp.zeros((), jnp.int32)
+
+
+def _raise_on_replaced_pairs(num_blocks, in_pool, src_indices, dst_indices):
+    bad = np.flatnonzero(~np.asarray(in_pool))
+    if bad.size:
+        pairs = [(int(src_indices[i]), int(dst_indices[i])) for i in bad[:8]]
+        raise RuntimeError(
+            f"{_replaced_pair_message(num_blocks)}: {bad.size} pair(s), "
+            f"first ones: {pairs}"
+        )
+
+
 def copy_blocks(pool, src_indices, dst_indices):
     """Whole-block copies within the pool: pool[dst[i]] = pool[src[i]].
 
@@ -404,22 +464,82 @@ def copy_blocks(pool, src_indices, dst_indices):
     the block-table-derived state block advances (chunked-prefill boundary,
     decode crossing, or prefix-cache resume). Pairs with src == dst are
     no-ops used as padding.
+
+    Valid indices are `[0, pool.shape[0])`. A pair whose src or dst is
+    outside that range is replaced by the `(0, 0)` padding pair
+    (`null_out_of_range_pairs`) and changes no block. Pairs inside the pool
+    are copied unchanged.
+
+    Replaced pairs are reported only when `pl.enable_debug_checks` is set as
+    the program is traced; otherwise nothing is added to the program. With it
+    set, the report depends on where the program runs:
+    - on TPU, the copy kernel runs `pl.debug_check` on each pair, like the
+      other kernel debug checks, so a replaced pair fails the kernel's check;
+    - on the host (CPU, including Pallas's TPU interpret mode, where
+      `pl.debug_check` does nothing), a host callback raises `RuntimeError`
+      naming the first replaced pairs.
     """
+    num_blocks = pool.shape[0]
+    in_pool = copy_pairs_in_pool(src_indices, dst_indices, num_blocks)
+    src, dst = null_out_of_range_pairs(
+        src_indices, dst_indices, num_blocks, in_pool=in_pool
+    )
+    if not pl.enable_debug_checks.value:
+        return _copy_blocks_unchecked(pool, src, dst)
+    # The callback only where it can run: a TPU program holds none.
+    checked = lax.platform_dependent(
+        in_pool,
+        src_indices,
+        dst_indices,
+        cpu=functools.partial(_report_on_host, num_blocks),
+        default=lambda *_: jnp.zeros((), jnp.int32),
+    )
+    # `checked` is always 0. Adding it makes the copy depend on the report, so
+    # the report runs before the kernel; do not drop it as a no-op.
+    return _copy_blocks_unchecked(
+        pool, src + checked.astype(src.dtype), dst, in_pool=in_pool
+    )
+
+
+def _copy_blocks_unchecked(pool, src_indices, dst_indices, in_pool=None):
+    """The copy kernel of `copy_blocks`. It does no bounds checks: every index
+    must be inside the pool. With `in_pool`, each grid step also runs
+    `pl.debug_check` on its pair's entry."""
     na = src_indices.shape[0]
     block_shape = (1,) + pool.shape[1:]
     pad = (0,) * (pool.ndim - 1)
 
-    def _copy_kernel(src_ref, dst_ref, pool_in_ref, pool_out_ref):
+    if in_pool is None:
+
+        def _copy_kernel(src_ref, dst_ref, pool_in_ref, pool_out_ref):
+            pool_out_ref[...] = pool_in_ref[...]
+
+        return pl.pallas_call(
+            _copy_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                grid=(na,),
+                in_specs=[pl.BlockSpec(block_shape, lambda i, s, d: (s[i],) + pad)],
+                out_specs=pl.BlockSpec(block_shape, lambda i, s, d: (d[i],) + pad),
+            ),
+            out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+            input_output_aliases={2: 0},
+        )(src_indices, dst_indices, pool)
+
+    message = _replaced_pair_message(pool.shape[0])
+
+    def _copy_kernel(src_ref, dst_ref, ok_ref, pool_in_ref, pool_out_ref):
+        pl.debug_check(ok_ref[pl.program_id(0)] != 0, message)
         pool_out_ref[...] = pool_in_ref[...]
 
     return pl.pallas_call(
         _copy_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=3,
             grid=(na,),
-            in_specs=[pl.BlockSpec(block_shape, lambda i, s, d: (s[i],) + pad)],
-            out_specs=pl.BlockSpec(block_shape, lambda i, s, d: (d[i],) + pad),
+            in_specs=[pl.BlockSpec(block_shape, lambda i, s, d, ok: (s[i],) + pad)],
+            out_specs=pl.BlockSpec(block_shape, lambda i, s, d, ok: (d[i],) + pad),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
-    )(src_indices, dst_indices, pool)
+        input_output_aliases={3: 0},
+    )(src_indices, dst_indices, in_pool.astype(jnp.int32), pool)

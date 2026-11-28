@@ -13,9 +13,14 @@
 # limitations under the License.
 """TPU roundtrip tests for the unified-pool region adapters."""
 
+import contextlib
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import pool_adapters
 
@@ -73,19 +78,88 @@ def test_same_dtype_region_roundtrip():
 
 
 @pytest.mark.tpu_test
-def test_copy_blocks():
+@pytest.mark.parametrize(
+    "debug_checks", [False, True], ids=["debug-checks-off", "debug-checks-on"]
+)
+def test_copy_blocks(debug_checks):
+    """With `pl.enable_debug_checks`, the copy kernel also runs `pl.debug_check`
+    on every pair. On TPU a check that fires halts the core, so only valid
+    pairs run here: a check that fired on them would leave the pool uncopied
+    and fail the test."""
     pool = _pool()
     before = np.asarray(pool)
     src = jnp.asarray([0, 2], dtype=jnp.int32)
     dst = jnp.asarray([3, 1], dtype=jnp.int32)
 
-    pool = pool_adapters.copy_blocks(pool, src, dst)
+    with pl.enable_debug_checks(debug_checks):
+        pool = pool_adapters.copy_blocks(pool, src, dst)
 
     after = np.asarray(pool)
     np.testing.assert_array_equal(after[3], before[0])
     np.testing.assert_array_equal(after[1], before[2])
     np.testing.assert_array_equal(after[0], before[0])
     np.testing.assert_array_equal(after[2], before[2])
+
+
+@pytest.mark.parametrize(
+    "mode", [pytest.param("tpu", marks=pytest.mark.tpu_test), "interpret"]
+)
+def test_copy_blocks_replaces_a_pair_outside_the_pool_by_the_null_pair(mode):
+    """The real copy kernel, on TPU or in Pallas's TPU interpret mode on the
+    host (which raises on a block index outside the pool): each pair that
+    joins a live block to an index outside the pool copies nothing. The
+    interpret run is pinned to the CPU device, which it needs even where the
+    default device is a TPU."""
+    interpret = mode == "interpret"
+    with (
+        jax.default_device(jax.devices("cpu")[0])
+        if interpret
+        else contextlib.nullcontext()
+    ):
+        pool = _pool()
+        before = np.asarray(pool)
+        # Each bad index is joined to a live block, as src and as dst.
+        src = jnp.asarray([2, NB, -1, 1, 2**31 - 1, 1], dtype=jnp.int32)
+        dst = jnp.asarray([3, 1, 1, NB, 1, -1], dtype=jnp.int32)
+        with (
+            pltpu.force_tpu_interpret_mode(pltpu.InterpretParams())
+            if interpret
+            else contextlib.nullcontext()
+        ):
+            pool = pool_adapters.copy_blocks(pool, src, dst)
+        after = np.asarray(pool)
+
+    np.testing.assert_array_equal(after[3], before[2])
+    for block in (0, 1, 2):
+        np.testing.assert_array_equal(after[block], before[block])
+
+
+def test_copy_blocks_debug_check_raises_on_the_host():
+    """With `pl.enable_debug_checks`, the real kernel under `jax.jit` in
+    Pallas's TPU interpret mode on the host: valid pairs copy as without the
+    flag, and a pair outside the pool raises. The kernel's `pl.debug_check`
+    does nothing in interpret mode; the host callback raises. Pinned to the
+    CPU device: on a TPU device the program would take the TPU branch, which
+    has no callback."""
+    copy = jax.jit(pool_adapters.copy_blocks)
+    with (
+        jax.default_device(jax.devices("cpu")[0]),
+        pl.enable_debug_checks(True),
+        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
+    ):
+        pool = _pool()
+        before = np.asarray(pool)
+        after = np.asarray(
+            copy(pool, jnp.asarray([2, 0], jnp.int32), jnp.asarray([3, 0], jnp.int32))
+        )
+        jax.effects_barrier()
+        np.testing.assert_array_equal(after[3], before[2])
+        with pytest.raises(
+            (RuntimeError, jax.errors.JaxRuntimeError),
+            match=r"outside \[0, 4\) replaced by the \(0, 0\) padding pair",
+        ):
+            copy(pool, jnp.asarray([2, NB], jnp.int32), jnp.asarray([3, 1], jnp.int32))
+            jax.effects_barrier()
 
 
 @pytest.mark.tpu_test
