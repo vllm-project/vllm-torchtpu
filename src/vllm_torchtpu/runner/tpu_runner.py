@@ -6586,6 +6586,10 @@ class TPUModelRunner(GPUModelRunner):
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
         self._arm_hier_reduce_scatter()
+        # Loading builds programs of its own, and which ones differs from run
+        # to run. Report them here, so that the next report holds only what a
+        # precompile case read.
+        self._update_num_xla_graphs("load_model")
 
     def _arm_hier_reduce_scatter(self) -> None:
         """Arms TPU_MOE_EP_HIER_RS once, outside Dynamo: it runs collectives."""

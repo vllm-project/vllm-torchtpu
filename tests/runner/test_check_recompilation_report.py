@@ -169,6 +169,38 @@ def test_a_cache_hit_is_counted_but_costs_no_compile_time(monkeypatch):
     assert "1 first read since the last check, 0.000s compiling" in text
 
 
+def test_programs_built_by_model_load_get_a_report_of_their_own(monkeypatch):
+    """What the compilation-cache e2e test relies on.
+
+    The runtime builds programs while the model loads, and which ones differs
+    from run to run. The report at the end of ``load_model`` takes them, so
+    compile time in a later report is a miss of the compilation cache.
+    """
+    runner = make_runner()
+    set_cache(monkeypatch, [])
+    capture(runner, "init")
+
+    built_by_load = entry(1, compile_secs=0.3)
+    set_cache(monkeypatch, [built_by_load])
+    load_report = capture(runner, "load_model")
+
+    set_cache(monkeypatch, [built_by_load, entry(10)])
+    first_case = capture(runner, "compute_selected_logits")
+
+    assert "case: load_model" in load_report
+    assert "1 first read since the last check, 0.300s compiling" in load_report
+    assert "1 first read since the last check, 0.000s compiling" in first_case
+
+
+def test_a_model_load_that_reads_no_program_still_logs_its_report(monkeypatch):
+    """The e2e test fails a warm run whose log has no ``load_model`` report."""
+    runner = make_runner()
+    set_cache(monkeypatch, [])
+    capture(runner, "init")
+
+    assert "case: load_model" in capture(runner, "load_model")
+
+
 def test_the_costliest_compiles_are_described_first(monkeypatch):
     runner = make_runner()
     set_cache(monkeypatch, [entry(0, read_count=2)])
