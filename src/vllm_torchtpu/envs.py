@@ -208,6 +208,17 @@ if TYPE_CHECKING:
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
     VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
+    TPU_MOONCAKE_MASTER_SERVER_ADDRESS: str = ""
+    TPU_MOONCAKE_METADATA_SERVER: str = ""
+    TPU_MOONCAKE_PROTOCOL: str = "hp_tcp"
+    TPU_MOONCAKE_DEVICE_NAME: str = ""
+    TPU_MOONCAKE_GLOBAL_SEGMENT_SIZE_MB: int = 4096
+    TPU_MOONCAKE_LOCAL_BUFFER_SIZE_MB: int = 512
+    TPU_MOONCAKE_STORE_MEMCPY: bool = False
+    TPU_MOONCAKE_TENT_CONNECTIONS: int = 0
+    TPU_MOONCAKE_CTRL_PORT: int = 27600
+    TPU_MOONCAKE_TRANSFER_THREADS: int = 4
+    MC_TENT_CONF: str = ""
 
 
 def env_with_choices(
@@ -1323,6 +1334,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
+    # Mooncake KV connector defaults (overridden by kv_connector_extra_config).
+    # MooncakeDistributedStore master address, e.g. "10.0.0.1:50051".
+    "TPU_MOONCAKE_MASTER_SERVER_ADDRESS": env_str(
+        "TPU_MOONCAKE_MASTER_SERVER_ADDRESS", ""
+    ),
+    # Mooncake metadata service endpoint, e.g. "http://10.0.0.1:8080/metadata"
+    # or "P2PHANDSHAKE" for direct P2P transfers.
+    "TPU_MOONCAKE_METADATA_SERVER": env_str("TPU_MOONCAKE_METADATA_SERVER", ""),
+    # Mooncake TENT transport protocol ("hp_tcp" or "tcp").
+    "TPU_MOONCAKE_PROTOCOL": env_str("TPU_MOONCAKE_PROTOCOL", "hp_tcp"),
+    # Optional NIC / device name passed to Mooncake TransferEngine or Store.
+    "TPU_MOONCAKE_DEVICE_NAME": env_str("TPU_MOONCAKE_DEVICE_NAME", ""),
+    # Per-worker host DRAM segment contributed to MooncakeDistributedStore (MiB).
+    "TPU_MOONCAKE_GLOBAL_SEGMENT_SIZE_MB": env_nonnegative_int(
+        "TPU_MOONCAKE_GLOBAL_SEGMENT_SIZE_MB", 4096
+    ),
+    # Per-worker local staging buffer size for MooncakeDistributedStore (MiB).
+    "TPU_MOONCAKE_LOCAL_BUFFER_SIZE_MB": env_nonnegative_int(
+        "TPU_MOONCAKE_LOCAL_BUFFER_SIZE_MB", 512
+    ),
+    # Set MC_STORE_MEMCPY=1 only when Mooncake's TpuAcceleratorDevice is active;
+    # defaults to False so store transfers route through TENT TPU DMA.
+    "TPU_MOONCAKE_STORE_MEMCPY": env_bool("TPU_MOONCAKE_STORE_MEMCPY", default=False),
+    # Optional TENT TCP/HP-TCP connection count override (0 keeps TENT default).
+    "TPU_MOONCAKE_TENT_CONNECTIONS": env_nonnegative_int(
+        "TPU_MOONCAKE_TENT_CONNECTIONS", 0
+    ),
+    # Base TCP port for TPUMooncakeConnector per-rank P2P control endpoints.
+    "TPU_MOONCAKE_CTRL_PORT": env_nonnegative_int("TPU_MOONCAKE_CTRL_PORT", 27600),
+    # Worker thread-pool size for async Mooncake KV transfers.
+    "TPU_MOONCAKE_TRANSFER_THREADS": env_nonnegative_int(
+        "TPU_MOONCAKE_TRANSFER_THREADS", 4
+    ),
+    # Optional pre-configured Mooncake TENT JSON string; preserved when set.
+    "MC_TENT_CONF": env_str("MC_TENT_CONF", ""),
 }
 
 

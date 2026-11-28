@@ -559,6 +559,14 @@ def _register_tpu_kv_connectors() -> None:
             "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
         ),
         ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
+        (
+            "TPUMooncakeConnector",
+            "vllm_torchtpu.distributed.kv_transfer.mooncake_connector",
+        ),
+        (
+            "TPUMooncakeOffloadingConnector",
+            "vllm_torchtpu.offload.mooncake_connector",
+        ),
     ):
         KVConnectorFactory.register_connector(name, module_path, name)
 
@@ -1441,6 +1449,8 @@ class TpuPlatform(Platform):
                 "TPURaidenConnector",
                 "TPUMultiConnector",
                 "TPURaidenOffloadingConnector",
+                "TPUMooncakeConnector",
+                "TPUMooncakeOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in _TPU_SUPPORTED_KV_CONNECTORS, (
                 f"TPU only supports the following KV connectors: "
@@ -1455,7 +1465,8 @@ class TpuPlatform(Platform):
             ):
                 validate_raiden_pd_config(vllm_config)
             is_hybrid_offloading = (
-                kv_transfer_config.kv_connector == "TPURaidenOffloadingConnector"
+                kv_transfer_config.kv_connector
+                in ("TPURaidenOffloadingConnector", "TPUMooncakeOffloadingConnector")
                 and is_hybrid
             )
             if is_hybrid_offloading and not unified_kv_layout_enabled(vllm_config):

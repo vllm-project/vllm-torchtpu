@@ -283,6 +283,7 @@ ignore-missing-imports = [
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
+    "mooncake", "mooncake.*",
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
