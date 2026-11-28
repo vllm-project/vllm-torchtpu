@@ -20,10 +20,12 @@ itself: apply_omni_tpu_patches() when the platform is constructed, and
 apply_omni_model_specific_patches() at attention backend selection
 (get_diffusion_attn_backend_cls).
 
-Patches for autoregressive stages served by TPUARWorker live in one submodule
-per model of this package and are applied from TPUARModelRunner.load_model()
-until Omni patches are unified with patch_registry.py (tracked in #1862); see
-qwen3omni_thinker.py.
+Larger patches live in their own submodule of this package:
+- Patches for autoregressive stages served by TPUARWorker, one submodule per
+  model, applied from TPUARModelRunner.load_model() until Omni patches are
+  unified with patch_registry.py (tracked in #1862); see qwen3omni_thinker.py.
+- Process-wide library patches named by what they patch, applied from
+  apply_omni_tpu_patches(); see safetensors_load.py.
 """
 
 from functools import cache as run_once
@@ -32,6 +34,9 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.omni.patches.safetensors_load import (
+    patch_safetensors_load_file_tpu_device,
+)
 
 logger = init_logger(__name__)
 
@@ -47,7 +52,7 @@ def _optimization_barrier_op() -> Any:
 
 @run_once
 def apply_omni_tpu_patches() -> None:
-    """Extend the async output timeout for TPU compilation and execution."""
+    """Apply TPU patches needed before any model is built or loaded."""
 
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
@@ -72,6 +77,9 @@ def apply_omni_tpu_patches() -> None:
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
+
+    # Before any weight load; see safetensors_load.py.
+    patch_safetensors_load_file_tpu_device()
 
 
 @run_once
