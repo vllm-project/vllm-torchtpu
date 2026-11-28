@@ -1081,7 +1081,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 return carry
 
             with ctx.stream.sc("qsa_rowsel", 2):
-                jax.lax.fori_loop(lo, lo + n, row, 0)
+                if n <= T:  # one request's rows, unrolled: their reductions overlap
+                    for i in range(n):
+                        row(lo + i, 0)
+                else:
+                    jax.lax.fori_loop(lo, lo + n, row, 0)
                 if self.async_dma and self._row_ids:
                     self._wait_ids_copies(ctx, n)
             if self.union_attn:  # per-request call: rows [lo, lo + T) are request lo // T
