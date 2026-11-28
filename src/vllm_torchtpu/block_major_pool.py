@@ -79,6 +79,44 @@ class BlockMajorPoolLayout:
         return self.num_pools * self.split
 
 
+class BlockMajorPoolBindable:
+    """Base class for GDN layers that remap their own block IDs into the merged pool.
+
+    `KVCacheManager` binds a unified-pool layer that subclasses this by calling
+    `set_block_major_pool(pool_index, layout)`; the shared GDN op and a model
+    directory's own copy of it subclass it to opt in explicitly. The layer
+    must also be a vLLM `GatedDeltaNetAttention`; the binder checks both.
+
+    The binding and the block ID remap live here, so every copy of the GDN op
+    maps a region-local state block ID to the same row of the merged pool.
+    A subclass sets `_bm_kernel` in its constructor (whether its pooled ops
+    were built for the merged block-major pool) and maps each state block ID
+    through `_bm_state_ids` before a pooled op reads or writes it.
+    """
+
+    # Whether pooled ops consume the merged block-major unified pool, along
+    # with `(pool_index, layout)` once bound by `set_block_major_pool()`.
+    # Class-level defaults support test/mock instances constructed without
+    # `__init__`.
+    _bm_kernel: bool = False
+    _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+
+    def set_block_major_pool(
+        self, pool_index: int, layout: BlockMajorPoolLayout
+    ) -> None:
+        """Binds this layer to its region index within the merged block-major pool."""
+        assert self._bm_kernel, "pooled ops were built for per-region pools"
+        self._bm_region = (pool_index, layout)
+
+    def _bm_state_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        """Maps region-local state block IDs to rows of the merged pool."""
+        if not self._bm_kernel:
+            return ids
+        assert self._bm_region is not None
+        pool_index, layout = self._bm_region
+        return flat_manager_ids(ids, pool_index, layout.num_pools)
+
+
 def kernel_view(pool):
     """Folds the merged pool's leading `(num_blocks, rows_per_block)` axes into dim 0.
 
