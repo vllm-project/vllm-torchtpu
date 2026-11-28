@@ -793,6 +793,23 @@ class TpuPlatform(Platform):
             os.environ["TORCH_TPU_TOPOLOGY"] = cls._get_tpu_topology(world_size)
 
     @classmethod
+    def _has_tpu_topology(cls, world_size: int) -> bool:
+        """Return whether torch_tpu exposes a standalone topology of ``world_size``.
+
+        Returns True when no TPU is attached (``get_tpu_topology`` returns
+        ``None``) so CPU-only callers and unit tests keep the default
+        replica-local dense DP behavior. Non-topology ``RuntimeError``s
+        (e.g. PCI scan or permission failures) propagate.
+        """
+        try:
+            hardware.get_tpu_topology(world_size)
+        except RuntimeError as exc:
+            if "no tpu topology found" in str(exc).lower():
+                return False
+            raise
+        return True
+
+    @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
         """Return the torch_tpu-reported topology for the requested world size."""
         topology = hardware.get_tpu_topology(world_size)
@@ -1333,12 +1350,17 @@ class TpuPlatform(Platform):
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_PORT", str(portpicker.pick_unused_port())
                 )
-                if parallel_config.enable_expert_parallel:
-                    # EP's expert-combine collective genuinely spans every
-                    # DP*TP worker, so torch_tpu needs one shared slice
-                    # across all of them; the worker spawn shim exposes a
-                    # DP-adjusted chip ordinal to TorchTPU for physical
-                    # binding.
+                from vllm_torchtpu.worker.tpu_rank_binding import (
+                    uses_unified_dp_slice,
+                )
+
+                if uses_unified_dp_slice(parallel_config):
+                    # EP's expert-combine collective spans every DP*TP worker,
+                    # and dense DP whose per-engine world_size lacks a
+                    # standalone TPU topology (e.g. TP=1 on dual-core TPU v7x)
+                    # also needs one shared slice so libtpu assigns one core
+                    # per worker; the worker spawn shim exposes a DP-adjusted
+                    # chip ordinal to TorchTPU for physical binding.
                     cls.device_control_env_var = (
                         "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
                     )

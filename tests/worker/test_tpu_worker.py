@@ -1014,6 +1014,96 @@ def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
     assert calls == [0]
 
 
+def test_init_device_dense_dp_unified_slice_without_standalone_topology(monkeypatch):
+    """Dense TP=1 DP workers on dual-core TPU bootstrap on the shared slice
+    without calling _get_tpu_topology(1) or enabling EP lockstep sync."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+    from vllm_torchtpu.worker import tpu_worker
+
+    sb_addrs = ",".join(f"localhost:{20000 + i}" for i in range(8))
+    monkeypatch.setattr(
+        TpuPlatform, "_has_tpu_topology", classmethod(lambda cls, ws: ws != 1)
+    )
+    monkeypatch.setattr(
+        TpuPlatform,
+        "_get_tpu_topology",
+        classmethod(
+            lambda cls, ws: (_ for _ in ()).throw(
+                AssertionError(f"unexpected _get_tpu_topology({ws}) call")
+            )
+        ),
+    )
+
+    pc = SimpleNamespace(
+        world_size=1,
+        local_world_size=1,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=8,
+        data_parallel_size_local=8,
+        data_parallel_index=3,
+        data_parallel_rank=3,
+        data_parallel_rank_local=3,
+        data_parallel_master_ip="127.0.0.1",
+        enable_expert_parallel=False,
+    )
+    cfg = _make_vllm_config()
+    cfg.parallel_config = pc
+    worker = _build_worker(cfg, rank=0)
+    worker.distributed_init_method = "tcp://127.0.0.1:29500"
+    worker.is_driver_worker = True
+    worker.devices = [torch.device("cpu")]
+    worker.model_runner_cls = MagicMock()
+
+    mock_platform = MagicMock()
+    mock_platform.get_worker_distributed_backend.return_value = "gloo"
+    mock_pp = MagicMock(is_first_rank=True, is_last_rank=True)
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "TORCH_TPU_DP_SIZE": "8",
+                "TORCH_TPU_DP_MASTER_ADDR": "127.0.0.1",
+                "TORCH_TPU_DP_MASTER_PORT": "29501",
+                "TORCH_TPU_SLICEBUILDER_ADDRESSES": sb_addrs,
+                "TORCH_TPU_TOPOLOGY": "2,2,1,2",
+            },
+        ),
+        patch("vllm.platforms.current_platform", mock_platform),
+        patch.object(tpu_worker, "set_current_vllm_config"),
+        patch.object(tpu_worker, "init_distributed_environment") as init_dist,
+        patch.object(tpu_worker, "ensure_model_parallel_initialized"),
+        patch.object(tpu_worker, "pcp_topology_order"),
+        patch.object(tpu_worker, "get_pp_group", return_value=mock_pp),
+        patch.object(tpu_worker.dist_utils, "get_node_id", return_value="0"),
+        patch.object(tpu_worker.vllm_utils, "report_usage_stats"),
+    ):
+        os.environ.pop("ALLOW_MULTIPLE_LIBTPU_LOAD", None)
+        worker.init_device()
+
+        assert pc.data_parallel_size == 8
+        assert pc.data_parallel_rank == 3
+        assert utils.dp_engines_in_lockstep(pc) is False
+        assert os.environ["RANK"] == "3"
+        assert os.environ["LOCAL_RANK"] == "3"
+        assert os.environ["WORLD_SIZE"] == "8"
+        assert os.environ["LOCAL_WORLD_SIZE"] == "8"
+        assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == sb_addrs
+        assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
+        assert "ALLOW_MULTIPLE_LIBTPU_LOAD" not in os.environ
+
+    init_dist.assert_called_once_with(
+        world_size=1,
+        rank=0,
+        local_rank=3,
+        distributed_init_method="tcp://127.0.0.1:29500",
+        backend="gloo",
+    )
+
+
 if __name__ == "__mp_main__":
     # The constructor is the boundary preceding executor and TPU initialization.
     EngineCoreProc.__init__ = _engine_init

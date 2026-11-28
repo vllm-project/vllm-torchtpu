@@ -186,6 +186,54 @@ def test_prepare_singlehost_tpu_env_skips_distributed_bootstrap_for_tp1(monkeypa
     assert "WORLD_SIZE" not in os.environ
 
 
+def test_has_tpu_topology_handles_runtime_error_and_cpu_none(monkeypatch):
+    """_has_tpu_topology returns False only for unsupported topology counts."""
+    with patch.object(
+        tpu_platform.hardware, "get_tpu_topology", return_value="1,1,1,2"
+    ):
+        assert TpuPlatform._has_tpu_topology(2) is True
+
+    with patch.object(tpu_platform.hardware, "get_tpu_topology", return_value=None):
+        assert TpuPlatform._has_tpu_topology(2) is True
+
+    with patch.object(
+        tpu_platform.hardware,
+        "get_tpu_topology",
+        side_effect=RuntimeError("No TPU topology found for count: 1"),
+    ):
+        assert TpuPlatform._has_tpu_topology(1) is False
+
+    with (
+        patch.object(
+            tpu_platform.hardware,
+            "get_tpu_topology",
+            side_effect=RuntimeError("PCI scan failed"),
+        ),
+        pytest.raises(RuntimeError, match="PCI scan failed"),
+    ):
+        TpuPlatform._has_tpu_topology(1)
+
+
+@pytest.mark.tpu_test
+def test_has_tpu_topology_on_tpu_hardware():
+    """Verify _has_tpu_topology against the real torch_tpu hardware probe."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.tpu_info import get_chip_version
+
+    device_count = tpu_platform.hardware.get_tpu_device_count()
+    assert device_count > 0
+    assert TpuPlatform._has_tpu_topology(device_count) is True
+
+    chip = get_chip_version()
+    if chip == pltpu.ChipVersion.TPU_7X:
+        assert TpuPlatform._has_tpu_topology(1) is False
+        if device_count >= 2:
+            assert TpuPlatform._has_tpu_topology(2) is True
+    elif chip == pltpu.ChipVersion.TPU_V6E:
+        assert TpuPlatform._has_tpu_topology(1) is True
+
+
 def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(monkeypatch):
     """A DP engine must not clear the slice env it inherited from the parent."""
     monkeypatch.setenv("WORLD_SIZE", "8")
@@ -332,6 +380,55 @@ class TestTpuPlatform:
         vllm_config.kv_transfer_config = None
         vllm_config.additional_config = {}
         return vllm_config
+
+    @pytest.mark.parametrize(
+        ("has_topology", "expected_env_var"),
+        [
+            (False, "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"),
+            (True, "TPU_VISIBLE_CHIPS"),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_dense_dp_device_control_env_var(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        has_topology,
+        expected_env_var,
+    ):
+        monkeypatch.setattr(TpuPlatform, "device_control_env_var", "TPU_VISIBLE_CHIPS")
+        monkeypatch.setattr(
+            TpuPlatform,
+            "_has_tpu_topology",
+            classmethod(lambda cls, ws: has_topology),
+        )
+        vllm_config.parallel_config.world_size = 1
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 8
+        vllm_config.parallel_config.data_parallel_size_local = 8
+        vllm_config.parallel_config.world_size_across_dp = 8
+        vllm_config.parallel_config.data_parallel_master_ip = "127.0.0.1"
+        vllm_config.parallel_config.enable_expert_parallel = False
+        vllm_config.parallel_config.distributed_executor_backend = "mp"
+        vllm_config.model_config.architectures = []
+        vllm_config.model_config.get_head_size.return_value = 128
+        vllm_config.attention_config.backend = None
+
+        with (
+            patch.dict(os.environ),
+            patch(
+                "vllm_torchtpu.distributed.tpu_mp_multihost.prepare_mp_multihost_dp_env",
+                return_value=False,
+            ),
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        assert TpuPlatform.device_control_env_var == expected_env_var
 
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
