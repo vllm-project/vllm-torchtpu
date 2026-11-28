@@ -911,37 +911,44 @@ def rpa_kernel(
             ),
         )
         def _run(final_allocs, schedule_ref, dma_sem, scratches):
-            # Initialize Q to zeros to prevent NaN pollution.
-            #
-            # When a query block is partially filled, tail slots in uninitialized VMEM
-            # may contain residual NaNs. In our implementation, invalid Q rows bypass
-            # invalid row masking and produce NaNs in p_rowsum and later pollute
-            # l_scratch and acc_scratch. Once l_scratch / acc_scratch becomes NaN,
-            # subsequent iterations cannot recover (0 * NaN = NaN).
-
-            # Initialize KV cache to zeros.
-            # When perfomring p * v, we perform causal masking on lhs (p) by zeroing
-            # out columns that should not be processed for a given row. Even if we
-            # don't perform masking on rows of rhs (v), the output is still correct
-            # since reuslt of multiplication will be zero thanks zero on lhs. However,
-            # this assumption does not hold if a row of rhs has NaNs. To avoid this,
-            # we initiallize scratch memory with non-zero values. Even if the scratch
-            # memory is storing kv cache from previous step, as long as the data is
-            # not NaNs, there will be no numeric concerns.
-
-            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
-
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
 
-            num_lanes = pltpu.get_tpu_info().num_lanes
-            q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            kv_ref_flat = kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
-                -1, num_lanes
-            )
+            # Skip dead VMEM initialization when the kernel has no scheduled steps
+            # (e.g. RPAm on pure-decode steps).
+            @pl.when(actual_steps > 0)
+            def _init_vmem():
+                # Initialize Q to zeros to prevent NaN pollution.
+                #
+                # When a query block is partially filled, tail slots in
+                # uninitialized VMEM may contain residual NaNs. In our
+                # implementation, invalid Q rows bypass invalid row masking and
+                # produce NaNs in p_rowsum and later pollute l_scratch and
+                # acc_scratch. Once l_scratch / acc_scratch becomes NaN,
+                # subsequent iterations cannot recover (0 * NaN = NaN).
 
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
-                ref[...] = jnp.zeros_like(ref)
+                # Initialize KV cache to zeros.
+                # When performing p * v, we perform causal masking on lhs (p) by
+                # zeroing out columns that should not be processed for a given
+                # row. Even if we don't perform masking on rows of rhs (v), the
+                # output is still correct since the result of multiplication will
+                # be zero thanks to zero on lhs. However, this assumption does
+                # not hold if a row of rhs has NaNs. To avoid this, we initialize
+                # scratch memory with finite values. Even if the scratch memory
+                # is storing kv cache from previous step, as long as the data is
+                # not NaNs, there will be no numeric concerns.
+                scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+
+                num_lanes = pltpu.get_tpu_info().num_lanes
+                q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(
+                    -1, num_lanes
+                )
+                kv_ref_flat = kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
+                    -1, num_lanes
+                )
+
+                # Explicitly zero out scratches and Q/KV buffers.
+                for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+                    ref[...] = jnp.zeros_like(ref)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the

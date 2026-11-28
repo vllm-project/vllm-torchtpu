@@ -389,6 +389,21 @@ def _write_schedule_to_hbm(
     jax.tree.map(lambda x: x.wait(), dma_list)
 
 
+def _write_actual_steps_to_hbm(
+    schedule_smem: RpaSchedule,
+    schedule_hbm: RpaSchedule,
+    dma_sem: jax.Ref,
+):
+    """Writes only the scalar `actual_steps` leaf from SMEM to HBM."""
+    copy = pltpu.make_async_copy(
+        schedule_smem.actual_steps.at[pl.ds(0, 1)],
+        schedule_hbm.actual_steps.at[pl.ds(0, 1)],
+        dma_sem.at[0],
+    )
+    copy.start()
+    copy.wait()
+
+
 def _compute_waits(
     schedule: RpaSchedule,
     start_step: jax.typing.ArrayLike,
@@ -938,15 +953,25 @@ def rpa_metadata_schedule_kernel(
     hbm_offset = loop_carry.hbm_offset
     steps = pl.cdiv(count, cfgs.batch_size) + hbm_offset
     schedule_ref.actual_steps[0] = steps
-    # Step 3: Mask out unvisited steps.
-    flush_to_hbm(
-        count,
-        schedule_ref,
-        schedule_hbm_ref,
-        hbm_offset,
-        dma_sem,
-        cfgs=cfgs,
-    )
+
+    def _flush_steps():
+        flush_to_hbm(
+            count,
+            schedule_ref,
+            schedule_hbm_ref,
+            hbm_offset,
+            dma_sem,
+            cfgs=cfgs,
+        )
+
+    def _flush_actual_steps_only():
+        _write_actual_steps_to_hbm(schedule_ref, schedule_hbm_ref, dma_sem)
+
+    # Step 3: Mask out unvisited steps and flush to HBM. When no new entries
+    # remain in SMEM (`count == 0`, e.g. empty RPAm on pure-decode steps or an
+    # exact chunk boundary), only DMA `actual_steps` so we avoid flushing an
+    # unused `max_steps_ub` schedule chunk.
+    jax.lax.cond(count > 0, _flush_steps, _flush_actual_steps_only)
 
 
 def generate_rpa_metadata(
