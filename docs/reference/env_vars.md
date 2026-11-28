@@ -50,7 +50,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DP_VOCAB_PARALLEL` | `False` | Opt-in. Shards the input embedding and lm_head over every DP x TP rank (the EP group) instead of each DP engine's TP group, cutting their HBM per device by DP x. Needs DP with expert parallelism; ignored, with a warning, under pipeline or context parallelism, speculative decoding, LoRA, pooling or multimodal models, or `TPU_GREEDY_TOP_TOKENS`. |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
-| `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
+| `TPU_TOKEN_BUCKET_LINEAR` | `False` | Adds linearly spaced token buckets above a quarter of the token budget to the power-of-two ones, for prompt-sized steps and the multimodal encoder's patch budgets. |
 
 Removed pipeline variables. Startup with pipeline parallelism fails while any of them is set:
 

@@ -30,8 +30,9 @@ def _make_manager(
     paths=None,
     budgets=(8, 4),
     forward=None,
+    model_cls=Mock,
 ):
-    model = Mock()
+    model = model_cls()
     model.use_data_parallel = False
     if forward is not None:
         model.encoder_cudagraph_forward = forward
@@ -131,6 +132,41 @@ def test_padding_clears_previous_request_and_preserves_defaults(manager):
     torch.testing.assert_close(result["pixels"][1:], torch.zeros(3, 2))
 
 
+@pytest.mark.parametrize(
+    "spans",
+    [
+        [(0, 5), (5, 11)],
+        [(0, 16)],
+        [(3, 4)],  # past the storage's start, shorter than a chunk
+        [(4, 6), (6, 8)],
+        [(9, 16)],
+        [(2, 4), (7, 10)],  # a gap between the parts
+        [(7, 10), (2, 4)],  # out of storage order, as batch packing gives
+        [(0, 2), (30, 33)],  # one storage, wider than the budget
+    ],
+)
+@pytest.mark.parametrize("one_storage", [True, False])
+def test_host_rows_reach_the_device_at_the_template_shape(spans, one_storage):
+    template = torch.zeros(16, 3, dtype=torch.bfloat16)
+    storage = torch.randn(40, 3)
+    parts = [storage[a:b] if one_storage else storage[a:b].clone() for a, b in spans]
+    rows = torch.cat(parts)
+    out = mm.rows_to_device(parts, template, torch.clone)
+    assert out.shape == template.shape and out.dtype == template.dtype
+    torch.testing.assert_close(out[: len(rows)], rows.to(torch.bfloat16))
+    assert not out[len(rows) :].any()
+
+
+def test_eager_fallback_gets_a_host_selection_as_upstream_selects():
+    parts = [torch.randn(4, 3), torch.randn(2, 3)]
+    grid = [[1, 2, 2], [1, 1, 2]]
+    got = mm._to_device(
+        {"pixel_values": parts, "image_grid_thw": grid}, torch.device("cpu")
+    )
+    assert torch.equal(got["pixel_values"], torch.cat(parts))
+    assert got["image_grid_thw"] == grid
+
+
 def test_exact_shape_uses_input_without_overwriting_template(manager):
     source = torch.ones(4, 2)
     result = manager._pad_to_template({"pixels": source}, 4, "global")
@@ -210,6 +246,18 @@ def test_exact_shape_replay_reuses_precompiled_dynamo_graph(monkeypatch):
     assert out is not None
     assert counter.frame_count == 1
     torch._dynamo.reset()
+
+
+@pytest.mark.parametrize(
+    ("linear", "budgets"),
+    [
+        (False, [64, 128, 256, 512, 1024, 2048, 4096, 8192]),
+        (True, [64, 128, 256, 512, 1024, 2048, *range(3072, 8193, 1024)]),
+    ],
+)
+def test_generated_budgets_take_the_linear_token_buckets(monkeypatch, linear, budgets):
+    monkeypatch.setattr(mm.envs, "TPU_TOKEN_BUCKET_LINEAR", linear)
+    assert mm.MMEncoderManager._generate_budgets(64, 8192) == budgets
 
 
 @pytest.mark.parametrize(
@@ -572,6 +620,47 @@ def test_capture_model_passes_encoder_step_budget_to_precompile(
     encoder_mgr.precompile_vision_encoder.assert_called_once_with(
         max_step_tokens=expected
     )
+
+
+class _BudgetInputsModel(Mock):
+    """A model with the budget-inputs hook."""
+
+    prepare_encoder_budget_inputs = Mock()
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "runner_config", "layout_free"),
+    [
+        (_BudgetInputsModel, {}, True),
+        (Mock, {}, False),
+        (_BudgetInputsModel, {"_dp_lockstep_enabled": lambda: True}, False),
+        (_BudgetInputsModel, {"is_multimodal_pruning_enabled": True}, False),
+        (_BudgetInputsModel, {"requires_sequential_video_encoding": True}, False),
+        (_BudgetInputsModel, {"lora_config": object()}, False),
+        (_BudgetInputsModel, {"mm_budget": None}, False),
+    ],
+)
+def test_layout_free_encoder_only_where_batches_run_in_budget_graphs(
+    compile_mock, model_cls, runner_config, layout_free
+):
+    """Host batches reach only configs that encode through the budget graphs."""
+    from vllm_torchtpu.runner import tpu_runner
+
+    config = {
+        "_dp_lockstep_enabled": lambda: False,
+        "is_multimodal_pruning_enabled": False,
+        "requires_sequential_video_encoding": False,
+        "lora_config": None,
+        "mm_budget": object(),
+        **runner_config,
+    }
+    manager = _make_manager(
+        lambda budget: {"pixels": torch.zeros(budget, 2)}, model_cls=model_cls
+    )
+    tpu_runner.TPUModelRunner._maybe_enable_layout_free_encoder(
+        SimpleNamespace(**config), manager
+    )
+    assert manager.layout_free is layout_free
 
 
 @pytest.mark.parametrize("capture_axes", [(), ((1, 2),)])

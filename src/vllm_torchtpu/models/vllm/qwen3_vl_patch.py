@@ -18,8 +18,10 @@ import functools
 import inspect
 import sys
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
 
+import numpy as np
 import torch
 
 from vllm_torchtpu.logger import init_logger
@@ -579,4 +581,202 @@ def maybe_patch_qwen3_vl_video_hf_text(
         context.InputProcessingContext.call_hf_processor = call_hf_processor
         processor_cls._tpu_video_hf_text_skipped = True
         logger.info("Applied TPU patch: Qwen3-VL videos skip the HF text vLLM drops.")
+    return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _bilinear_tables(
+    h: int, w: int, num_grid_per_side: int, merge: int, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`pos_embed_interpolate_native`'s corner indices and weights for an h x w
+    grid, on the host, in spatial-merge order: `[4, h * w]` each."""
+    h_idxs = torch.linspace(0, num_grid_per_side - 1, h, dtype=torch.float32)
+    w_idxs = torch.linspace(0, num_grid_per_side - 1, w, dtype=torch.float32)
+    h_floor, w_floor = h_idxs.to(torch.long), w_idxs.to(torch.long)
+    h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+    w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+    dh_grid, dw_grid = torch.meshgrid(h_idxs - h_floor, w_idxs - w_floor, indexing="ij")
+    h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+    h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+    w11 = dh_grid * dw_grid
+    w10 = dh_grid - w11
+    w01 = dw_grid - w11
+    w00 = 1 - dh_grid - w01
+    h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+    w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+    indices = h_grid * num_grid_per_side + w_grid
+    weights = torch.stack([w00, w01, w10, w11]).to(dtype)
+
+    def merge_order(x: torch.Tensor) -> torch.Tensor:
+        x = x.reshape(4, h // merge, merge, w // merge, merge)
+        return x.permute(0, 1, 3, 2, 4).reshape(4, -1)
+
+    return merge_order(indices), merge_order(weights)
+
+
+def _prepare_encoder_budget_inputs(
+    self,
+    mm_kwargs: dict | None,
+    template: dict[str, torch.Tensor],
+    upload: Callable[[torch.Tensor], torch.Tensor],
+) -> dict[str, torch.Tensor | list[torch.Tensor] | None]:
+    """The vision tower's inputs for one budget graph, at its template's shapes.
+
+    Upstream builds the position embeddings and rotary tables with eager device
+    ops shaped by each item's grid, so every new image layout compiles them,
+    and the fused graph can differ from one request to the next. Here the
+    layout-only parts (corner indices, bilinear weights, rotary position ids)
+    are built on the host and padded to the budget's rows; the device only
+    gathers and sums at the budget's shape. Padding rows come out zero, like
+    the template's. Pixels pass through for the manager to pad: on the
+    device, or as host item slices (`_select_encoder_items`), which it uploads
+    in chunks of the budget (`rows_to_device`). Host tables reach the device by
+    `upload`, which keeps them alive until the device has read them.
+    `mm_kwargs=None` builds a stand-in that fills the budget, with host pixels
+    (warm-up).
+    """
+    # Not at module top: this module loads at platform activation, before
+    # vLLM's layers can import (docs/developers_guide/tpu_patch_mechanism.md).
+    from vllm.model_executor.layers.attention.mm_encoder_attention import (
+        MMEncoderAttention,
+    )
+
+    visual = self.visual
+    merge = visual.spatial_merge_size
+    template_embeds = template["pos_embeds"]
+    rows = template_embeds.shape[0]
+    if mm_kwargs is None:
+        side = int(rows**0.5) // merge * merge
+        grid = [(1, side, side)]
+        # In the dtype vLLM's processor gives served pixels.
+        stand_in = template["pixel_values"]
+        pixels = [torch.zeros(stand_in.shape, dtype=self.model_config.dtype)]
+    else:
+        grid = [
+            tuple(int(v) for v in g) for g in self._get_grid_thw_by_modality(mm_kwargs)
+        ]
+        pixels = self._get_pixel_values_by_modality(mm_kwargs)
+
+    cos, sin = visual.rotary_pos_emb.get_cos_sin(
+        visual.rotary_pos_emb.cos_sin_cache.shape[0]
+    )
+    corners = torch.zeros(4, rows, dtype=torch.long)
+    weights = torch.zeros(4, rows, dtype=visual.dtype)
+    # Padding rows read the zero row appended to the rotary tables below.
+    pos_ids = torch.full((rows, 2), cos.shape[0], dtype=torch.long)
+    start = 0
+    for t, h, w in grid:
+        item_corners, item_weights = _bilinear_tables(
+            h, w, visual.num_grid_per_side, merge, visual.dtype
+        )
+        item_pos_ids = visual.rot_pos_ids(h, w, merge)
+        for _ in range(t):
+            end = start + h * w
+            corners[:, start:end] = item_corners
+            weights[:, start:end] = item_weights
+            pos_ids[start:end] = item_pos_ids
+            start = end
+
+    embeds = visual.pos_embed.weight[upload(corners)]
+    embeds *= upload(weights).unsqueeze(-1)
+    pos_ids = upload(pos_ids)
+    values: dict[str, torch.Tensor | list[torch.Tensor] | None] = {
+        "pixel_values": pixels,
+        "pos_embeds": embeds.sum(dim=0).to(template_embeds.dtype),
+        "rotary_pos_emb_cos": torch.nn.functional.pad(cos, (0, 0, 0, 1))[
+            pos_ids
+        ].flatten(1),
+        "rotary_pos_emb_sin": torch.nn.functional.pad(sin, (0, 0, 0, 1))[
+            pos_ids
+        ].flatten(1),
+    }
+
+    # The attention metadata, as `Qwen3_VisionTransformer.prepare_encoder_metadata`
+    # builds it for the replay buffers, but padded to the template's sequence
+    # count for images too, so images and videos run one program per budget.
+    grid_np = np.array(grid, dtype=np.int32)
+    cu_seqlens = np.repeat(grid_np[:, 1] * grid_np[:, 2], grid_np[:, 0]).cumsum(
+        dtype=np.int32
+    )
+    cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+    pad_to = template["cu_seqlens"].shape[0] - 1
+    if len(cu_seqlens) - 1 < pad_to:
+        cu_seqlens = np.concatenate(
+            [
+                cu_seqlens,
+                np.full(pad_to - len(cu_seqlens) + 1, cu_seqlens[-1], np.int32),
+            ]
+        )
+    # Built on the host, so that `upload` holds their sources.
+    backend, host = visual.attn_backend, torch.device("cpu")
+    sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
+        backend, cu_seqlens, host
+    )
+    values["sequence_lengths"] = (
+        None if sequence_lengths is None else upload(sequence_lengths)
+    )
+    values["max_seqlen"] = torch.tensor(
+        MMEncoderAttention.compute_max_seqlen(backend, cu_seqlens), dtype=torch.int32
+    )
+    values["cu_seqlens"] = upload(
+        MMEncoderAttention.maybe_recompute_cu_seqlens(
+            backend,
+            cu_seqlens,
+            visual.hidden_size,
+            visual.tp_size,
+            host,
+            fp8_padded_hidden_size=visual.fp8_padded_hidden_size,
+        )
+    )
+    return values
+
+
+def _select_encoder_items(upstream):
+    """Qwen3-VL's item selection, leaving host pixels as per-item slices.
+
+    Upstream concatenates the selected items' pixels; on host batches that is
+    a one-thread copy, so the slices go through the budget-inputs hook to the
+    manager, which uploads them in chunks of the budget without one.
+    """
+
+    @functools.wraps(upstream)
+    def select(self, mm_kwargs, indices):
+        pixel_values = self._get_pixel_values_by_modality(mm_kwargs)
+        if not indices or not pixel_values.is_cpu:
+            return upstream(self, mm_kwargs, indices)
+        grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
+        offsets = np.cumsum([0] + [t * h * w for t, h, w in grid_thw])
+        modality = self.get_input_modality(mm_kwargs)
+        key = "pixel_values" if modality == "image" else "pixel_values_videos"
+        return {
+            key: [pixel_values[offsets[i] : offsets[i + 1]] for i in indices],
+            f"{modality}_grid_thw": [grid_thw[i] for i in indices],
+        }
+
+    return select
+
+
+def maybe_patch_qwen3_vl_budget_inputs(
+    model_config: Optional["ModelConfig"] = None,
+) -> bool | None:
+    """Give the Qwen3-VL vision tower the encoder manager's budget-inputs hook
+    and host-batch item selection."""
+    if model_config is None or not _has_qwen3_vl_vision(model_config):
+        return False
+    from vllm.model_executor.models import qwen3_vl
+
+    from vllm_torchtpu.runner.mm_encoder_manager import BUDGET_INPUTS_HOOK
+
+    model_cls = qwen3_vl.Qwen3VLForConditionalGeneration
+    if (
+        getattr(model_cls, BUDGET_INPUTS_HOOK, None)
+        is not _prepare_encoder_budget_inputs
+    ):
+        setattr(model_cls, BUDGET_INPUTS_HOOK, _prepare_encoder_budget_inputs)
+        model_cls.select_encoder_cudagraph_items = _select_encoder_items(
+            model_cls.select_encoder_cudagraph_items
+        )
+        logger.info(
+            "Applied TPU patch: Qwen3-VL builds encoder inputs at budget shapes."
+        )
     return None

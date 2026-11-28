@@ -942,7 +942,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
     ],
     # Add linear token buckets above a quarter of the token budget, for
-    # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
+    # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings)
+    # and multimodal encoder patch budgets (runner/mm_encoder_manager.py).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
     # Pipeline parallelism: while the pending prefill work cannot fill every
     # stage with a full step, spread it over the stages in smaller steps

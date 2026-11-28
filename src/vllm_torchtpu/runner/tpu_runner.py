@@ -191,6 +191,7 @@ from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
+    host_encoder_batches,
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
@@ -4151,8 +4152,32 @@ class TPUModelRunner(GPUModelRunner):
             List of multimodal embedding tensors for inputs processed by the
             encoder.
         """
-        with chunked_video_encoding(self.model, self.model_config):
+        with (
+            chunked_video_encoding(self.model, self.model_config),
+            host_encoder_batches(self),
+        ):
             return super()._execute_mm_encoder(scheduler_output)
+
+    def _maybe_enable_layout_free_encoder(self, manager: MMEncoderManager) -> None:
+        """Hand the encoder its batches on the host (see `host_encoder_batches`)
+        unless this config needs today's per-batch uploads."""
+        if self._dp_lockstep_enabled():
+            reason = "DP-coordinated encoding"
+        elif (
+            self.is_multimodal_pruning_enabled
+            or self.requires_sequential_video_encoding
+        ):
+            reason = "the model prunes or encodes videos one by one"
+        elif self.lora_config is not None:
+            reason = "multimodal LoRA"
+        elif self.mm_budget is None:
+            reason = "no encoder cache budget"
+        else:
+            reason = manager.enable_layout_free()
+        if reason is None:
+            logger.info("Layout-free multimodal encoder: pixels in budget chunks.")
+        else:
+            logger.info("Multimodal encoder uploads pixels per batch: %s.", reason)
 
     def _get_model_inputs(
         self,
@@ -4532,7 +4557,10 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors()
                 self._execute_mm_encoder(scheduler_output)
                 if has_encoder_inputs:
-                    synchronize_tensors()
+                    # Enqueue the encoder as programs of its own, then prepare
+                    # the LM inputs while it runs rather than with the device
+                    # idle.
+                    synchronize_tensors(wait=False)
 
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
@@ -4688,23 +4716,21 @@ class TPUModelRunner(GPUModelRunner):
             # covers requests [start_index, end_index) in req order). Offsets
             # come from the host-side cumsum, so no per-chunk device sync.
             chunk_mm_inputs = None
-            if is_mm_embed_full is not None:
-                assert mm_tok_cumsum is not None
+            if mm_cumsum_np is not None:
+                assert is_mm_embed_full is not None and mm_tok_cumsum is not None
+                assert mm_embeds_flat is not None
                 tok_start = int(mm_tok_cumsum[start_index])
                 tok_end = int(mm_tok_cumsum[end_index])
-                is_mm_chunk = is_mm_embed_full[tok_start:tok_end]
-                if mm_cumsum_np is not None:
-                    assert mm_embeds_flat is not None
-                    mm_start = int(mm_cumsum_np[tok_start])
-                    mm_cnt = int(mm_cumsum_np[tok_end]) - mm_start
-                    chunk_embeds = (
-                        [mm_embeds_flat[mm_start : mm_start + mm_cnt]]
-                        if mm_cnt > 0
-                        else []
+                mm_start = int(mm_cumsum_np[tok_start])
+                mm_cnt = int(mm_cumsum_np[tok_end]) - mm_start
+                # A chunk without multimodal embeddings (every decode step)
+                # embeds its ids directly: an all-False mask changes no value
+                # but costs an upload per step.
+                if mm_cnt > 0:
+                    chunk_mm_inputs = (
+                        [mm_embeds_flat[mm_start : mm_start + mm_cnt]],
+                        is_mm_embed_full[tok_start:tok_end],
                     )
-                else:
-                    chunk_embeds = []
-                chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             self._record_input_staging_fence()
             if self._pp_is_first:
@@ -8120,6 +8146,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.vllm_config, self.device, self.model
             )
             if self.encoder_cudagraph_manager is not None:
+                self.encoder_cudagraph_manager.upload = lambda host: stage_h2d_upload(
+                    self, host
+                )
+                self._maybe_enable_layout_free_encoder(self.encoder_cudagraph_manager)
                 max_step_tokens = (
                     self.mm_budget.get_encoder_budget()
                     if self.mm_budget is not None
