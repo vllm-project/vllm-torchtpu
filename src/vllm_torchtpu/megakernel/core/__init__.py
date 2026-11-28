@@ -25,6 +25,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         dma,
         errors,
         exec_spec,
+        geometry,
         module,
         module_options,
         modules,
@@ -33,6 +34,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         pool,
         profile,
         profiles,
+        schedule,
         spec,
         weights,
     )
@@ -53,6 +55,11 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         ExecSpec,
         Tiles,
         default_tiles,
+    )
+    from .geometry import (
+        FromHF,
+        LMHead,
+        ModelGeometry,
     )
     from .modules import (
         GDN,
@@ -104,6 +111,12 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         model_default_profile,
         register_profile,
     )
+    from .schedule import (
+        Every,
+        FromHFLayerTypes,
+        ResolvedSchedule,
+        Schedule,
+    )
     from .spec import (
         REQUIRED,
         CompareMode,
@@ -146,6 +159,7 @@ _SUBMODULES = frozenset(
         "dma",
         "errors",
         "exec_spec",
+        "geometry",
         "module",
         "module_options",
         "modules",
@@ -154,6 +168,7 @@ _SUBMODULES = frozenset(
         "pool",
         "profile",
         "profiles",
+        "schedule",
         "spec",
         "weights",
     }
@@ -242,6 +257,13 @@ _LAZY: dict[str, str] = {
     "pack_spec_logical_weights": ".weights",
     "stream": ".dma",
     "vmem": ".dma",
+    "FromHF": ".geometry",
+    "LMHead": ".geometry",
+    "ModelGeometry": ".geometry",
+    "Every": ".schedule",
+    "FromHFLayerTypes": ".schedule",
+    "ResolvedSchedule": ".schedule",
+    "Schedule": ".schedule",
 }
 
 __all__ = [
@@ -258,8 +280,11 @@ __all__ = [
     "DebugOptions",
     "Embedding",
     "EmbeddingModule",
+    "Every",
     "ExecSpec",
     "ExtraInput",
+    "FromHF",
+    "FromHFLayerTypes",
     "FrozenDict",
     "GDNLinInLayout",
     "GDNModule",
@@ -269,6 +294,7 @@ __all__ = [
     "HFParamDecl",
     "JaxArrayOps",
     "KVCacheDecl",
+    "LMHead",
     "LayerType",
     "MegakernelConfigError",
     "MegakernelLayoutError",
@@ -276,6 +302,7 @@ __all__ = [
     "MoEDebug",
     "MoEModule",
     "MoEParams",
+    "ModelGeometry",
     "ModelSpec",
     "Module",
     "ModuleBinding",
@@ -289,6 +316,8 @@ __all__ = [
     "Profile",
     "RecurrentCacheDecl",
     "ResolvedModuleGeometry",
+    "ResolvedSchedule",
+    "Schedule",
     "ScratchReq",
     "SmallField",
     "Spec",
@@ -317,6 +346,7 @@ __all__ = [
     "exec_spec",
     "fit_default_tiles",
     "fitted_plan",
+    "geometry",
     "get_profile",
     "kv_to_raw_page",
     "list_profiles",
@@ -337,6 +367,7 @@ __all__ = [
     "raw_pages_to_ssm",
     "register_profile",
     "round_up",
+    "schedule",
     "spec",
     "ssm_to_raw_pages",
     "stream",
