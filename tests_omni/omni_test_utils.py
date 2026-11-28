@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -204,3 +206,44 @@ def isolate_thinker_patch_targets() -> Generator[None]:
         ),
     ):
         yield
+
+
+def build_qwen3_omni_thinker_stub(
+    *,
+    hidden_size: int = 16,
+    deepstack_layers: int = 2,
+    max_tokens: int = 16,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> Any:
+    """Build a real Thinker instance with minimal attributes for ``embed_input_ids``."""
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+    )
+
+    thinker = Qwen3OmniMoeThinkerForConditionalGeneration.__new__(
+        Qwen3OmniMoeThinkerForConditionalGeneration
+    )
+    nn.Module.__init__(thinker)
+    thinker._has_oov_mm_tokens = False
+    thinker.use_deepstack = True
+    thinker.deepstack_num_level = deepstack_layers
+    thinker.deepstack_input_embeds = [
+        torch.zeros((max_tokens, hidden_size), device=device, dtype=dtype)
+        for _ in range(deepstack_layers)
+    ]
+    thinker.deepstack_input_embeds_num_tokens = 0
+    thinker.config = SimpleNamespace(
+        video_token_id=10,
+        audio_token_id=11,
+        text_config=SimpleNamespace(hidden_size=hidden_size),
+    )
+    thinker.visual = SimpleNamespace(
+        deepstack_visual_indexes=list(range(deepstack_layers))
+    )
+    thinker.language_model = SimpleNamespace(
+        embed_input_ids=lambda ids: (
+            ids.to(dtype=dtype).unsqueeze(-1).expand(-1, hidden_size).contiguous() * 0.1
+        )
+    )
+    return thinker
