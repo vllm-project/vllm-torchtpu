@@ -68,6 +68,7 @@ from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 
+from vllm_torchtpu import rope_in_graph
 from vllm_torchtpu.kernels.deepseek_v4 import q_send
 from vllm_torchtpu.kernels.deepseek_v4.collective_ids import Q_SEND_COLLECTIVE_ID
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
@@ -153,8 +154,7 @@ def _wo_a_o_fetch_fn(mesh: Mesh, head_dim: int):
 
     def fn(
         o: jax.Array,
-        positions: jax.Array,
-        cos_sin_cache: jax.Array,
+        cos_sin: jax.Array,
         wo_a: jax.Array,
         wo_a_scale: jax.Array,
         neighbor_mesh_index: jax.Array,
@@ -164,8 +164,7 @@ def _wo_a_o_fetch_fn(mesh: Mesh, head_dim: int):
             kernel,
             mesh,
             o,
-            positions,
-            cos_sin_cache,
+            cos_sin,
             wo_a,
             wo_a_scale,
             neighbor_mesh_index,
@@ -237,25 +236,24 @@ class _FusedOFetch:
                 name,
                 _wo_a_o_fetch_fn(mesh, head_dim),
                 mesh=mesh,
-                input_partition_specs=(P(ax),) * 7,
+                input_partition_specs=(P(ax),) * 6,
                 output_partition_specs=P(ax),
             )
             op.register_fake(
-                lambda o, pos, _cache, wo_a, *_: o.new_empty(
-                    (pos.shape[0], wo_a.shape[1])
+                lambda o, cos_sin, wo_a, *_: o.new_empty(
+                    (cos_sin.shape[0], wo_a.shape[1])
                 )
             )
             _pallas_op_cache[name] = op
         self._op = op
 
-    def __call__(self, o, positions_all, cos_sin_cache, wo_a, wo_a_scale):
+    def __call__(self, o, cos_sin_all, wo_a, wo_a_scale):
         """wo_a over [chiplet 0 tokens; chiplet 1 tokens] with the current
         chiplet's heads, the neighboring chiplet's tokens fetched from its `o`
         inside the kernel."""
         return self._op(
             o,
-            positions_all,
-            cos_sin_cache,
+            cos_sin_all,
             wo_a,
             wo_a_scale,
             self.neighbor_mesh_index,
@@ -314,14 +312,13 @@ def _q_send_fn(mesh: Mesh, head_dim: int):
 def _qnorm_rope_pair_jax(
     current_heads: jax.Array,
     neighbor_heads: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     chiplet_index: jax.Array,
     *,
     eps: float,
 ) -> jax.Array:
     return qnorm_rope_pair(
-        current_heads, neighbor_heads, positions, cos_sin_cache, chiplet_index, eps=eps
+        current_heads, neighbor_heads, cos_sin, chiplet_index, eps=eps
     )
 
 
@@ -389,7 +386,7 @@ class _QSendRope:
                 name,
                 functools.partial(_qnorm_rope_pair_jax, eps=eps),
                 mesh=get_pallas_op_mesh(),
-                input_partition_specs=(P(),) * 5,
+                input_partition_specs=(P(),) * 4,
             )
             rope.register_fake(
                 lambda current, neighbor, *_: neighbor.new_empty(
@@ -399,7 +396,7 @@ class _QSendRope:
             _pallas_op_cache[name] = rope
         self._rope = rope
 
-    def __call__(self, q_half, positions, cos_sin_cache):
+    def __call__(self, q_half, cos_sin):
         """``q_half`` [2, T, W]: wq_b over both chiplets' tokens with the current
         chiplet's heads. Returns the current chiplet's tokens' q over all heads,
         normed and roped."""
@@ -409,8 +406,7 @@ class _QSendRope:
         return self._rope(
             qh.view(2 * num_tokens, heads, self.head_dim),
             neighbor.view(num_tokens, heads, self.head_dim),
-            positions,
-            cos_sin_cache,
+            cos_sin,
             self.chiplet_index,
         )
 
@@ -542,9 +538,8 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
                 f"2 x {num_tokens}; both cores must run at the same token count"
             )
         q_half = self.wq_b(qr_pair).view(2, num_tokens, -1)
-        return self._q_send_rope(
-            q_half, positions, self.mla_attn.rotary_emb.cos_sin_cache
-        )
+        cos_sin = rope_in_graph.cos_sin_at(self.mla_attn.rotary_emb, positions)
+        return self._q_send_rope(q_half, cos_sin)
 
     def _o_proj(self, o, positions):
         group = self._chip_pair
@@ -554,11 +549,11 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         positions_all = group.all_gather(
             positions.to(torch.int32).contiguous(), dim=0
         ).to(positions.dtype)
+        cos_sin_all = rope_in_graph.cos_sin_at(self.rotary_emb, positions_all)
         if self._use_fused_o_fetch:
             z = self._fused_o_fetch(
                 o.reshape(num_tokens, self.n_local_heads, self.head_dim),
-                positions_all,
-                self.rotary_emb.cos_sin_cache,
+                cos_sin_all,
                 self.wo_a.weight,
                 self.wo_a.weight_scale,
             )
@@ -569,8 +564,7 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             o_half = torch.cat(pieces, dim=0).contiguous()
             z = self.o_proj_op(
                 o_half,
-                positions_all,
-                self.rotary_emb.cos_sin_cache,
+                cos_sin_all,
                 self.wo_a.weight,
                 self.wo_a.weight_scale,
             )

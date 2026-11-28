@@ -27,7 +27,7 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, rope_in_graph
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
@@ -98,8 +98,7 @@ BATCH_AXIS = None
 # Module-level so `pallas.jax_op` can trace and register it as a torch op.
 def _indexer_jax(
     q: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     indexer_weights: jax.Array,
     cache_kv: jax.Array,
     seq_lens: jax.Array,
@@ -128,8 +127,7 @@ def _indexer_jax(
 
     def _indexer_local(
         q,
-        positions,
-        cos_sin_cache,
+        cos_sin,
         indexer_weights,
         cache_kv,
         seq_lens,
@@ -141,9 +139,7 @@ def _indexer_jax(
         # Note: vLLM's implementation rounds the scale factors up to the next
         # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
         # sufficient here.
-        q_quant, q_scales = rope_quant(
-            q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
-        )
+        q_quant, q_scales = rope_quant(q, cos_sin, quant_dtype=jnp.float8_e4m3fn)
 
         # Fold the query quantization scales into the weights.
         weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
@@ -172,8 +168,7 @@ def _indexer_jax(
 
     return _indexer_local(
         q,
-        positions,
-        cos_sin_cache,
+        cos_sin,
         indexer_weights,
         cache_kv,
         seq_lens,
@@ -270,14 +265,15 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         attn_data_axis = None
         attn_head_axis = "model"
         batch_axis = BATCH_AXIS
+        # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+        # pyrefly: ignore[no-matching-overload]
         indexer_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
                 P(attn_data_axis, attn_head_axis, None),  # q
-                P(attn_data_axis),  # positions
-                P(),  # cos_sin_cache
+                P(attn_data_axis, None),  # cos_sin
                 P(attn_data_axis, attn_head_axis),  # indexer_weights
                 P(),  # cache_kv
                 P(batch_axis),  # seq_lens
@@ -341,10 +337,11 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         idx_q_start_loc = attn_metadata.query_start_loc
         idx_req_dist = attn_metadata.request_distribution
 
+        cos_sin = rope_in_graph.cos_sin_at(rotary_emb, positions)
+
         return self.indexer_op(
             q,
-            positions,
-            rotary_emb.cos_sin_cache,
+            cos_sin,
             indexer_weights,
             kv_cache,
             idx_seq_lens,

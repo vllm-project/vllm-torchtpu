@@ -73,7 +73,6 @@ def test_indexer_refuses_a_cache_of_the_other_layout():
     with pytest.raises(ValueError, match="SEQ_ALONG_LANE layout"):
         _indexer_jax(
             jnp.zeros((1, 1, 128), jnp.bfloat16),
-            zeros,
             jnp.zeros((1, 64), jnp.float32),
             jnp.zeros((1, 1), jnp.float32),
             jnp.zeros((1, 64, 4, 256), jnp.uint8),
@@ -180,8 +179,7 @@ def _group_ids(fn):
     t, h, pages = 128, 4, 8
     args = (
         jax.ShapeDtypeStruct((t, h, 128), jnp.bfloat16),  # q
-        jax.ShapeDtypeStruct((t,), jnp.int32),  # positions
-        jax.ShapeDtypeStruct((4096, 64), jnp.float32),  # cos_sin_cache
+        jax.ShapeDtypeStruct((t, 64), jnp.float32),  # cos_sin
         jax.ShapeDtypeStruct((t, h), jnp.float32),  # indexer_weights
         jax.ShapeDtypeStruct(  # SEQ_ALONG_LANE cache
             (pages, compressor_config.SAL_SUBLANE_GROUPS, 4, 256), jnp.uint8
@@ -207,3 +205,52 @@ def test_chunked_layers_get_their_own_op_and_groups(monkeypatch):
     # 128 tokens in chunks of 32: 4 chunks, 3 groups per layer.
     assert [len(layer) for layer in ids] == [3, 3], ids
     assert not ids[0] & ids[1], ids
+
+
+def test_indexer_forward_looks_up_cos_sin():
+    """VllmDeepseekV4Indexer.forward looks up per-token cos_sin at positions."""
+    from vllm.config import DeviceConfig, VllmConfig
+    from vllm.forward_context import set_forward_context
+
+    num_tokens, rotary_dim = 6, 8
+    positions = torch.tensor([0, 3, 4, 7, 11, 15], dtype=torch.int32)
+    table = torch.randn(32, rotary_dim)
+
+    indexer = VllmDeepseekV4Indexer.__new__(VllmDeepseekV4Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.n_head = 2
+    indexer.head_dim = 16
+    indexer.topk_tokens = 4
+    indexer.wq_b = lambda q: (torch.zeros(num_tokens, 2, 16), None)
+    indexer.compressor = lambda *_a: None
+    indexer.k_cache = SimpleNamespace(
+        prefix="idx", kv_cache=torch.ones(1, dtype=torch.uint8)
+    )
+    captured: list[torch.Tensor] = []
+    object.__setattr__(
+        indexer,
+        "indexer_op",
+        lambda *args: captured.append(args[1]) or torch.zeros(num_tokens, 4),
+    )
+
+    attn_meta = {
+        "idx": SimpleNamespace(
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            block_tables=torch.zeros(1, 2, dtype=torch.int32),
+            query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        )
+    }
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    zeros = torch.zeros(num_tokens, 4)
+
+    with set_forward_context(attn_meta, cfg):
+        indexer.forward(
+            zeros,
+            zeros,
+            torch.zeros(num_tokens, 2),
+            positions,
+            SimpleNamespace(cos_sin_cache=table),
+        )
+
+    assert torch.equal(captured[0], table.index_select(0, positions))
