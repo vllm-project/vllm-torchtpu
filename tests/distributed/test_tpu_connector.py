@@ -9385,6 +9385,10 @@ class TestStage3AsyncOptionsThroughGetFinished:
             assert worker.get_finished() == (set(), set())
             release.set()
             worker._reap_stage3_registrations({"r1"})
+            # get_finished reports a failed send in done_sending too, so the
+            # outcome itself shows which terminal was kept.
+            outcome = "failed" if failed else "done"
+            assert worker._stage3_send_outcomes == {"r1": outcome}
             done_sending, _ = worker.get_finished()
         assert done_sending == {"r1"}
         assert worker._stage3_early_send_terminals == {}
